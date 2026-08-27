@@ -12,7 +12,7 @@
     {
       "binding": "DB",
       "database_name": "kadobo-journal",
-      "database_id": "REPLACE_WITH_WRANGLER_D1_CREATE_OUTPUT",
+      "database_id": "40f4b9dd-83a7-4ca1-aba6-2dba2e9b61ec",
       "migrations_dir": "migrations"
     }
   ],
