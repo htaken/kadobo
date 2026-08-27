@@ -1,0 +1,23 @@
+{
+  "name": "@kadobo/gas",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Google Apps Script（TypeScript → esbuild で単一 Code.js）。状態遷移・集計・カード生成・Sheets/Drive/Slack アダプタ（実装設計 §7）。",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p .",
+    "build": "node build.mjs",
+    "push": "clasp push"
+  },
+  "dependencies": {
+    "@kadobo/shared": "*"
+  },
+  "devDependencies": {
+    "@google/clasp": "^3.4.0",
+    "@types/google-apps-script": "^2.0.12",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}
