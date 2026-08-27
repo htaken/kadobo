@@ -1,0 +1,26 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "kadobo-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+
+  // D1: 受付ジャーナル（実装設計 §5）。
+  // 初回セットアップ: `wrangler d1 create kadobo-journal` を実行し、出力された
+  // database_id を下記のプレースホルダーと置き換える。その後
+  // `wrangler d1 migrations apply DB`（ローカルは --local を付与）でスキーマを適用する。
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "kadobo-journal",
+      "database_id": "REPLACE_WITH_WRANGLER_D1_CREATE_OUTPUT",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // Cron Trigger（実装設計 §6.6）:
+  //   */5 * * * *  … pending 再送・N 回失敗通知
+  //   17 3 * * *   … 30 日超の journal 削除・nonce 削除（JST 12:17 ≒ UTC 03:17）
+  "triggers": {
+    "crons": ["*/5 * * * *", "17 3 * * *"]
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@kadobo/worker",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Cloudflare Worker: Slack 署名検証・D1 受付ジャーナル・GAS 転送（実装設計 §6）。",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p .",
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "types": "wrangler types"
+  },
+  "dependencies": {
+    "@kadobo/shared": "*"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260827.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.126.0"
+  }
+}
