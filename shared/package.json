@@ -1,0 +1,21 @@
+{
+  "name": "@kadobo/shared",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Worker と GAS の両方で動く純粋 TypeScript（DOM/Node API 非依存）。封筒・冪等キー・時刻。",
+  "type": "module",
+  "types": "./src/protocol.ts",
+  "exports": {
+    "./protocol": "./src/protocol.ts",
+    "./ids": "./src/ids.ts",
+    "./time": "./src/time.ts"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}
