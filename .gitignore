@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+worker/.wrangler/
+.wrangler/
+
+# env / secrets
+.dev.vars
+.dev.vars.*
+*.env
+.env
+.env.*
+
+# GAS deploy credentials (commit gas/.clasp.json.example instead)
+gas/.clasp.json
+.clasprc.json
+
+# editors / OS
+.DS_Store
+*.log
+coverage/
+
+# generated Cloudflare Worker binding types
+worker/worker-configuration.d.ts
