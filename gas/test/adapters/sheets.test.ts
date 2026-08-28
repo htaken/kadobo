@@ -309,9 +309,12 @@ describe("handleStamp を SheetsAdapter（実アダプタ）に通した end-to-
     expect(rawLog?.getCell(2, COL.business_date)).toBe("2026-08-27");
     expect(typeof rawLog?.getCell(2, COL.business_date)).toBe("string");
 
-    // 1 回目は postMessage、2 回目は chat.update（同じ ts を使い回せている）。
-    expect(ports.slack.posted).toHaveLength(1);
-    expect(ports.slack.updated).toHaveLength(1);
+    // stamp リクエストは常に message_ts（押されたカードの実際の ts）を preferredMessageTs として
+    // 渡すため、内部シートの card ts が未設定でも 1 回目から chat.update が使われる
+    // （実装設計の自己修復ロジック。内部シートには 1 回目の成功時に message_ts が書き戻される）。
+    expect(ports.slack.posted).toHaveLength(0);
+    expect(ports.slack.updated).toHaveLength(2);
+    expect(ports.slack.updated.every((u) => u.ts === "1756260000.000100")).toBe(true);
   });
 
   it("START→BREAK_START→BREAK_END→END の 4 連続打刻が全て applied:true になる", () => {

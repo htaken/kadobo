@@ -69,7 +69,11 @@ describe("handleCorrectionSubmit — CORRECTION 追記", () => {
     expect(correction.reason).toBe("打刻忘れ");
 
     expect(ports.sheets.dailySummaries.get(BUSINESS_DATE)).toBeDefined();
-    expect(ports.slack.posted).toHaveLength(1); // カード再描画（postMessage: card ts 未設定のため）
+    // req.message_ts（押されたカードの実際の ts）が優先されるため、内部シートに ts が
+    // 無くても chat.update が使われる（自己修復: 直後に内部シートへも書き戻される）。
+    expect(ports.slack.posted).toHaveLength(0);
+    expect(ports.slack.updated).toHaveLength(1);
+    expect(ports.slack.updated[0]?.ts).toBe(req.message_ts);
   });
 });
 

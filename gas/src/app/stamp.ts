@@ -35,7 +35,9 @@ export function handleStamp(req: StampRequest, ports: AppPorts): GasResponse {
   // 1. 重複判定（実装設計 §4.2: 生ログの idempotency_key 列で完全一致）。
   const existing = ports.sheets.findRawLogByIdempotencyKey(req.idempotency_key);
   if (existing !== null) {
-    redrawCardForBusinessDate(existing.business_date, req.channel_id, ports);
+    redrawCardForBusinessDate(existing.business_date, req.channel_id, ports, {
+      preferredMessageTs: req.message_ts,
+    });
     return { ok: true, applied: false, reason: "DUPLICATE" };
   }
 
@@ -64,7 +66,9 @@ export function handleStamp(req: StampRequest, ports: AppPorts): GasResponse {
         // response_url は 30 分・5 回の制限があり失敗し得る。カード再描画は別途行うため無視する。
       }
     }
-    redrawCardForBusinessDate(businessDate, req.channel_id, ports);
+    redrawCardForBusinessDate(businessDate, req.channel_id, ports, {
+      preferredMessageTs: req.message_ts,
+    });
     return { ok: true, applied: false, reason: "INVALID_TRANSITION" };
   }
 
@@ -91,7 +95,9 @@ export function handleStamp(req: StampRequest, ports: AppPorts): GasResponse {
 
   // 6. 日次・月次再計算 → カード再描画（実装設計 §7.5: 追記後の Slack 更新失敗は applied:true）。
   recomputeDailyAndMonthly(businessDate, ports);
-  redrawCardForBusinessDate(businessDate, req.channel_id, ports);
+  redrawCardForBusinessDate(businessDate, req.channel_id, ports, {
+    preferredMessageTs: req.message_ts,
+  });
 
   return { ok: true, applied: true };
 }

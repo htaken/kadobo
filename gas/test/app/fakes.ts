@@ -107,6 +107,13 @@ export class FakeSlack implements SlackPort {
 
   nextPostTs = "1756260000.000001";
   failNextUpdate = false;
+  /**
+   * `failNextUpdate` が true のとき `update()` が投げるエラーメッセージ。既定は一般的な
+   * Slack API エラー（`SlackAdapter` が投げる `slack_api_error:chat.update:<error>` 相当）。
+   * `message_not_found`/`cant_update_message` を含む文字列を渡すと `cardHelpers.pushCard` の
+   * postMessage フォールバック分岐をテストできる。
+   */
+  failNextUpdateError = "slack_api_error:chat.update";
   failNextPostMessage = false;
 
   postMessage(input: SlackBlocksMessage): SlackPostMessageResult {
@@ -121,7 +128,7 @@ export class FakeSlack implements SlackPort {
   update(input: SlackUpdateMessage): void {
     if (this.failNextUpdate) {
       this.failNextUpdate = false;
-      throw new Error("slack_api_error:chat.update");
+      throw new Error(this.failNextUpdateError);
     }
     this.updated.push(input);
   }

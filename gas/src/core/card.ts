@@ -117,13 +117,27 @@ export interface CardWarning {
   business_date: string;
 }
 
+/**
+ * 「本日累計」表示の区分（実装設計 §7.3 の日次 `status` に対応）。
+ * - `ok`: 確定済み（`daily.status === 'OK'`）。通常どおり合計時間を表示する。
+ * - `in_progress`: 進行中（`daily.status === '進行中'`＝ WORKING/ON_BREAK）。完了済み
+ *   セッションの合計時間を「計測中」の注記付きで表示する（要修正ではない）。
+ * - `needs_fix`: 要修正（`daily.status === '要修正'`）。合計時間は表示せず警告のみ。
+ */
+export type TotalStatus = "ok" | "in_progress" | "needs_fix";
+
 export interface RenderCardInput {
   /** `YYYY-MM-DD`（JST）。 */
   business_date: string;
   state: State;
   sessions: SessionSummary[];
-  /** 本日累計秒。`null` は「要修正」等で算出不能（実装設計 §7.3）。 */
-  totalSeconds: number | null;
+  /**
+   * 完了済みセッションの合計秒。進行中（`totalStatus: 'in_progress'`）でも、完了済み分は
+   * 算出できるためここに渡す。`totalStatus: 'needs_fix'` のときは表示に使われない（`0` でよい）。
+   */
+  totalSeconds: number;
+  /** 本日累計表示の区分。{@link TotalStatus} 参照。 */
+  totalStatus: TotalStatus;
   /** `status` context ブロックの文言（{@link renderStatusLine} で生成）。`null`/未指定ならブロックを省略。 */
   statusLine?: string | null;
   warning?: CardWarning;
@@ -164,10 +178,16 @@ export function renderCard(input: RenderCardInput): object[] {
     text: { type: "mrkdwn", text: sessionsText },
   });
 
-  const totalText =
-    input.totalSeconds !== null
-      ? `本日累計 ${formatDurationLetters(input.totalSeconds)}`
-      : "本日累計 ⚠️ 要修正";
+  const totalText = ((): string => {
+    switch (input.totalStatus) {
+      case "needs_fix":
+        return "本日累計 ⚠️ 要修正";
+      case "in_progress":
+        return `本日累計 ${formatDurationLetters(input.totalSeconds)}（計測中）`;
+      case "ok":
+        return `本日累計 ${formatDurationLetters(input.totalSeconds)}`;
+    }
+  })();
   blocks.push({
     type: "section",
     block_id: "total",

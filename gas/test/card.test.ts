@@ -47,6 +47,7 @@ function baseInput(overrides: Partial<RenderCardInput> = {}): RenderCardInput {
     state: "WORKING",
     sessions: [SESSION_1],
     totalSeconds: 12480,
+    totalStatus: "ok",
     ...overrides,
   };
 }
@@ -81,12 +82,37 @@ describe("renderCard — block_id 構造（実装設計 §2.2）", () => {
     expect(header.text.text).toContain("稼働中");
   });
 
-  it("total は要修正時（totalSeconds=null）に⚠️要修正を表示する", () => {
-    const blocks = renderCard(baseInput({ totalSeconds: null }));
+  it("total は要修正時（totalStatus='needs_fix'）に⚠️要修正を表示する", () => {
+    const blocks = renderCard(baseInput({ totalStatus: "needs_fix", totalSeconds: 0 }));
     const total = (blocks as Block[]).find((b) => b.block_id === "total")! as unknown as {
       text: { text: string };
     };
-    expect(total.text.text).toContain("要修正");
+    expect(total.text.text).toBe("本日累計 ⚠️ 要修正");
+  });
+
+  it("total は進行中時（totalStatus='in_progress'）に完了分の時間＋（計測中）を表示する", () => {
+    const blocks = renderCard(baseInput({ totalStatus: "in_progress", totalSeconds: 3600 }));
+    const total = (blocks as Block[]).find((b) => b.block_id === "total")! as unknown as {
+      text: { text: string };
+    };
+    expect(total.text.text).toBe("本日累計 1h 0m（計測中）");
+  });
+
+  it("total は進行中で完了セッションが無いとき「本日累計 0h 0m（計測中）」を表示する（要修正ではない）", () => {
+    const blocks = renderCard(baseInput({ totalStatus: "in_progress", totalSeconds: 0, sessions: [] }));
+    const total = (blocks as Block[]).find((b) => b.block_id === "total")! as unknown as {
+      text: { text: string };
+    };
+    expect(total.text.text).toBe("本日累計 0h 0m（計測中）");
+    expect(total.text.text).not.toContain("要修正");
+  });
+
+  it("total は通常時（totalStatus='ok'）に⚠️要修正を含まず合計時間のみ表示する", () => {
+    const blocks = renderCard(baseInput({ totalStatus: "ok", totalSeconds: 12480 }));
+    const total = (blocks as Block[]).find((b) => b.block_id === "total")! as unknown as {
+      text: { text: string };
+    };
+    expect(total.text.text).toBe("本日累計 3h 28m");
   });
 
   it("sessions ブロックに進行中セッションが `–` で表示される", () => {

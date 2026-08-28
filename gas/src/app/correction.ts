@@ -63,7 +63,9 @@ export function handleCorrectionSubmit(req: CorrectionSubmitRequest, ports: AppP
   // 1. 重複判定。
   const existing = ports.sheets.findRawLogByIdempotencyKey(req.idempotency_key);
   if (existing !== null) {
-    redrawCardForBusinessDate(existing.business_date, req.channel_id, ports);
+    redrawCardForBusinessDate(existing.business_date, req.channel_id, ports, {
+      preferredMessageTs: req.message_ts,
+    });
     return { ok: true, applied: false, reason: "DUPLICATE" };
   }
 
@@ -139,7 +141,9 @@ export function handleCorrectionSubmit(req: CorrectionSubmitRequest, ports: AppP
 
   // 4. 再計算 → カード再描画。
   recomputeDailyAndMonthly(req.business_date, ports);
-  redrawCardForBusinessDate(req.business_date, req.channel_id, ports);
+  redrawCardForBusinessDate(req.business_date, req.channel_id, ports, {
+    preferredMessageTs: req.message_ts,
+  });
 
   return { ok: true, applied: true };
 }
