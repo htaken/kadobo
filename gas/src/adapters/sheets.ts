@@ -5,6 +5,7 @@
  * `kind+key` を主キーとして 1 行 upsert する。経費台帳は WP3 では書込ポートを持たない
  * （`setupSpreadsheet` が作成するのみ）。
  */
+import { businessDateOf, formatJst } from "@kadobo/shared/time";
 import type { RecentDay } from "../core/businessDate";
 import type { LoggedEvent, LogEventType } from "../core/state";
 import type { DailyStatus, Rounding, TaxCategory, UnitPriceRow, Withholding } from "../core/aggregate";
@@ -114,8 +115,72 @@ const SHEET_HEADERS: Record<string, readonly string[]> = {
 const PROTECTED_SHEETS: readonly string[] = [SHEET_NAMES.rawLog, SHEET_NAMES.dailySummary, SHEET_NAMES.internal];
 
 /**
+ * text 化しない列（本来数値・真偽値の列。1-based 列番号）。型自動変換バグ対策A。
+ * Sheets は `appendRow`/`setValues` に渡した「数値・日付に見える文字列」を自動変換してしまう
+ * （実機で確認: 内部シートの `value`（カード ts）が数値化して末尾ゼロが消失、`business_date` が
+ * `Date` 化されて文字列比較が壊れる）。ここに挙げた列以外は書き込み前に text 書式（`@`）を
+ * 適用して自動変換を防ぐ。経費台帳は WP3 では書込ポートを持たないためこのマップに含めない
+ * （{@link textColumnIndices} が空配列を返し、対象外になる）。
+ */
+const NON_TEXT_COLUMNS: Partial<Record<string, readonly number[]>> = {
+  // occurred_at / received_at / processed_at / session_no / old_value / new_value
+  [SHEET_NAMES.rawLog]: [5, 7, 8, 10, 13, 14],
+  // session_count / break_seconds / worked_seconds / worked_minutes / correction_count / updated_at
+  [SHEET_NAMES.dailySummary]: [3, 6, 7, 8, 10, 12],
+  // unit_price / tax_inclusive
+  [SHEET_NAMES.unitPrice]: [2, 4],
+  // worked_minutes / hours / unit_price / amount / tax_amount / withholding_amount / net_amount /
+  // locked_at（現状の型に合わせ number のまま） / updated_at
+  [SHEET_NAMES.monthlyBill]: [3, 4, 5, 6, 7, 8, 9, 12, 14],
+  // updated_at（kind/key/value は text。value がカードの Slack ts で最重要）
+  [SHEET_NAMES.internal]: [4],
+};
+
+/** シートの text 化すべき列（1-based）を返す。`NON_TEXT_COLUMNS` に無いシートは対象外（`[]`）。 */
+function textColumnIndices(name: string): number[] {
+  const headers = SHEET_HEADERS[name];
+  const nonText = NON_TEXT_COLUMNS[name];
+  if (headers === undefined || nonText === undefined) {
+    return [];
+  }
+  const nonTextSet = new Set(nonText);
+  const result: number[] = [];
+  for (let i = 1; i <= headers.length; i++) {
+    if (!nonTextSet.has(i)) {
+      result.push(i);
+    }
+  }
+  return result;
+}
+
+/**
+ * シート上の text 化対象列の `rowIndex` から `numRows` 行に `setNumberFormat("@")` を適用する
+ * （冪等・型自動変換バグ対策A）。`setupSpreadsheet` は既存の全データ行（`2 〜 getMaxRows()`）に、
+ * 1 行の追記・更新ヘルパ（`appendFormattedRow`/`setFormattedRow`）は対象の 1 行だけに適用する。
+ */
+function applyTextFormat(
+  sheet: GoogleAppsScript.Spreadsheet.Sheet,
+  name: string,
+  rowIndex: number,
+  numRows: number,
+  numCols: number,
+): void {
+  if (numRows < 1) {
+    return;
+  }
+  for (const col of textColumnIndices(name)) {
+    if (col <= numCols) {
+      sheet.getRange(rowIndex, col, numRows, 1).setNumberFormat("@");
+    }
+  }
+}
+
+/**
  * スプレッドシートを初期化する（実装設計 §7.1, §8 WP3 受入条件）。不足シート・ヘッダー行のみ
  * 作成する冪等な処理。既存データがあるシートのヘッダーは上書きしない。
+ * 文字列列の text 書式（対策A）は既存シートにも毎回（冪等に）再適用する（ヘッダー書き込みの
+ * 「空なら書く」ガードとは独立。単価マスタ等、GAS が書込ポートを持たず人手で編集される列も
+ * ここで先回りして text 化しておく）。
  */
 export function setupSpreadsheet(spreadsheetId: string): void {
   const ss = SpreadsheetApp.openById(spreadsheetId);
@@ -126,6 +191,10 @@ export function setupSpreadsheet(spreadsheetId: string): void {
     }
     if (sheet.getLastRow() === 0) {
       sheet.getRange(1, 1, 1, headers.length).setValues([[...headers]]);
+    }
+    const maxRows = sheet.getMaxRows();
+    if (maxRows >= 2) {
+      applyTextFormat(sheet, name, 2, maxRows - 1, headers.length);
     }
     if (PROTECTED_SHEETS.includes(name)) {
       const alreadyProtected = sheet.getProtections(SpreadsheetApp.ProtectionType.SHEET).length > 0;
@@ -153,14 +222,54 @@ function strOrNull(v: unknown): string | null {
   return s === "" ? null : s;
 }
 
+// ---------------------------------------------------------------------------
+// 型自動変換バグ対策B（読み取り側の防御的正規化）。
+//
+// text 書式（対策A）を適用する前に書かれた既存データや、書式が何らかの理由で外れた
+// エッジケースでは、`business_date`（"YYYY-MM-DD"）等の日付・年月文字列列が Sheets に
+// よって `Date` 型へ自動変換されて格納され得る。読み取り時に `Date` を検出したら JST の
+// カレンダー値へ復元してから文字列化する。`Date#getTime()` は変換元テキストが表す時刻を
+// 正しく保持している（Apps Script が返す `Date` はどの実行環境で読んでも絶対時刻として
+// 正しい）ので、`@kadobo/shared/time` の JST 変換ユーティリティにそのまま渡せる
+// （GAS 実行環境のローカルタイムゾーン設定に依存しない）。
+//
+// 数値化された ts（内部シートの `value` 列、末尾ゼロの桁落ち）は文字列としての情報が
+// 失われており読み取り側では復元不能。これは対策Aの text 書式で根治する。
+// ---------------------------------------------------------------------------
+
+/** `Date` 化された日付セル（business_date 等）を JST の "YYYY-MM-DD" に復元する。 */
+function strDate(v: unknown): string {
+  return v instanceof Date ? businessDateOf(v.getTime()) : str(v);
+}
+
+function strDateOrNull(v: unknown): string | null {
+  const s = strDate(v);
+  return s === "" ? null : s;
+}
+
+/** `Date` 化された日時セル（occurred_at_jst 等）を JST の "YYYY-MM-DD HH:mm:ss" に復元する。 */
+function strDateTime(v: unknown): string {
+  return v instanceof Date ? formatJst(v.getTime()) : str(v);
+}
+
+function strDateTimeOrNull(v: unknown): string | null {
+  const s = strDateTime(v);
+  return s === "" ? null : s;
+}
+
+/** `Date` 化された年月セル（月次請求の `month`＝"YYYY-MM"）を復元する。 */
+function strMonth(v: unknown): string {
+  return v instanceof Date ? businessDateOf(v.getTime()).slice(0, 7) : str(v);
+}
+
 function rowToRawLog(row: unknown[]): RawLogRow {
   return {
     event_id: str(row[0]),
     idempotency_key: str(row[1]),
-    business_date: str(row[2]),
+    business_date: strDate(row[2]),
     event_type: str(row[3]) as LogEventType,
     occurred_at: Number(row[4]),
-    occurred_at_jst: str(row[5]),
+    occurred_at_jst: strDateTime(row[5]),
     received_at: Number(row[6]),
     processed_at: Number(row[7]),
     source: str(row[8]),
@@ -195,11 +304,11 @@ function rawLogToRow(r: RawLogRow): unknown[] {
 
 function rowToDailySummary(row: unknown[]): DailySummaryRow {
   return {
-    business_date: str(row[0]),
+    business_date: strDate(row[0]),
     weekday: str(row[1]),
     session_count: Number(row[2]),
-    first_start_jst: strOrNull(row[3]),
-    last_end_jst: strOrNull(row[4]),
+    first_start_jst: strDateTimeOrNull(row[3]),
+    last_end_jst: strDateTimeOrNull(row[4]),
     break_seconds: Number(row[5]),
     worked_seconds: numOrNull(row[6]),
     worked_minutes: numOrNull(row[7]),
@@ -236,15 +345,15 @@ function rowToUnitPrice(row: unknown[]): UnitPriceRow {
     tax_display: str(row[4]) as UnitPriceRow["tax_display"],
     rounding: str(row[5]) as Rounding,
     withholding: str(row[6]) as Withholding,
-    valid_from: str(row[7]),
-    valid_to: strOrNull(row[8]),
+    valid_from: strDate(row[7]),
+    valid_to: strDateOrNull(row[8]),
   };
 }
 
 function rowToMonthlyBill(row: unknown[]): MonthlyBillRow {
   return {
     client: str(row[0]),
-    month: str(row[1]),
+    month: strMonth(row[1]),
     worked_minutes: Number(row[2]),
     hours: Number(row[3]),
     unit_price: Number(row[4]),
@@ -313,8 +422,28 @@ export class SheetsAdapter implements SheetsPort {
     return sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
   }
 
+  /**
+   * 末尾に 1 行追記する（型自動変換バグ対策A）。`appendRow` は書き込み前に書式を指定できない
+   * ため、追記先の行番号を算出してから文字列列に text 書式（`@`）を設定し、`setValues` で
+   * 書き込む（`appendRawLog`・`upsertDailySummary`・`upsertMonthlyBill`・`setInternalValue`
+   * 共通のヘルパ）。
+   */
+  private appendFormattedRow(name: string, rowValues: unknown[]): void {
+    const sheet = this.sheet(name);
+    const rowIndex = sheet.getLastRow() + 1;
+    applyTextFormat(sheet, name, rowIndex, 1, rowValues.length);
+    sheet.getRange(rowIndex, 1, 1, rowValues.length).setValues([rowValues]);
+  }
+
+  /** 既存行（`rowIndex`、1-based）を上書きする。書式適用は {@link appendFormattedRow} と同様。 */
+  private setFormattedRow(name: string, rowIndex: number, rowValues: unknown[]): void {
+    const sheet = this.sheet(name);
+    applyTextFormat(sheet, name, rowIndex, 1, rowValues.length);
+    sheet.getRange(rowIndex, 1, 1, rowValues.length).setValues([rowValues]);
+  }
+
   appendRawLog(row: RawLogRow): void {
-    this.sheet(SHEET_NAMES.rawLog).appendRow(rawLogToRow(row));
+    this.appendFormattedRow(SHEET_NAMES.rawLog, rawLogToRow(row));
   }
 
   findRawLogByIdempotencyKey(idempotencyKey: string): RawLogRow | null {
@@ -341,7 +470,7 @@ export class SheetsAdapter implements SheetsPort {
 
   getEventsForBusinessDate(businessDate: string): RawLogRow[] {
     return this.dataRows(SHEET_NAMES.rawLog)
-      .filter((row) => str(row[2]) === businessDate)
+      .filter((row) => strDate(row[2]) === businessDate)
       .map(rowToRawLog);
   }
 
@@ -362,26 +491,25 @@ export class SheetsAdapter implements SheetsPort {
   }
 
   upsertDailySummary(row: DailySummaryRow): void {
-    const sheet = this.sheet(SHEET_NAMES.dailySummary);
     const values = this.dataRows(SHEET_NAMES.dailySummary);
-    const idx = values.findIndex((r) => str(r[0]) === row.business_date);
+    const idx = values.findIndex((r) => strDate(r[0]) === row.business_date);
     const rowValues = dailySummaryToRow(row);
     if (idx === -1) {
-      sheet.appendRow(rowValues);
+      this.appendFormattedRow(SHEET_NAMES.dailySummary, rowValues);
       return;
     }
-    sheet.getRange(idx + 2, 1, 1, DAILY_SUMMARY_HEADERS.length).setValues([rowValues]);
+    this.setFormattedRow(SHEET_NAMES.dailySummary, idx + 2, rowValues);
   }
 
   getDailySummary(businessDate: string): DailySummaryRow | null {
-    const found = this.dataRows(SHEET_NAMES.dailySummary).find((r) => str(r[0]) === businessDate);
+    const found = this.dataRows(SHEET_NAMES.dailySummary).find((r) => strDate(r[0]) === businessDate);
     return found === undefined ? null : rowToDailySummary(found);
   }
 
   getDailySummariesInRange(fromDate: string, toDate: string): DailySummaryRow[] {
     return this.dataRows(SHEET_NAMES.dailySummary)
       .filter((r) => {
-        const d = str(r[0]);
+        const d = strDate(r[0]);
         return d >= fromDate && d <= toDate;
       })
       .map(rowToDailySummary)
@@ -393,36 +521,36 @@ export class SheetsAdapter implements SheetsPort {
   }
 
   upsertMonthlyBill(row: MonthlyBillRow): void {
-    const sheet = this.sheet(SHEET_NAMES.monthlyBill);
     const values = this.dataRows(SHEET_NAMES.monthlyBill);
-    const idx = values.findIndex((r) => str(r[0]) === row.client && str(r[1]) === row.month);
+    const idx = values.findIndex((r) => str(r[0]) === row.client && strMonth(r[1]) === row.month);
     const rowValues = monthlyBillToRow(row);
     if (idx === -1) {
-      sheet.appendRow(rowValues);
+      this.appendFormattedRow(SHEET_NAMES.monthlyBill, rowValues);
       return;
     }
-    sheet.getRange(idx + 2, 1, 1, MONTHLY_BILL_HEADERS.length).setValues([rowValues]);
+    this.setFormattedRow(SHEET_NAMES.monthlyBill, idx + 2, rowValues);
   }
 
   getMonthlyBill(client: string, month: string): MonthlyBillRow | null {
-    const found = this.dataRows(SHEET_NAMES.monthlyBill).find((r) => str(r[0]) === client && str(r[1]) === month);
+    const found = this.dataRows(SHEET_NAMES.monthlyBill).find(
+      (r) => str(r[0]) === client && strMonth(r[1]) === month,
+    );
     return found === undefined ? null : rowToMonthlyBill(found);
   }
 
   getInternalValue(kind: string, key: string): string | null {
-    const found = this.dataRows(SHEET_NAMES.internal).find((r) => str(r[0]) === kind && str(r[1]) === key);
+    const found = this.dataRows(SHEET_NAMES.internal).find((r) => str(r[0]) === kind && strDate(r[1]) === key);
     return found === undefined ? null : str(found[2]);
   }
 
   setInternalValue(kind: string, key: string, value: string): void {
-    const sheet = this.sheet(SHEET_NAMES.internal);
     const values = this.dataRows(SHEET_NAMES.internal);
-    const idx = values.findIndex((r) => str(r[0]) === kind && str(r[1]) === key);
+    const idx = values.findIndex((r) => str(r[0]) === kind && strDate(r[1]) === key);
     const rowValues = [kind, key, value, Date.now()];
     if (idx === -1) {
-      sheet.appendRow(rowValues);
+      this.appendFormattedRow(SHEET_NAMES.internal, rowValues);
       return;
     }
-    sheet.getRange(idx + 2, 1, 1, INTERNAL_HEADERS.length).setValues([rowValues]);
+    this.setFormattedRow(SHEET_NAMES.internal, idx + 2, rowValues);
   }
 }

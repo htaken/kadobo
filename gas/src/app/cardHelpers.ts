@@ -61,8 +61,10 @@ export function redrawCardForBusinessDate(
     });
 
     pushCard(channelId, businessDate, blocks, `稼働記録 ${businessDate}`, ports);
-  } catch {
+  } catch (e) {
     // カード再描画の失敗は致命的ではない（記録は既に完了している。次回の再描画で修復される）。
+    // ただし原因が GAS の実行ログから追えるよう記録だけはしておく（観測性）。
+    console.error("redrawCard failed: " + (e instanceof Error ? (e.stack || e.message) : String(e)));
   }
 }
 
