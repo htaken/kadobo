@@ -78,23 +78,23 @@ function button(actionId: CardActionId, label: string, value: string): object {
 function actionsForState(state: State, businessDate: string): object[] {
   switch (state) {
     case "IDLE":
-      return [button("kado_start", "開始", businessDate)];
+      return [button("kado_start", "▶️開始", businessDate)];
     case "WORKING":
       return [
-        button("kado_break_start", "休憩", businessDate),
-        button("kado_end", "終了", businessDate),
-        button("kado_correct", "✏️ 修正", businessDate),
+        button("kado_break_start", "☕休憩", businessDate),
+        button("kado_end", "⏹️終了", businessDate),
+        button("kado_correct", "✏️修正", businessDate),
       ];
     case "ON_BREAK":
       return [
-        button("kado_break_end", "再開", businessDate),
-        button("kado_end", "終了", businessDate),
-        button("kado_correct", "✏️ 修正", businessDate),
+        button("kado_break_end", "▶️再開", businessDate),
+        button("kado_end", "⏹️終了", businessDate),
+        button("kado_correct", "✏️修正", businessDate),
       ];
     case "CLOSED":
       return [
-        button("kado_start", "再開", businessDate),
-        button("kado_correct", "✏️ 修正", businessDate),
+        button("kado_start", "▶️再開", businessDate),
+        button("kado_correct", "✏️修正", businessDate),
       ];
   }
 }
@@ -164,7 +164,7 @@ export function renderCard(input: RenderCardInput): object[] {
       type: "section",
       block_id: "warning",
       text: { type: "mrkdwn", text: `⚠️ ${input.warning.text}` },
-      accessory: button("kado_correct", "✏️ 修正", input.warning.business_date),
+      accessory: button("kado_correct", "✏️修正", input.warning.business_date),
     });
   }
 

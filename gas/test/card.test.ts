@@ -25,6 +25,11 @@ function actionIds(blocks: object[]): string[] {
   return (actions?.elements ?? []).map((e) => e.action_id!).filter(Boolean);
 }
 
+function actionLabels(blocks: object[]): string[] {
+  const actions = (blocks as Block[]).find((b) => b.block_id === "actions");
+  return (actions?.elements ?? []).map((e) => e.text?.text ?? "");
+}
+
 const SESSION_1: SessionSummary = {
   session_no: 1,
   start_at: Date.parse("2026-09-01T09:02:00+09:00"),
@@ -139,6 +144,26 @@ describe("renderCard — 状態ごとの有効ボタン（実装設計 §2.3）"
   it("ON_BREAK: [再開][終了][修正]", () => {
     const blocks = renderCard(baseInput({ state: "ON_BREAK" }));
     expect(actionIds(blocks)).toEqual(["kado_break_end", "kado_end", "kado_correct"]);
+  });
+
+  it("ボタンラベルは絵文字付き・絵文字と文字の間にスペースを入れない", () => {
+    expect(
+      actionLabels(renderCard(baseInput({ state: "IDLE", sessions: [], totalSeconds: 0 }))),
+    ).toEqual(["▶️開始"]);
+    expect(actionLabels(renderCard(baseInput({ state: "WORKING" })))).toEqual([
+      "☕休憩",
+      "⏹️終了",
+      "✏️修正",
+    ]);
+    expect(actionLabels(renderCard(baseInput({ state: "ON_BREAK" })))).toEqual([
+      "▶️再開",
+      "⏹️終了",
+      "✏️修正",
+    ]);
+    expect(actionLabels(renderCard(baseInput({ state: "CLOSED" })))).toEqual(["▶️再開", "✏️修正"]);
+    for (const label of actionLabels(renderCard(baseInput({ state: "WORKING" })))) {
+      expect(label).not.toContain(" ");
+    }
   });
 
   it("CLOSED: [再開][修正]", () => {
