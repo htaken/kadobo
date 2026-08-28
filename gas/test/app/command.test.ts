@@ -71,30 +71,6 @@ describe("handleCommand — ''（当日カード・再投稿）", () => {
   });
 });
 
-describe("handleCommand — refresh", () => {
-  it("既存カードを再描画する（update。delete/repost はしない）", () => {
-    const ports = makeFakePorts();
-    ports.sheets.setInternalValue("card", `C1:${TODAY}`, "1756260000.000999");
-
-    const result = handleCommand(makeCommandRequest({ text: "refresh" }), ports);
-
-    expect(result).toEqual({ ok: true, applied: true });
-    expect(ports.slack.updated).toHaveLength(1);
-    expect(ports.slack.deleted).toHaveLength(0);
-    expect(ports.slack.posted).toHaveLength(0);
-  });
-
-  it("実行後に response_url へ ephemeral 解決を送る", () => {
-    const ports = makeFakePorts();
-    ports.sheets.setInternalValue("card", `C1:${TODAY}`, "1756260000.000999");
-
-    handleCommand(makeCommandRequest({ text: "refresh" }), ports);
-
-    expect(ports.slack.ephemeral).toHaveLength(1);
-    expect(ports.slack.ephemeral[0]?.text).toContain("更新しました");
-  });
-});
-
 describe("handleCommand — status", () => {
   it("今週・今月の累計を response_url へ ephemeral 表示する", () => {
     const ports = makeFakePorts();

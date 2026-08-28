@@ -62,8 +62,7 @@ kadobo/
 
 | コマンド | 引数 | 動作 |
 |---|---|---|
-| `/kado` | なし | 当日カードを投稿（既にあれば再描画） |
-| `/kado refresh` | | 当日カードを再描画 |
+| `/kado` | なし | 当日カードを再表示（無ければ投稿。あれば削除して再投稿） |
 | `/kado status` | | 今週・今月の累計を ephemeral 表示（`response_url`） |
 | `/keihi` | 任意 | MVP では ephemeral「経費機能は自動化フェーズで提供予定（暫定運用: 紙原本保管＋Drive 手動保存）」を返し GAS へ転送しない |
 
@@ -133,7 +132,7 @@ type GasRequest =
   | { kind: 'correction_submit'; idempotency_key; user_id; view_id; channel_id; message_ts; business_date;
       target: string /* event_id | 'add_end' */; new_date: string /* YYYY-MM-DD */; new_time: string /* HH:mm */;
       reason: string; received_at_ms; source: 'modal'|'retry' }
-  | { kind: 'command'; idempotency_key; user_id; channel_id; text: ''|'refresh'|'status';
+  | { kind: 'command'; idempotency_key; user_id; channel_id; text: ''|'status';
       response_url: string; received_at_ms; source: 'command'|'retry' }
 ```
 
@@ -252,7 +251,7 @@ CREATE TABLE nonces (nonce TEXT PRIMARY KEY, seen_at INTEGER NOT NULL);
 ### 6.5 スラッシュコマンド
 
 1. `/keihi` → 200 `{response_type:'ephemeral', text:…}` で終了（転送しない）
-2. `/kado …` → 引数を `''|'refresh'|'status'` に正規化（それ以外は ephemeral で使い方を返す）→ D1 INSERT → 200 `{response_type:'ephemeral', text:'⏳ 処理中…'}` → `waitUntil` で GAS へ POST
+2. `/kado …` → 引数を `''|'status'` に正規化（それ以外は ephemeral で使い方を返す）→ D1 INSERT → 200 `{response_type:'ephemeral', text:'⏳ 処理中…'}` → `waitUntil` で GAS へ POST
 
 ### 6.6 `scheduled`
 
@@ -364,7 +363,7 @@ doPost(e)
        stamp:              重複判定 → 業務日決定 → 遷移検証 → 生ログ追記 → 日次・月次再計算 → カード再描画（chat.update）→ 応答
        open_correction:    業務日のイベント読込 → 本モーダル生成 → views.update → 応答
        correction_submit:  重複判定 → 対象検証（存在／LOCKED 月）→ CORRECTION（または END）追記 → 再計算 → カード再描画 → 応答
-       command:            '' → 当日カード投稿（内部 card キーが無ければ postMessage、あれば update）／'refresh' → 再描画／'status' → 今週・今月累計を response_url へ ephemeral
+       command:            '' → 当日カード再表示（内部 card キーが無ければ postMessage、あれば削除して再投稿）／'status' → 今週・今月累計を response_url へ ephemeral
 ```
 
 - 例外は捕捉して `{ok:false, error: message, retryable: true}`（Sheets の一時エラー等）。**ただし** 生ログ追記後の Slack 更新失敗は `{ok:true, applied:true}` を返す（記録は成功している。表示は次回再描画で修復）

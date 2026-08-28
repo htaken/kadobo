@@ -119,7 +119,7 @@ features:
     - command: /kado
       url: "https://<WORKER_DOMAIN>/slack/commands"
       description: 稼働カードの投稿・再描画・週次/月次累計の確認
-      usage_hint: "[refresh|status]"
+      usage_hint: "[status]"
       should_escape: false
     - command: /keihi
       url: "https://<WORKER_DOMAIN>/slack/commands"

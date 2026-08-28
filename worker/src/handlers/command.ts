@@ -2,7 +2,7 @@
  * スラッシュコマンドハンドラ（実装設計 §6.5, §2.1）。
  *
  * 1. `/keihi` → 200 `{response_type:'ephemeral', text:…}` で終了（転送しない）
- * 2. `/kado …` → 引数を `''|'refresh'|'status'` に正規化（それ以外は ephemeral で使い方を返す）
+ * 2. `/kado …` → 引数を `''|'status'` に正規化（それ以外は ephemeral で使い方を返す）
  *    → D1 INSERT → 200 `{response_type:'ephemeral', text:'⏳ 処理中…'}` → `waitUntil` で GAS へ POST
  */
 import { commandIdempotencyKey, ulid } from "@kadobo/shared/ids";
@@ -18,7 +18,7 @@ const KEIHI_EPHEMERAL_TEXT =
   "経費機能は自動化フェーズで提供予定です（暫定運用: 紙原本保管＋Drive手動保存）。";
 
 const KADO_USAGE_TEXT =
-  "使い方: `/kado`（当日カードを投稿・再描画） / `/kado refresh`（再描画） / `/kado status`（今週・今月の累計を表示）";
+  "使い方: `/kado`（当日の稼働カードを表示） / `/kado status`（今週・今月の累計を表示）";
 
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -29,7 +29,7 @@ function jsonResponse(body: unknown): Response {
 
 function normalizeKadoText(text: string): CommandText | null {
   const trimmed = text.trim();
-  if (trimmed === "" || trimmed === "refresh" || trimmed === "status") {
+  if (trimmed === "" || trimmed === "status") {
     return trimmed;
   }
   return null;

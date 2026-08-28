@@ -13,7 +13,7 @@ const STAMP_ACTION_IDS: readonly StampActionId[] = [
   "kado_end",
 ];
 
-const COMMAND_TEXTS: readonly CommandText[] = ["", "refresh", "status"];
+const COMMAND_TEXTS: readonly CommandText[] = ["", "status"];
 
 function isStr(v: unknown): v is string {
   return typeof v === "string";

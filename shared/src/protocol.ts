@@ -55,7 +55,7 @@ export type CorrectionSubmitSource = "modal" | "retry";
 export type CommandSource = "command" | "retry";
 
 /** スラッシュコマンドの正規化済み引数（実装設計 §2.1）。 */
-export type CommandText = "" | "refresh" | "status";
+export type CommandText = "" | "status";
 
 /**
  * Worker → GAS のペイロード種別（実装設計 §3.2）。4 種の判別共用体（`kind` で判別）。

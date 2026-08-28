@@ -394,7 +394,7 @@ describe("handleSlashCommand", () => {
     expect(calls).toHaveLength(0);
   });
 
-  it.each(["", "refresh", "status"])("/kado %s: 正規化して journal に INSERT・GAS へ転送する", async (text) => {
+  it.each(["", "status"])("/kado %s: 正規化して journal に INSERT・GAS へ転送する", async (text) => {
     const env = makeEnv(db);
     const { ctx, flush } = createTestCtx();
     const { fetchImpl, calls } = createFetchStub((url) => {
@@ -419,20 +419,24 @@ describe("handleSlashCommand", () => {
     expect(calls.some((c) => c.url === env.GAS_URL)).toBe(true);
   });
 
-  it("/kado unknown: 使い方 ephemeral を返し journal には記録しない", async () => {
-    const env = makeEnv(db);
-    const { ctx, flush } = createTestCtx();
-    const { fetchImpl, calls } = createFetchStub();
-    const command = makeCommand({ text: "unknown-arg" });
+  it.each(["unknown-arg", "refresh"])(
+    "/kado %s: 未知の引数として使い方 ephemeral を返し journal には記録しない",
+    async (text) => {
+      const env = makeEnv(db);
+      const { ctx, flush } = createTestCtx();
+      const { fetchImpl, calls } = createFetchStub();
+      const command = makeCommand({ text });
 
-    const res = await handleSlashCommand({ env, ctx, command, fetchImpl });
-    const body = (await res.json()) as any;
-    expect(body.text).toContain("使い方");
+      const res = await handleSlashCommand({ env, ctx, command, fetchImpl });
+      const body = (await res.json()) as any;
+      expect(body.response_type).toBe("ephemeral");
+      expect(body.text).toContain("使い方");
 
-    await flush();
-    expect(await allJournalRows()).toHaveLength(0);
-    expect(calls).toHaveLength(0);
-  });
+      await flush();
+      expect(await allJournalRows()).toHaveLength(0);
+      expect(calls).toHaveLength(0);
+    },
+  );
 
   it("GAS: ok:false,retryable:false → response_url へ失敗を POST する", async () => {
     const env = makeEnv(db);

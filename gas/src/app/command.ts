@@ -1,5 +1,5 @@
 /**
- * `command`（`/kado` の 3 種）ユースケース（実装設計 §7.5, §2.1）。
+ * `command`（`/kado` の 2 種）ユースケース（実装設計 §7.5, §2.1）。
  */
 import { businessDateOf } from "@kadobo/shared/time";
 import type { GasRequest, GasResponse } from "@kadobo/shared/protocol";
@@ -33,10 +33,12 @@ function resolveEphemeral(responseUrl: string, text: string, ports: AppPorts): v
 
 /**
  * `''` → 当日カードを再投稿（既存カードは削除して新規投稿。稼働終了後に再実行してもカードが
- * 見える位置に出るようにするための UX 修正）。`refresh` → 当日カードをその場更新（従来どおり）。
- * `status` → 今週・今月の累計を `response_url` へ ephemeral 表示。いずれも最後に
- * `postEphemeral` でスラッシュコマンドの「⏳ 処理中…」を解決する。`command`/`open_correction`
- * は本質的に冪等なので重複判定は行わない（実装設計 §4.2）。
+ * 見える位置に出るようにするための UX 修正）。`status` → 今週・今月の累計を `response_url` へ
+ * ephemeral 表示。いずれも最後に `postEphemeral` でスラッシュコマンドの「⏳ 処理中…」を解決する。
+ * `command`/`open_correction` は本質的に冪等なので重複判定は行わない（実装設計 §4.2）。
+ *
+ * `CommandText` は `''|'status'` のみ（`validateRequest` で検証済み）のため、`if (req.text
+ * === "")` の否定は必ず `"status"` になる。TypeScript の型上もそう絞り込まれる。
  */
 export function handleCommand(req: CommandRequest, ports: AppPorts): GasResponse {
   const today = businessDateOf(ports.clock.nowMs());
@@ -44,12 +46,6 @@ export function handleCommand(req: CommandRequest, ports: AppPorts): GasResponse
   if (req.text === "") {
     redrawCardForBusinessDate(today, req.channel_id, ports, { repost: true });
     resolveEphemeral(req.response_url, "✅ 本日の稼働カードを表示しました。", ports);
-    return { ok: true, applied: true };
-  }
-
-  if (req.text === "refresh") {
-    redrawCardForBusinessDate(today, req.channel_id, ports);
-    resolveEphemeral(req.response_url, "✅ 稼働カードを更新しました。", ports);
     return { ok: true, applied: true };
   }
 
