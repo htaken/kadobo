@@ -152,3 +152,51 @@ describe("redrawCardForBusinessDate — chat.update 失敗時のフォールバ�
     expect(ports.sheets.getInternalValue("card", KEY)).toBeNull();
   });
 });
+
+describe("redrawCardForBusinessDate — repost: true（素の /kado 専用の再投稿）", () => {
+  it("既存カード ts があれば delete してから新規 postMessage し、内部シートの ts を張り替える", () => {
+    const ports = makeFakePorts();
+    ports.sheets.setInternalValue("card", KEY, "1756260000.000999");
+
+    redrawCardForBusinessDate(BUSINESS_DATE, CHANNEL, ports, { repost: true });
+
+    expect(ports.slack.deleted).toEqual([{ channel: CHANNEL, ts: "1756260000.000999" }]);
+    expect(ports.slack.updated).toHaveLength(0);
+    expect(ports.slack.posted).toHaveLength(1);
+    expect(ports.sheets.getInternalValue("card", KEY)).toBe(ports.slack.nextPostTs);
+  });
+
+  it("既存カードが無い（初回）ときは delete を呼ばず postMessage のみ行う", () => {
+    const ports = makeFakePorts();
+
+    redrawCardForBusinessDate(BUSINESS_DATE, CHANNEL, ports, { repost: true });
+
+    expect(ports.slack.deleted).toHaveLength(0);
+    expect(ports.slack.posted).toHaveLength(1);
+    expect(ports.sheets.getInternalValue("card", KEY)).toBe(ports.slack.nextPostTs);
+  });
+
+  it("delete が失敗しても postMessage は実行され、例外も投げない（best-effort）", () => {
+    const ports = makeFakePorts();
+    ports.sheets.setInternalValue("card", KEY, "1756260000.000999");
+    ports.slack.failNextDelete = true;
+
+    expect(() => redrawCardForBusinessDate(BUSINESS_DATE, CHANNEL, ports, { repost: true })).not.toThrow();
+
+    expect(ports.slack.posted).toHaveLength(1);
+    expect(ports.sheets.getInternalValue("card", KEY)).toBe(ports.slack.nextPostTs);
+  });
+
+  it("repost 未指定（既定 false）なら preferredMessageTs があっても従来どおり update する（delete しない）", () => {
+    const ports = makeFakePorts();
+    ports.sheets.setInternalValue("card", KEY, "1756260000.000999");
+
+    redrawCardForBusinessDate(BUSINESS_DATE, CHANNEL, ports, {
+      preferredMessageTs: "1756260000.000999",
+    });
+
+    expect(ports.slack.deleted).toHaveLength(0);
+    expect(ports.slack.updated).toHaveLength(1);
+    expect(ports.slack.posted).toHaveLength(0);
+  });
+});

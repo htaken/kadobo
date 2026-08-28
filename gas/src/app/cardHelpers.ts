@@ -60,7 +60,7 @@ export function redrawCardForBusinessDate(
   businessDate: string,
   channelId: string,
   ports: AppPorts,
-  opts?: { warning?: CardWarning; preferredMessageTs?: string },
+  opts?: { warning?: CardWarning; preferredMessageTs?: string; repost?: boolean },
 ): void {
   try {
     const rows = ports.sheets.getEventsForBusinessDate(businessDate);
@@ -82,7 +82,15 @@ export function redrawCardForBusinessDate(
       warning: opts?.warning,
     });
 
-    pushCard(channelId, businessDate, blocks, `稼働記録 ${businessDate}`, ports, opts?.preferredMessageTs);
+    pushCard(
+      channelId,
+      businessDate,
+      blocks,
+      `稼働記録 ${businessDate}`,
+      ports,
+      opts?.preferredMessageTs,
+      opts?.repost === true,
+    );
   } catch (e) {
     // カード再描画の失敗は致命的ではない（記録は既に完了している。次回の再描画で修復される）。
     // ただし原因が GAS の実行ログから追えるよう記録だけはしておく（観測性）。
@@ -102,6 +110,17 @@ function isMessageGoneError(e: unknown): boolean {
  * 対象 ts は `preferredMessageTs`（呼び出し側が把握している「いま操作されたカード」の
  * 正確な ts）を最優先し、無ければ内部シートの `card` キャッシュを使う。
  *
+ * `repost === true`（素の `/kado` 専用）のときは、その場更新ではなく必ず「削除→新規投稿」を
+ * 行う。既存カードが上にスクロールして見えなくなっていても、新しいカードが投稿されるため
+ * 必ず目に入る（実装設計外の UX 修正: 稼働終了後の再実行対策）。
+ *   1. 内部シートに既存カード ts（`storedTs`）があれば `ports.slack.deleteMessage` を
+ *      best-effort で呼ぶ（失敗しても無視して続行。`SlackAdapter` 自体も
+ *      `message_not_found`/`cant_delete_message` は握りつぶすが、それ以外のエラーも
+ *      ここでは止めない）。
+ *   2. `ports.slack.postMessage` で新規カードを投稿し、返った ts で内部シートを張り替える。
+ *   3. 既存カードが無い（初回）場合は削除をスキップし、投稿のみ行う。
+ *
+ * `repost` が偽（既定）のときは従来どおり:
  * - 対象 ts があれば `chat.update` を試す。
  *   - 成功: 内部シートの保存値が対象 ts と異なれば（または未保存なら）上書きする（自己修復。
  *     内部シートの ts が Sheets の型変換等で壊れていても、次回以降は正しい値に揃う）。
@@ -118,9 +137,24 @@ function pushCard(
   text: string,
   ports: AppPorts,
   preferredMessageTs?: string,
+  repost = false,
 ): void {
   const key = `${channelId}:${businessDate}`;
   const storedTs = ports.sheets.getInternalValue("card", key);
+
+  if (repost) {
+    if (storedTs !== null) {
+      try {
+        ports.slack.deleteMessage({ channel: channelId, ts: storedTs });
+      } catch (e) {
+        console.error("pushCard delete failed: " + (e instanceof Error ? (e.stack || e.message) : String(e)));
+      }
+    }
+    const posted = ports.slack.postMessage({ channel: channelId, text, blocks });
+    ports.sheets.setInternalValue("card", key, posted.ts);
+    return;
+  }
+
   const target = preferredMessageTs ?? storedTs;
 
   if (target !== null) {

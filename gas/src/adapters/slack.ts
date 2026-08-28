@@ -82,12 +82,24 @@ export class SlackAdapter implements SlackPort {
   }
 
   postEphemeral(responseUrl: string, text: string): void {
-    postToResponseUrl(responseUrl, { response_type: "ephemeral", text });
+    postToResponseUrl(responseUrl, { replace_original: true, response_type: "ephemeral", text });
   }
 
   dm(userId: string, text: string): void {
     const opened = callSlackApi(this.token(), "conversations.open", { users: userId });
     const channel = opened.channel as { id: string };
     callSlackApi(this.token(), "chat.postMessage", { channel: channel.id, text });
+  }
+
+  deleteMessage(input: { channel: string; ts: string }): void {
+    try {
+      callSlackApi(this.token(), "chat.delete", input);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      if (message.includes("message_not_found") || message.includes("cant_delete_message")) {
+        return;
+      }
+      throw e;
+    }
   }
 }

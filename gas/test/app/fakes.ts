@@ -104,9 +104,18 @@ export class FakeSlack implements SlackPort {
   viewsUpdated: SlackViewsUpdateInput[] = [];
   ephemeral: { responseUrl: string; text: string }[] = [];
   dms: { userId: string; text: string }[] = [];
+  deleted: { channel: string; ts: string }[] = [];
 
   nextPostTs = "1756260000.000001";
   failNextUpdate = false;
+  /**
+   * `true` にすると次回の `deleteMessage()` がエラーを投げる。実 `SlackAdapter` は
+   * `message_not_found`/`cant_delete_message` をここで握りつぶすため呼び出し側には届かないが、
+   * フェイクではあえて届く形にして `cardHelpers.pushCard` 側の best-effort な try/catch
+   * （どんな理由の失敗でも `/kado` 全体を壊さない）を直接検証できるようにする。
+   */
+  failNextDelete = false;
+  failNextDeleteError = "slack_api_error:chat.delete:message_not_found";
   /**
    * `failNextUpdate` が true のとき `update()` が投げるエラーメッセージ。既定は一般的な
    * Slack API エラー（`SlackAdapter` が投げる `slack_api_error:chat.update:<error>` 相当）。
@@ -147,6 +156,14 @@ export class FakeSlack implements SlackPort {
 
   dm(userId: string, text: string): void {
     this.dms.push({ userId, text });
+  }
+
+  deleteMessage(input: { channel: string; ts: string }): void {
+    if (this.failNextDelete) {
+      this.failNextDelete = false;
+      throw new Error(this.failNextDeleteError);
+    }
+    this.deleted.push(input);
   }
 }
 

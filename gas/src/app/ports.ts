@@ -167,10 +167,20 @@ export interface SlackPort {
   update(input: SlackUpdateMessage): void;
   viewsOpen(input: SlackViewsOpenInput): SlackViewsOpenResult;
   viewsUpdate(input: SlackViewsUpdateInput): void;
-  /** `response_url` への POST（ephemeral）。 */
+  /**
+   * `response_url` への POST（ephemeral）。`replace_original: true` を付与するため、
+   * スラッシュコマンドが最初に返す「⏳ 処理中…」等の暫定エフェメラル応答をこの呼び出しの
+   * 内容で置き換える。
+   */
   postEphemeral(responseUrl: string, text: string): void;
   /** DM 送信（`conversations.open` ＋ `chat.postMessage`、実装設計 §7.9）。 */
   dm(userId: string, text: string): void;
+  /**
+   * `chat.delete` でメッセージを削除する（Bot 自身の投稿のみ、既存 `chat:write` スコープで可）。
+   * 対象がすでに無い/削除できない（`message_not_found`/`cant_delete_message`）場合は
+   * 呼び出し側が best-effort で使えるよう例外にせず握りつぶす。それ以外のエラーは例外を投げる。
+   */
+  deleteMessage(input: { channel: string; ts: string }): void;
 }
 
 // ---------------------------------------------------------------------------

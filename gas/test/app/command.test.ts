@@ -23,32 +23,56 @@ function makeCommandRequest(overrides: Partial<CommandRequest> = {}): CommandReq
   };
 }
 
-describe("handleCommand — ''（当日カード）", () => {
-  it("内部 card ts が無ければ postMessage して ts を保存する", () => {
+describe("handleCommand — ''（当日カード・再投稿）", () => {
+  it("内部 card ts が無ければ（初回）delete を呼ばず postMessage のみで ts を保存する", () => {
     const ports = makeFakePorts();
     const result = handleCommand(makeCommandRequest({ text: "" }), ports);
 
     expect(result).toEqual({ ok: true, applied: true });
+    expect(ports.slack.deleted).toHaveLength(0);
     expect(ports.slack.posted).toHaveLength(1);
     expect(ports.slack.updated).toHaveLength(0);
     expect(ports.sheets.getInternalValue("card", `C1:${TODAY}`)).toBe(ports.slack.nextPostTs);
   });
 
-  it("既存 ts があれば chat.update する", () => {
+  it("既存 ts があれば chat.update ではなく、その ts を削除してから新規 postMessage する（再投稿）", () => {
     const ports = makeFakePorts();
     ports.sheets.setInternalValue("card", `C1:${TODAY}`, "1756260000.000999");
 
     const result = handleCommand(makeCommandRequest({ text: "" }), ports);
 
     expect(result).toEqual({ ok: true, applied: true });
-    expect(ports.slack.posted).toHaveLength(0);
-    expect(ports.slack.updated).toHaveLength(1);
-    expect(ports.slack.updated[0]?.ts).toBe("1756260000.000999");
+    expect(ports.slack.updated).toHaveLength(0);
+    expect(ports.slack.deleted).toEqual([{ channel: "C1", ts: "1756260000.000999" }]);
+    expect(ports.slack.posted).toHaveLength(1);
+    expect(ports.sheets.getInternalValue("card", `C1:${TODAY}`)).toBe(ports.slack.nextPostTs);
+  });
+
+  it("deleteMessage が失敗（message_not_found 相当）しても全体は成功し、新カードが投稿される", () => {
+    const ports = makeFakePorts();
+    ports.sheets.setInternalValue("card", `C1:${TODAY}`, "1756260000.000999");
+    ports.slack.failNextDelete = true;
+
+    const result = handleCommand(makeCommandRequest({ text: "" }), ports);
+
+    expect(result).toEqual({ ok: true, applied: true });
+    expect(ports.slack.posted).toHaveLength(1);
+    expect(ports.sheets.getInternalValue("card", `C1:${TODAY}`)).toBe(ports.slack.nextPostTs);
+  });
+
+  it("実行後に response_url へ replace_original 相当の ephemeral 解決を送る（⏳ 処理中… の解決）", () => {
+    const ports = makeFakePorts();
+
+    handleCommand(makeCommandRequest({ text: "" }), ports);
+
+    expect(ports.slack.ephemeral).toHaveLength(1);
+    expect(ports.slack.ephemeral[0]?.responseUrl).toBe("https://hooks.slack.test/xxx");
+    expect(ports.slack.ephemeral[0]?.text).toContain("表示しました");
   });
 });
 
 describe("handleCommand — refresh", () => {
-  it("既存カードを再描画する（update）", () => {
+  it("既存カードを再描画する（update。delete/repost はしない）", () => {
     const ports = makeFakePorts();
     ports.sheets.setInternalValue("card", `C1:${TODAY}`, "1756260000.000999");
 
@@ -56,6 +80,18 @@ describe("handleCommand — refresh", () => {
 
     expect(result).toEqual({ ok: true, applied: true });
     expect(ports.slack.updated).toHaveLength(1);
+    expect(ports.slack.deleted).toHaveLength(0);
+    expect(ports.slack.posted).toHaveLength(0);
+  });
+
+  it("実行後に response_url へ ephemeral 解決を送る", () => {
+    const ports = makeFakePorts();
+    ports.sheets.setInternalValue("card", `C1:${TODAY}`, "1756260000.000999");
+
+    handleCommand(makeCommandRequest({ text: "refresh" }), ports);
+
+    expect(ports.slack.ephemeral).toHaveLength(1);
+    expect(ports.slack.ephemeral[0]?.text).toContain("更新しました");
   });
 });
 
