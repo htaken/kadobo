@@ -53,7 +53,9 @@ function buildPorts(): AppPorts {
 export function doPost(
   e: GoogleAppsScript.Events.DoPost,
 ): GoogleAppsScript.Content.TextOutput {
-  const raw = e.postData?.contents ?? "";
+  // `e` はエディタから手動実行すると undefined になる（doPost は HTTP POST でのみ呼ぶ想定）。
+  // 実運用の POST には必ず postData があるが、手動実行時に例外を投げず JSON を返せるよう防御する。
+  const raw = e?.postData?.contents ?? "";
   const result = handlePostBody(raw, buildPorts());
   return ContentService.createTextOutput(JSON.stringify(result)).setMimeType(
     ContentService.MimeType.JSON,
