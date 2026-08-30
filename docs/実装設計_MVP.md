@@ -75,7 +75,9 @@ kadobo/
 | `sessions` | section | 当日の各セッション `#1 09:02 – 12:00（休憩 0:30）`、進行中は `#2 13:00 –` |
 | `total` | section | `本日累計 2h 28m`（要修正がある日は `⚠️ 要修正` を併記） |
 | `actions` | actions | 状態で有効なボタンのみ（§2.3） |
-| `status` | context | 直近イベントの処理状態 `⏳ 開始 09:02 記録中…` ／ `⚠️ 記録待ち（自動再試行中）` ／ `✅ 開始 09:02 記録済み` |
+| `status` | context | 直近イベントの処理状態 `⏳ 開始 09:02 記録中…` ／ `⚠️ 記録待ち（自動再試行中）` ／ `⚠️ 記録に失敗しました（DM をご確認ください）` ／ `✅ 開始 09:02 記録済み` |
+
+`⏳ …記録中…` を表示している間は `actions` ブロックを外す（処理中の二度押し防止）。ボタンは GAS のカード再描画、または Worker の `⚠️` 表示（押下時の blocks を復元する）で戻る。
 
 ### 2.3 ボタン `action_id`（`actions` ブロック内）
 
@@ -152,10 +154,19 @@ Worker の判定:
 
 | 結果 | ジャーナル `status` | 追加動作 |
 |---|---|---|
-| HTTP≠200／本文が JSON でない／`ok` 無し／タイムアウト（20 s）／ネットワーク例外 | `pending` のまま、`attempts++`、`last_error` | 初回失敗時にカード `status` を `⚠️ 記録待ち（自動再試行中）` |
+| HTTP≠200／本文が JSON でない／`ok` 無し／タイムアウト（25 s）／ネットワーク例外 | `pending` のまま、`attempts++`、`last_error` | **カードは触らない**（⏳ のまま）。本人へ ephemeral「記録の反映を確認できませんでした（自動で再試行します）」 |
 | `ok:true`（`applied` 問わず） | `done` | なし（カード確定表示は GAS が行う） |
-| `ok:false, retryable:true` | `pending` | 同上 |
-| `ok:false, retryable:false` | `rejected` | 本人へ DM（処理 ID・エラー） |
+| `ok:false, retryable:true`（`LOCK_TIMEOUT` 等の**適用前エラー**） | `pending` | カード `status` を `⚠️ 記録待ち（自動再試行中）` に（`actions` も復元） |
+| `ok:false, retryable:true`（上記以外＝ GAS の総括 catch 由来） | `pending` | **カードは触らない**（⏳ のまま）＋ ephemeral |
+| `ok:false, retryable:false` | `rejected` | 本人へ DM（処理 ID・エラー）＋ カード `status` を `⚠️ 記録に失敗しました（DM をご確認ください）` に（`actions` も復元） |
+
+**カードを上書きしてよい条件**（Codex 指摘の「timeout 時の上書き競合」対策）: Worker が持っているのは*押下時点の古い* `blocks` なので、GAS がすでにカードを描き替えていた場合に `chat.update` すると正しい表示を巻き戻してしまう。上書きしてよいのは「GAS がカードに触れていないと確定できる」次の場合だけ:
+
+- `rejected`（GAS が `retryable:false` で明示的に未適用を宣言。かつ Cron 再送されない終局状態なので、戻さないとボタンが消えたままになる）
+- `pending` かつエラーコードが `shared` の `GAS_PRE_APPLY_ERRORS`（`UNAUTHORIZED` / `BAD_REQUEST` / `MALFORMED_BODY` / `LOCK_TIMEOUT`＝ユースケース本体に入る前に返るもの）
+- `forwarding_enabled='0'` で GAS へ送っていない場合
+
+それ以外（タイムアウト・ネットワーク断・HTTP エラー・GAS の総括 catch）は適用有無が不明なため、カードは ⏳ のまま残して Cron 再送（最大 5 分）で GAS に正しく描き直させる。
 
 - GAS Web アプリは認可エラー等で **HTML を 200 で返す**ことがあるため、必ず JSON パースと `ok` の存在を確認する
 - GAS の `/exec` は 302 リダイレクトを返す。Worker の `fetch` は `redirect: 'follow'`（既定）で追従する
@@ -185,7 +196,8 @@ Worker の判定:
 
 - Worker: D1 `journal.idempotency_key UNIQUE`。`INSERT … ON CONFLICT(idempotency_key) DO NOTHING` とし `meta.changes === 0` なら重複→ACK のみ
 - GAS: `stamp`／`correction_submit` は**生ログの `idempotency_key` 列**で重複判定する（`TextFinder` 完全一致）。重複なら `{ok:true, applied:false, reason:'DUPLICATE'}` を返し、**カードは再描画する**（前回の Slack 更新失敗を修復するため）。`command`／`open_correction` は本質的に冪等なので判定不要
-- GAS の書込処理は `LockService.getScriptLock()`（待機 20 秒）で直列化する
+- GAS の書込処理は `LockService.getScriptLock()`（待機 **10 秒** = `shared` の `GAS_LOCK_WAIT_MS`）で直列化する。Worker 側タイムアウト（`GAS_TIMEOUT_MS` = 25 秒）より十分短くしてあるのが要点で、同値だとロック待ちのリクエストが処理へ進む前に Worker が打ち切られ、「適用済みか未適用か不明」な結果しか残らない。短くしておけば `{ok:false, error:'LOCK_TIMEOUT', retryable:true}` として「確実に未適用」と分かる形で素早く返る
+- 重複（`DUPLICATE`）分岐でも**日次・月次の再計算をやり直す**。再送の原因には「生ログ追記までは成功し、その後の再計算で落ちた」ケースが含まれるため、再描画だけで `ok` を返すと集計が欠落したまま D1 が `done` になり復旧しない
 
 ### 4.3 ID
 
@@ -234,8 +246,8 @@ CREATE TABLE nonces (nonce TEXT PRIMARY KEY, seen_at INTEGER NOT NULL);
 1. 冪等キー生成 → D1 に `pending` で INSERT（重複なら ACK して終了）
 2. **即 ACK**（200、空ボディ）
 3. `ctx.waitUntil()` 内で順に:
-   - `chat.update`: `payload.message.blocks` から `block_id === 'status'` を除去し、末尾に context `⏳ {ラベル} {HH:mm JST} 記録中…` を追加（`text` は元のフォールバック）
-   - `forwarding_enabled` を確認 → GAS へ POST（§3）→ §3.3 の表に従い D1 更新。失敗なら `status` ブロックを `⚠️ 記録待ち（自動再試行中）` に
+   - `chat.update`: `payload.message.blocks` から `block_id === 'status'` と `block_id === 'actions'` を除去し、末尾に context `⏳ {ラベル} {HH:mm JST} 記録中…` を追加（`text` は元のフォールバック）。`actions` を外すのは処理中の二度押し防止
+   - `forwarding_enabled` を確認 → GAS へ POST（§3）→ §3.3 の表に従い D1 更新。失敗時のカード表示は §3.3 の「カードを上書きしてよい条件」に従う（上書きしてよい場合のみ押下時の blocks を復元して `status` を `⚠️` にする。不明な場合はカードを触らず ephemeral のみ）
 
 ### 6.3 `block_actions`（`kado_correct`）
 

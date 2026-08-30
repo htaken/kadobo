@@ -10,7 +10,7 @@ import { createTestHarness } from "wrangler";
 import type { Env } from "../src/index";
 import { handleKadoCorrect } from "../src/handlers/correct";
 import { handleSlashCommand } from "../src/handlers/command";
-import { handleStamp, withStatusBlock } from "../src/handlers/stamp";
+import { handleStamp, isCardSafeToOverwrite, withStatusBlock } from "../src/handlers/stamp";
 import { handleViewSubmission } from "../src/handlers/view_submission";
 import * as journal from "../src/journal";
 import type { SlackBlockAction, SlackBlockActionsPayload, SlackSlashCommand, SlackViewSubmissionPayload } from "../src/slack/parse";
@@ -53,6 +53,7 @@ function makeStampPayload(overrides?: Partial<SlackBlockActionsPayload>): SlackB
       text: "稼働記録",
       blocks: [
         { block_id: "header", type: "section" },
+        { block_id: "actions", type: "actions", elements: [{ type: "button", action_id: "kado_start" }] },
         { block_id: "status", type: "context" },
       ],
     },
@@ -89,6 +90,8 @@ describe("handleStamp", () => {
     const blocks = (chatUpdateCalls[0]?.body as any).blocks;
     expect(blocks.find((b: any) => b.block_id === "status").elements[0].text).toContain("⏳ 開始");
     expect(blocks.filter((b: any) => b.block_id === "status")).toHaveLength(1);
+    // ⏳ 表示中は actions を外して二度押しを防ぐ（ボタンは GAS の再描画で戻る）。
+    expect(blocks.some((b: any) => b.block_id === "actions")).toBe(false);
   });
 
   it("重複押下: 2 回目は journal 追加なしで即 200", async () => {
@@ -138,6 +141,8 @@ describe("handleStamp", () => {
     expect(lastBlocks.find((b: any) => b.block_id === "status").elements[0].text).toBe(
       "⚠️ 記録待ち（自動再試行中）",
     );
+    // LOCK_TIMEOUT は GAS がカードに触れる前のエラー。⏳ で外したボタンをここで戻す。
+    expect(lastBlocks.some((b: any) => b.block_id === "actions")).toBe(true);
     // rejected ではないので DM (chat.postMessage 宛先=user_id) は送らない
     const dm = calls.find((c) => c.url.endsWith("/chat.postMessage") && (c.body as any).channel === "U1");
     expect(dm).toBeUndefined();
@@ -165,6 +170,87 @@ describe("handleStamp", () => {
     const dm = calls.find((c) => c.url.endsWith("/chat.postMessage") && (c.body as any).channel === "U1");
     expect(dm).toBeDefined();
     expect((dm?.body as any).text).toContain("SCHEMA_ERROR");
+
+    // rejected は Cron 再送されない終局状態。ここでカードを戻さないとボタンが消えたままになる。
+    const lastUpdate = calls.filter((c) => c.url.endsWith("/chat.update")).pop();
+    const lastBlocks = (lastUpdate?.body as any).blocks;
+    expect(lastBlocks.some((b: any) => b.block_id === "actions")).toBe(true);
+    expect(lastBlocks.find((b: any) => b.block_id === "status").elements[0].text).toBe(
+      "⚠️ 記録に失敗しました（DM をご確認ください）",
+    );
+  });
+
+  it("timeout: 適用有無が不明なのでカードは ⏳ のまま。⚠️ 上書きせず response_url へ ephemeral", async () => {
+    const env = makeEnv(db);
+    const { ctx, flush } = createTestCtx();
+    const { fetchImpl, calls } = createFetchStub((url) => {
+      if (url === env.GAS_URL) {
+        // AbortController によるタイムアウトと同じ結果（例外）を再現する。
+        throw Object.assign(new Error("The operation was aborted"), { name: "AbortError" });
+      }
+      return undefined;
+    });
+    const payload = makeStampPayload();
+
+    await handleStamp({ env, ctx, action: makeStampAction(), payload, fetchImpl });
+    await flush();
+
+    const rows = await allJournalRows();
+    expect(rows[0].status).toBe("pending");
+
+    // ⏳ の 1 回だけ。GAS がすでにカードを描き替えている可能性があるため上書きしない。
+    const chatUpdateCalls = calls.filter((c) => c.url.endsWith("/chat.update"));
+    expect(chatUpdateCalls).toHaveLength(1);
+    expect((chatUpdateCalls[0]?.body as any).blocks.find((b: any) => b.block_id === "status").elements[0].text)
+      .toContain("⏳");
+
+    // 代わりに本人へ ephemeral。カード自体を差し替えないよう replace_original は付けない。
+    const ephemeral = calls.find((c) => c.url === payload.response_url);
+    expect(ephemeral).toBeDefined();
+    expect((ephemeral?.body as any).response_type).toBe("ephemeral");
+    expect((ephemeral?.body as any).replace_original).toBeUndefined();
+    expect((ephemeral?.body as any).text).toContain("確認できませんでした");
+  });
+
+  it("GAS が HTTP 500: 同じく不明扱い。カードは ⏳ のままで ephemeral", async () => {
+    const env = makeEnv(db);
+    const { ctx, flush } = createTestCtx();
+    const { fetchImpl, calls } = createFetchStub((url) => {
+      if (url === env.GAS_URL) {
+        return new Response("boom", { status: 500 });
+      }
+      return undefined;
+    });
+    const payload = makeStampPayload();
+
+    await handleStamp({ env, ctx, action: makeStampAction(), payload, fetchImpl });
+    await flush();
+
+    const rows = await allJournalRows();
+    expect(rows[0].status).toBe("pending");
+    expect(rows[0].last_error).toBe("http_500");
+    expect(calls.filter((c) => c.url.endsWith("/chat.update"))).toHaveLength(1);
+    expect(calls.some((c) => c.url === payload.response_url)).toBe(true);
+  });
+
+  it("response_url が無い状態で不明終了: ephemeral の代わりに DM で知らせる", async () => {
+    const env = makeEnv(db);
+    const { ctx, flush } = createTestCtx();
+    const { fetchImpl, calls } = createFetchStub((url) => {
+      if (url === env.GAS_URL) {
+        return jsonResponse({ ok: false, error: "Service Spreadsheets timed out", retryable: true });
+      }
+      return undefined;
+    });
+    const payload = makeStampPayload({ response_url: undefined });
+
+    await handleStamp({ env, ctx, action: makeStampAction(), payload, fetchImpl });
+    await flush();
+
+    // GAS の総括 catch 由来のエラーは「追記後に落ちた」可能性があるため上書きしない。
+    expect(calls.filter((c) => c.url.endsWith("/chat.update"))).toHaveLength(1);
+    const dm = calls.find((c) => c.url.endsWith("/chat.postMessage") && (c.body as any).channel === "U1");
+    expect((dm?.body as any).text).toContain("確認できませんでした");
   });
 
   it("forwarding_enabled='0': GAS へ送らず journal は pending のまま、カードは ⚠️", async () => {
@@ -197,6 +283,35 @@ describe("withStatusBlock", () => {
       block_id: "status",
       elements: [{ type: "mrkdwn", text: "⏳ test" }],
     });
+  });
+
+  it("既定では actions ブロックを残す", () => {
+    const blocks = withStatusBlock([{ block_id: "header" }, { block_id: "actions" }], "⚠️ test");
+    expect(blocks.some((b) => b.block_id === "actions")).toBe(true);
+  });
+
+  it("removeActions: actions ブロックも除去する（⏳ 中の二度押し防止）", () => {
+    const blocks = withStatusBlock([{ block_id: "header" }, { block_id: "actions" }], "⏳ test", {
+      removeActions: true,
+    });
+    expect(blocks.some((b) => b.block_id === "actions")).toBe(false);
+    expect(blocks.some((b) => b.block_id === "header")).toBe(true);
+  });
+});
+
+describe("isCardSafeToOverwrite", () => {
+  it("rejected と GAS の適用前エラーだけ true", () => {
+    expect(isCardSafeToOverwrite({ status: "rejected", error: "BAD_REQUEST" })).toBe(true);
+    expect(isCardSafeToOverwrite({ status: "rejected", error: "SCHEMA_ERROR" })).toBe(true);
+    expect(isCardSafeToOverwrite({ status: "pending", error: "LOCK_TIMEOUT" })).toBe(true);
+  });
+
+  it("適用有無が不明な結果は false（GAS が描いたカードを壊さない）", () => {
+    expect(isCardSafeToOverwrite({ status: "pending", error: "timeout" })).toBe(false);
+    expect(isCardSafeToOverwrite({ status: "pending", error: "http_500" })).toBe(false);
+    expect(isCardSafeToOverwrite({ status: "pending", error: "invalid_response_shape" })).toBe(false);
+    expect(isCardSafeToOverwrite({ status: "pending", error: "Service Spreadsheets timed out" })).toBe(false);
+    expect(isCardSafeToOverwrite({ status: "done" })).toBe(false);
   });
 });
 

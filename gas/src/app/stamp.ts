@@ -33,8 +33,14 @@ export function handleStamp(req: StampRequest, ports: AppPorts): GasResponse {
   const nowMs = ports.clock.nowMs();
 
   // 1. 重複判定（実装設計 §4.2: 生ログの idempotency_key 列で完全一致）。
+  //
+  // 再送の理由は「生ログ追記までは成功したが、その後の再計算またはカード更新で落ちた／
+  // Worker への応答が届かなかった」ケースを含む。したがって重複分岐でも初回と同じ
+  // 「再計算 → カード再描画」を必ずやり直す（再計算を飛ばすと、日次・月次が欠落したまま
+  // D1 だけ done になり、二度と復旧しない）。どちらも冪等なので追記なしで安全に反復できる。
   const existing = ports.sheets.findRawLogByIdempotencyKey(req.idempotency_key);
   if (existing !== null) {
+    recomputeDailyAndMonthly(existing.business_date, ports);
     redrawCardForBusinessDate(existing.business_date, req.channel_id, ports, {
       preferredMessageTs: req.message_ts,
     });

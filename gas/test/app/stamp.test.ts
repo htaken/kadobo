@@ -1,4 +1,5 @@
 import { buttonIdempotencyKey } from "@kadobo/shared/ids";
+import { formatJst } from "@kadobo/shared/time";
 import type { GasRequest } from "@kadobo/shared/protocol";
 import { describe, expect, it } from "vitest";
 import { handleStamp } from "../../src/app/stamp";
@@ -90,6 +91,41 @@ describe("handleStamp — 重複", () => {
     expect(ports.sheets.rawLog).toHaveLength(1); // 追記されない
     // カード再描画（前回 Slack 更新失敗の修復）: preferredMessageTs があるので update が呼ばれる。
     expect(ports.slack.updated).toHaveLength(2);
+  });
+
+  it("生ログ追記後・再計算前に落ちた再送でも、重複分岐で日次・月次を計算し直す", () => {
+    const ports = makeFakePorts();
+    const req = makeStampRequest();
+
+    // 「生ログ 1 行の追記までは成功したが、その直後の再計算で落ちた」状態を再現する。
+    // 従来はこの再送が再描画だけで ok を返し、日次・月次が欠けたまま D1 が done になっていた。
+    ports.sheets.rawLog.push({
+      event_id: "E_SEED",
+      idempotency_key: req.idempotency_key,
+      business_date: "2026-09-01",
+      event_type: "START",
+      occurred_at: req.occurred_at_ms,
+      occurred_at_jst: formatJst(req.occurred_at_ms),
+      received_at: req.received_at_ms,
+      processed_at: req.received_at_ms,
+      source: "button",
+      session_no: 1,
+      memo: "",
+      correction_of: null,
+      old_value: null,
+      new_value: null,
+      reason: "",
+    });
+    expect(ports.sheets.dailySummaries.size).toBe(0);
+    expect(ports.sheets.monthlyBills.size).toBe(0);
+
+    const result = handleStamp({ ...req, source: "retry" }, ports);
+
+    expect(result).toEqual({ ok: true, applied: false, reason: "DUPLICATE" });
+    expect(ports.sheets.rawLog).toHaveLength(1); // 追記されない（冪等）
+    expect(ports.sheets.dailySummaries.get("2026-09-01")?.status).toBe("進行中");
+    expect(ports.sheets.monthlyBills.size).toBe(1);
+    expect(ports.slack.updated).toHaveLength(1);
   });
 });
 

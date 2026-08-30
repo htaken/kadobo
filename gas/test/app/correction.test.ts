@@ -173,6 +173,33 @@ describe("handleCorrectionSubmit — 重複", () => {
     expect(result).toEqual({ ok: true, applied: false, reason: "DUPLICATE" });
     expect(ports.sheets.rawLog).toHaveLength(2); // 追記されない
   });
+
+  it("CORRECTION 追記後・再計算前に落ちた再送でも、重複分岐で日次・月次を計算し直す", () => {
+    const ports = makeFakePorts();
+    const req = makeSubmitRequest();
+    ports.sheets.rawLog.push(startRow());
+    // 「CORRECTION 行の追記までは成功したが、その直後の再計算で落ちた」状態を再現する。
+    ports.sheets.rawLog.push(
+      startRow({
+        event_id: "E_CORR",
+        idempotency_key: req.idempotency_key,
+        event_type: "CORRECTION",
+        session_no: null,
+        correction_of: "E1",
+        old_value: START_MS,
+        new_value: jstToMs("2026-09-01", "09:30"),
+      }),
+    );
+    expect(ports.sheets.dailySummaries.size).toBe(0);
+    expect(ports.sheets.monthlyBills.size).toBe(0);
+
+    const result = handleCorrectionSubmit({ ...req, source: "retry" }, ports);
+
+    expect(result).toEqual({ ok: true, applied: false, reason: "DUPLICATE" });
+    expect(ports.sheets.rawLog).toHaveLength(2); // 追記されない（冪等）
+    expect(ports.sheets.dailySummaries.get(BUSINESS_DATE)).toBeDefined();
+    expect(ports.sheets.monthlyBills.size).toBe(1);
+  });
 });
 
 describe("handleOpenCorrection", () => {

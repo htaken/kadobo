@@ -1,3 +1,27 @@
+## 対応状況（2026-08-28 追記）
+
+本文の指摘はすべてコード側で解消済み。
+
+**「推奨コード修正」の 3 点**（先行対応済み）
+
+| 指摘 | 対応 |
+|---|---|
+| `preferredMessageTs` を追加し stamp/correction で `req.message_ts` を使う | `gas/src/app/cardHelpers.ts` の `redrawCardForBusinessDate(..., {preferredMessageTs})`。stamp/correction/重複/不正遷移の全経路で `req.message_ts` を渡す |
+| 更新成功後に内部 card ts を自己修復 | `pushCard()`: `chat.update` 成功時に `storedTs !== target` なら内部シートを上書き |
+| 保存 ts が `message_not_found` なら再投稿 | `pushCard()`: `message_not_found`/`cant_update_message` で `chat.postMessage` にフォールバックし内部 ts を張り替え |
+
+**「その他の潜在不具合」**
+
+| 指摘 | 対応 |
+|---|---|
+| 生ログ追記後に再計算が失敗すると、再送時に再計算されない | `handleStamp` / `handleCorrectionSubmit` の重複（`DUPLICATE`）分岐で `recomputeDailyAndMonthly()` を必ず呼ぶようにした。回帰テスト: 「生ログ追記後・再計算前に落ちた再送でも、重複分岐で日次・月次を計算し直す」 |
+| Worker の 20 秒 timeout と GAS の 20 秒 Lock 待機が同値 | `GAS_LOCK_WAIT_MS = 10000`（新設、`shared/src/protocol.ts`）を `LockAdapter` が使う。`GAS_TIMEOUT_MS` は 20000 → 25000。差が 10 秒以上あることを `shared/test/protocol.test.ts` で固定 |
+| timeout 時に Worker が古い blocks で GAS の成功描画を上書きし得る | Worker は「GAS がカードに触れていないと確定できる」場合のみ上書きする（`isCardSafeToOverwrite()`）。判定は `rejected`（終局・未適用宣言）と `isGasPreApplyError()`（`UNAUTHORIZED`/`BAD_REQUEST`/`MALFORMED_BODY`/`LOCK_TIMEOUT`）のみ。timeout・ネットワーク断・HTTP エラー・GAS の総括 catch はカードを ⏳ のまま残し、本人へ ephemeral で知らせて Cron 再送に任せる |
+| ⏳ 表示中も actions が残り再押下できる | `withStatusBlock(..., {removeActions:true})` で ⏳ 中は `actions` を除去。ボタンは GAS の再描画、または上書き可判定が真のときの ⚠️ 表示（押下時 blocks を復元）で戻る |
+| 進行中カードが「本日累計 ⚠️ 要修正」と表示される | 先行対応済み。`daily.status` を `ok`/`in_progress`/`needs_fix` に写像し、進行中は `本日累計 Xh Ym（計測中）` |
+
+---
+
 ## 結論
 
 最有力の根本原因は、**対策前に数値化・桁落ちした「内部」シートのカード ts が、対策適用後も修復されず残っていること**です。そこに、**GAS が `chat.update` 失敗を握りつぶして `ok:true` を返す設計**が重なり、D1 は `done` なのにカードだけ⏳のままになります。報告された症状とコードの挙動が完全に一致します。

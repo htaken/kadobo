@@ -60,9 +60,11 @@ function notifyCorrectionFailure(
 export function handleCorrectionSubmit(req: CorrectionSubmitRequest, ports: AppPorts): GasResponse {
   const nowMs = ports.clock.nowMs();
 
-  // 1. 重複判定。
+  // 1. 重複判定。`handleStamp` と同じ理由（追記後・再計算前に落ちた再送を救う）で、
+  // 重複分岐でも再計算とカード再描画をやり直す。
   const existing = ports.sheets.findRawLogByIdempotencyKey(req.idempotency_key);
   if (existing !== null) {
+    recomputeDailyAndMonthly(existing.business_date, ports);
     redrawCardForBusinessDate(existing.business_date, req.channel_id, ports, {
       preferredMessageTs: req.message_ts,
     });

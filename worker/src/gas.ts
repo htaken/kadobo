@@ -43,7 +43,7 @@ export async function buildEnvelope(
 
 export interface SendToGasOptions extends BuildEnvelopeOptions {
   fetchImpl?: typeof fetch;
-  /** テスト用: タイムアウト（ms）。既定は `GAS_TIMEOUT_MS`（20000）。 */
+  /** テスト用: タイムアウト（ms）。既定は `GAS_TIMEOUT_MS`（25000）。 */
   timeoutMs?: number;
 }
 

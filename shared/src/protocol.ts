@@ -12,8 +12,24 @@ export const ENVELOPE_VERSION = 1;
 /** 封筒の受付窓（秒）。`|now - ts| <= ENVELOPE_WINDOW_SEC` を許容する（実装設計 §3.1）。 */
 export const ENVELOPE_WINDOW_SEC = 300;
 
-/** Worker → GAS 呼び出しのタイムアウト（ms）（実装設計 §3.3）。 */
-export const GAS_TIMEOUT_MS = 20000;
+/**
+ * GAS 側で `LockService.getScriptLock()` を待つ最大時間（ms）（実装設計 §4.2）。
+ *
+ * {@link GAS_TIMEOUT_MS} より十分短くなければならない。同値だと「ロックを待たされた
+ * リクエスト」が GAS の処理へ進む前に Worker 側でタイムアウトし、GAS が適用したのか
+ * どうか Worker から判別できない灰色の結果だけが残る。短くしておけば、待たされた
+ * リクエストは `{ok:false, error:'LOCK_TIMEOUT', retryable:true}` として素早く
+ * 「確実に未適用」と分かる形で返り、Cron 再送に安全に回せる。
+ */
+export const GAS_LOCK_WAIT_MS = 10000;
+
+/**
+ * Worker → GAS 呼び出しのタイムアウト（ms）（実装設計 §3.3）。
+ *
+ * 内訳は「{@link GAS_LOCK_WAIT_MS}（最大 10 秒のロック待ち）＋ GAS 本体の処理（目標 5 秒、
+ * Sheets/Slack が遅い日で 10 秒程度）」。`waitUntil()` の 30 秒上限の内側に収める。
+ */
+export const GAS_TIMEOUT_MS = 25000;
 
 /** Cron 再送が何回連続失敗したら本人へメンション通知するか（実装設計 §6.6）。 */
 export const RETRY_NOTIFY_AT = 6;
@@ -114,6 +130,28 @@ export type GasRequest =
       received_at_ms: number;
       source: CommandSource;
     };
+
+/**
+ * 「GAS が生ログ追記・カード再描画のいずれにも触れていないことが確実」なエラーコード。
+ *
+ * `dispatch()` がユースケース本体（`handleStamp` 等）へ入る**前**に返すものだけを列挙する。
+ * Worker はこの判定が真のときに限り、押下時の古い blocks でカードを `chat.update` して
+ * よい（GAS 側がカードを描き替えていないと確定しているため、上書き競合が起きない）。
+ *
+ * 逆に、`dispatch()` の総括 catch が返す例外メッセージ（Sheets 一時エラー等）は
+ * 「追記後に落ちた」可能性があるため、ここには含めない。
+ */
+const GAS_PRE_APPLY_ERRORS: readonly string[] = [
+  "UNAUTHORIZED",
+  "BAD_REQUEST",
+  "MALFORMED_BODY",
+  "LOCK_TIMEOUT",
+];
+
+/** {@link GAS_PRE_APPLY_ERRORS} に含まれるか（Worker のカード上書き可否判定に使う）。 */
+export function isGasPreApplyError(error: string): boolean {
+  return GAS_PRE_APPLY_ERRORS.indexOf(error) !== -1;
+}
 
 /** GAS 側で `ok:true` を返す際に付与し得る理由コード（実装設計 §3.3）。 */
 export type GasResponseReason =

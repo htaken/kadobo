@@ -113,8 +113,8 @@ describe("sendToGas: 実装設計 §3.3 のマッピング", () => {
     expect(outcome).toEqual({ status: "pending", error: "getaddrinfo ENOTFOUND" });
   });
 
-  it("既定のタイムアウトは shared の GAS_TIMEOUT_MS(20000) と一致する", () => {
-    expect(GAS_TIMEOUT_MS).toBe(20000);
+  it("既定のタイムアウトは shared の GAS_TIMEOUT_MS(25000) と一致する", () => {
+    expect(GAS_TIMEOUT_MS).toBe(25000);
   });
 
   it("GAS_URL への POST は redirect:'follow' を指定する（GAS の /exec は 302 を返すため）", async () => {
