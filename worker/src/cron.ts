@@ -1,7 +1,7 @@
 /**
  * `scheduled` ハンドラの中身（実装設計 §6.6）。
  *
- * - `*\/5 * * * *`: pending 再送。`forwarding_enabled` を確認 → `created_at` 昇順に最大 20 件取得 →
+ * - `*\/5 * * * *`: pending 再送。`forwarding_enabled` を確認 → `created_at` 昇順に最大 16 件取得 →
  *   `source` を `'retry'` にして直列に GAS へ POST → §3.3 に従い更新。
  *   `attempts` が `RETRY_NOTIFY_AT` に達した時点、以後 `RETRY_NOTIFY_EVERY` 回ごとにメンション通知。
  * - `17 3 * * *`: §5 の 30 日削除・nonce 削除。
@@ -18,15 +18,21 @@ const NONCE_TTL_MS = 10 * 60 * 1000;
  * 1 起動あたりに再送する pending の最大件数（実装設計 §6.6）。
  *
  * Workers Free プランの**外部サブリクエスト上限は 1 起動あたり 50 件**で、リダイレクトチェーンも
- * その数に含まれる。GAS の `/exec` は必ず `script.googleusercontent.com` へ 302 を返し `sendToGas` は
- * `redirect: "follow"` なので、1 件の再送につき 2 件を消費する。さらに `notifyRejectedDm`／
- * `notifyRetryMention`（Slack API）も同じ枠を使う。
+ * その数に含まれる。1 件の再送が最悪ケースで消費する外部サブリクエストは **3 件**:
  *
- * したがって上限は 25 件未満に抑える必要がある。20 件なら通知が全件に付いても 50 件に収まる。
- * cron は 5 分ごとに再実行されるため、あふれた分は次サイクルで処理され取りこぼしにはならない。
+ * 1. `sendToGas` の POST … 1 件
+ * 2. GAS の `/exec` が返す `script.googleusercontent.com` への 302 追従（`redirect: "follow"`）… 1 件
+ * 3. `notifyRejectedDm`（DM）または `notifyRetryMention`（メンション）の `chat.postMessage` … 1 件
+ *
+ * 3 は「たまたま全件が同時に通知条件を満たす」場合に全件へ付く。pending は GAS 障害でまとめて
+ * 溜まるため `attempts` が揃って `RETRY_NOTIFY_AT` に達しやすく、また共有シークレット不一致等で
+ * GAS が全件に `retryable:false` を返せば全件が `notifyRejectedDm` に入る。**最悪ケースは現実的**。
+ *
+ * したがって `3n <= 50` すなわち **n <= 16**。cron は 5 分ごとに再実行されるため、あふれた分は
+ * 次サイクルで処理され取りこぼしにはならない。
  * （D1 へのアクセスは「内部サービス」枠＝Free プラン 1,000 件/起動の別勘定なのでここには数えない）
  */
-const RETRY_BATCH_LIMIT = 20;
+const RETRY_BATCH_LIMIT = 16;
 
 function messageTsOf(request: GasRequest): string | undefined {
   return request.kind === "command" ? undefined : request.message_ts;

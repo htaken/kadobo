@@ -269,7 +269,7 @@ CREATE TABLE nonces (nonce TEXT PRIMARY KEY, seen_at INTEGER NOT NULL);
 
 | cron | 処理 |
 |---|---|
-| `*/5 * * * *` | `forwarding_enabled` を確認 → `status='pending'` を `created_at` 昇順に**最大 20 件**取得（`RETRY_BATCH_LIMIT`。Free プランの外部サブリクエスト上限 50 件/起動に対し、GAS の 302 リダイレクト追従で 1 件あたり 2 件消費するため。§9 #9）→ `source` を `'retry'` にして GAS へ順に POST（直列。GAS の Lock 競合を避ける）→ §3.3 に従い更新。`attempts` が 6 になった時点、以後 72 回ごと（≒6 時間）に、`payload.channel_id` へ `<@user_id>` メンション（`https://slack.com/archives/<channel>/p<ts の "." 抜き>` のリンク付き）を投稿し `notified_at` 更新 |
+| `*/5 * * * *` | `forwarding_enabled` を確認 → `status='pending'` を `created_at` 昇順に**最大 16 件**取得（`RETRY_BATCH_LIMIT`。Free プランの外部サブリクエスト上限 50 件/起動に対し、1 件あたり最悪 3 件（POST＋302 追従＋通知）消費するため。§9 #9）→ `source` を `'retry'` にして GAS へ順に POST（直列。GAS の Lock 競合を避ける）→ §3.3 に従い更新。`attempts` が 6 になった時点、以後 72 回ごと（≒6 時間）に、`payload.channel_id` へ `<@user_id>` メンション（`https://slack.com/archives/<channel>/p<ts の "." 抜き>` のリンク付き）を投稿し `notified_at` 更新 |
 | `17 3 * * *` | §5 の 30 日削除・nonce 削除 |
 
 ### 6.7 Worker の環境
@@ -423,7 +423,7 @@ doPost(e)
 | 6 | 停止フラグ | D1 `settings.forwarding_enabled` | 再デプロイ不要で切替可、Cron からも参照可 |
 | 7 | 修正モーダル | `date` を持たせ、跨日の修正を明示的に指定可能にする | 時刻のみでは跨日が曖昧 |
 | 8 | `/keihi` | Worker が定型 ephemeral のみ返す | MVP スコープ外（暫定運用） |
-| 9 | Cron 再送のバッチ上限 | `RETRY_BATCH_LIMIT = 20`（当初 50） | Workers Free の外部サブリクエスト上限は 50 件/起動でリダイレクトも数える。GAS `/exec` は 302 を返し `redirect:"follow"` で 1 件 2 消費、加えて通知の Slack API 呼び出しもあるため 50 件では上限超過で再送が途中停止する。あふれた分は 5 分後の次サイクルで処理される |
+| 9 | Cron 再送のバッチ上限 | `RETRY_BATCH_LIMIT = 16`（当初 50 → 20 → 16） | Workers Free の外部サブリクエスト上限は 50 件/起動でリダイレクトも数える。1 件の再送は最悪 **3 件**消費する（`sendToGas` の POST／GAS `/exec` の 302 追従／`notifyRejectedDm`・`notifyRetryMention` の `chat.postMessage`）。pending は GAS 障害でまとめて溜まるため `attempts` が揃って通知条件を満たしやすく、最悪ケースは現実的。`3n <= 50` より **n <= 16**。あふれた分は 5 分後の次サイクルで処理される（2026-08-31 の Codex レビューで 20 でも超過することが判明し訂正） |
 
 ## 10. README に含める手順（WP4 で作成）
 
