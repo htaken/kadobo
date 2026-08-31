@@ -11,3 +11,4 @@ export * from "./businessDate";
 export * from "./aggregate";
 export * from "./envelope";
 export * from "./card";
+export * from "./expense";
