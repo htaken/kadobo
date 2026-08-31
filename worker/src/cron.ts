@@ -34,8 +34,14 @@ const NONCE_TTL_MS = 10 * 60 * 1000;
  */
 const RETRY_BATCH_LIMIT = 16;
 
+/**
+ * 再送失敗通知のリンク先に使う `message_ts`。
+ * `command` と `expense_submit` は稼働カードに紐づかないため持たない。
+ */
 function messageTsOf(request: GasRequest): string | undefined {
-  return request.kind === "command" ? undefined : request.message_ts;
+  return request.kind === "command" || request.kind === "expense_submit"
+    ? undefined
+    : request.message_ts;
 }
 
 export interface RunRetryCronOptions {

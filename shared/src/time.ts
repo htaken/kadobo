@@ -90,3 +90,39 @@ export function jstToMs(dateStr: string, timeStr: string): number {
   const utcMs = Date.UTC(year, month - 1, day, hour, minute, 0, 0);
   return utcMs - JST_OFFSET_MS;
 }
+
+/** 西暦年がうるう年か（4 で割り切れるが 100 で割り切れない、または 400 で割り切れる）。 */
+export function isLeapYear(year: number): boolean {
+  return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+}
+
+/** `month`（1〜12。呼び出し側で範囲チェック済みであること）の日数。 */
+export function daysInMonthOf(year: number, month: number): number {
+  const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month === 2 && isLeapYear(year)) {
+    return 29;
+  }
+  return DAYS_IN_MONTH[month - 1]!;
+}
+
+/**
+ * `date` が `YYYY-MM-DD` 形式（4 桁年・2 桁月・2 桁日のゼロ埋め）で、かつ**実在する日付**か
+ * （月 01-12、日はその月の実日数。うるう年考慮）。
+ *
+ * `Date` のパースは環境によって緩い補正をする（`2026-02-30` を 3/2 として受けるなど）ため
+ * 頼らず、自前で判定する。**Worker と GAS の両方から使う**（実装設計 経費フェーズ §4.3・§5.5 の
+ * 二重検証。同じ判定を 2 箇所に書くと片方だけ直る事故が起きるため、`shared` に置く）。
+ */
+export function isValidDateString(date: string): boolean {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  if (m === null) {
+    return false;
+  }
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  if (month < 1 || month > 12) {
+    return false;
+  }
+  return day >= 1 && day <= daysInMonthOf(year, month);
+}

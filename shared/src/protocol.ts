@@ -6,6 +6,8 @@
  * 呼び出し側から注入する（`shared/src/ids.ts` 参照）。
  */
 
+import type { ExpenseCategory, ReceiptType } from "./expense";
+
 /** 封筒のプロトコルバージョン（実装設計 §3.1）。 */
 export const ENVELOPE_VERSION = 1;
 
@@ -69,12 +71,14 @@ export type StampActionId =
 export type StampSource = "button" | "retry";
 export type CorrectionSubmitSource = "modal" | "retry";
 export type CommandSource = "command" | "retry";
+export type ExpenseSubmitSource = "modal" | "retry";
 
 /** スラッシュコマンドの正規化済み引数（実装設計 §2.1）。 */
 export type CommandText = "" | "status";
 
 /**
- * Worker → GAS のペイロード種別（実装設計 §3.2）。4 種の判別共用体（`kind` で判別）。
+ * Worker → GAS のペイロード種別（実装設計 §3.2、経費フェーズ §3.1）。
+ * 5 種の判別共用体（`kind` で判別）。
  */
 export type GasRequest =
   | {
@@ -129,7 +133,47 @@ export type GasRequest =
       response_url: string;
       received_at_ms: number;
       source: CommandSource;
+    }
+  | {
+      kind: "expense_submit";
+      idempotency_key: string;
+      user_id: string;
+      view_id: string;
+      /**
+       * 通知先チャンネル（実装設計 経費フェーズ §3.1）。
+       * `cron.ts` の再送失敗通知が**全 pending** に対して `channel_id` を参照するため必須。
+       */
+      channel_id: string;
+      receipt_type: ReceiptType;
+      /** 取引年月日 `YYYY-MM-DD`（JST）。 */
+      date: string;
+      /** 税込円。正の整数。 */
+      amount: number;
+      category: ExpenseCategory;
+      partner: string;
+      /** 未入力は `''`。 */
+      memo: string;
+      file: ExpenseSubmitFile;
+      received_at_ms: number;
+      source: ExpenseSubmitSource;
     };
+
+/**
+ * `view_submission` の `file_input` から Worker が取り出して詰め直したファイル情報
+ * （実装設計 経費フェーズ §3.1）。**Bot トークンは載せない**。GAS が Script Property から読む。
+ */
+export interface ExpenseSubmitFile {
+  /** Slack file id（`F...`）。 */
+  id: string;
+  name: string;
+  mimetype: string;
+  /** 拡張子相当（Slack の推定値。GAS は `name` の拡張子とマジックバイトでも検証する）。 */
+  filetype: string;
+  /** bytes。Slack の申告値。GAS はダウンロード後の実サイズも検証する。 */
+  size: number;
+  /** `Authorization: Bearer <bot token>` を付けて GET する。ホスト検証は必須。 */
+  url_private: string;
+}
 
 /**
  * 「GAS が生ログ追記・カード再描画のいずれにも触れていないことが確実」なエラーコード。

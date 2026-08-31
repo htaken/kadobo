@@ -76,6 +76,10 @@ function routeRequest(req: GasRequest, ports: AppPorts): GasResponse {
       return handleCorrectionSubmit(req, ports);
     case "command":
       return handleCommand(req, ports);
+    case "expense_submit":
+      // WP8b（`handleExpenseSubmit`）で置き換える。それまでは明示的に未実装を返す。
+      // Worker 側の `/keihi` は WP6 まで定型 ephemeral のままなので、この分岐へは到達しない。
+      return { ok: false, error: "NOT_IMPLEMENTED", retryable: false };
   }
 }
 

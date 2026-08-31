@@ -30,7 +30,7 @@ export type AttemptOutcome =
 export interface InsertJournalInput {
   id: string;
   idempotency_key: string;
-  kind: "stamp" | "open_correction" | "correction_submit" | "command";
+  kind: "stamp" | "open_correction" | "correction_submit" | "command" | "expense_submit";
   /** GasRequest の JSON 文字列（送信するものと同一。実装設計 §5）。 */
   payload: string;
   now: number;
