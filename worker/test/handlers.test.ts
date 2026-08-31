@@ -493,20 +493,22 @@ describe("handleSlashCommand", () => {
     };
   }
 
-  it("/keihi: 定型 ephemeral を返し GAS へ転送しない", async () => {
+  // 🔄 経費フェーズ §4.1: /keihi は定型 ephemeral ではなく経費モーダルを開くようになった
+  // （詳細な検証は `expense.test.ts` に集約する。ここでは GAS 未転送・D1 未使用の確認のみ）。
+  it("/keihi: モーダルを開き、GAS へ転送せず journal にも記録しない", async () => {
     const env = makeEnv(db);
     const { ctx, flush } = createTestCtx();
     const { fetchImpl, calls } = createFetchStub();
     const command = makeCommand({ command: "/keihi", text: "1000円 交通費" });
 
     const res = await handleSlashCommand({ env, ctx, command, fetchImpl });
-    const body = (await res.json()) as any;
-    expect(body.response_type).toBe("ephemeral");
-    expect(body.text).toContain("経費機能");
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("");
 
     await flush();
+    expect(calls.some((c) => c.url.endsWith("/views.open"))).toBe(true);
+    expect(calls.some((c) => c.url === env.GAS_URL)).toBe(false);
     expect(await allJournalRows()).toHaveLength(0);
-    expect(calls).toHaveLength(0);
   });
 
   it.each(["", "status"])("/kado %s: 正規化して journal に INSERT・GAS へ転送する", async (text) => {

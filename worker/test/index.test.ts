@@ -7,10 +7,14 @@
  * 実ネットワークへアクセスしないことを保証するため、ここで真の HTTP 経由でテストするのは
  * 外部呼び出し（Slack API・GAS への `waitUntil` 内 fetch）が発生しない経路のみに限定する:
  *   - 署名検証の成否（失敗時は 401 になりハンドラへ到達しない）
- *   - `/keihi`（GAS へ転送しない・HTTP レスポンスをその場で返す）
+ *   - `/kado` の不正引数（使い方 ephemeral をその場で返し、GAS へは転送しない）
  *   - `/internal/status`（D1 の読み取りのみで完結する）
- * block_actions・`/kado`・view_submission 等、`waitUntil` 内で Slack API/GAS へ fetch する経路は
- * `handlers.test.ts` でハンドラ関数を直接呼び出し、`fetchImpl` スタブで検証する。
+ * 🔄 経費フェーズ §4.1 で `/keihi` は `views.open` を `waitUntil` 内で呼ぶようになったため、
+ * この経路の対象からは外した（`fetchImpl` を注入できないこの真の HTTP 経路では実ネットワークに
+ * 触れてしまうため）。`/keihi` の実際の振る舞い（モーダルの中身・失敗時の応答など）は
+ * `expense.test.ts` で `fetchImpl` スタブを使って検証する。
+ * block_actions・`/kado`（正常系）・view_submission 等、`waitUntil` 内で Slack API/GAS へ fetch
+ * する経路は `handlers.test.ts` でハンドラ関数を直接呼び出し、`fetchImpl` スタブで検証する。
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createTestHarness } from "wrangler";
@@ -85,22 +89,25 @@ describe("ルーティング", () => {
 });
 
 describe("Slack 署名検証（真の HTTP 経由）", () => {
+  // `/kado` の不正引数: normalizeKadoText が null を返し、その場で使い方 ephemeral を返して
+  // 終了する（waitUntil なし・D1 なし・外部 fetch なし）。署名検証の通過確認に外部呼び出しを
+  // 一切伴わない経路として選んでいる（ファイル冒頭コメントの不変条件を参照）。
   const body = new URLSearchParams({
-    command: "/keihi",
-    text: "",
+    command: "/kado",
+    text: "foo",
     user_id: "U1",
     channel_id: "C1",
     trigger_id: "T1",
     response_url: "https://hooks.slack.test/resp",
   }).toString();
 
-  it("正しい署名・時刻窓内なら通り、/keihi は定型 ephemeral を返す", async () => {
+  it("正しい署名・時刻窓内なら通り、/kado の不正引数は使い方 ephemeral を返す", async () => {
     const nowSec = Math.floor(Date.now() / 1000);
     const res = await postSlack("/slack/commands", body, nowSec);
     expect(res.status).toBe(200);
     const json = (await res.json()) as any;
     expect(json.response_type).toBe("ephemeral");
-    expect(json.text).toContain("経費機能");
+    expect(json.text).toContain("使い方");
   });
 
   it("不正な署名は401", async () => {

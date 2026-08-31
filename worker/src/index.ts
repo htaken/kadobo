@@ -12,6 +12,7 @@ import { runCleanupCron, runRetryCron } from "./cron";
 import type { Env } from "./env";
 import { handleKadoCorrect } from "./handlers/correct";
 import { handleSlashCommand } from "./handlers/command";
+import { EXPENSE_CALLBACK_ID, handleExpenseSubmission } from "./handlers/expense";
 import { handleInternalStatus } from "./handlers/status";
 import { handleStamp } from "./handlers/stamp";
 import { handleViewSubmission } from "./handlers/view_submission";
@@ -56,7 +57,16 @@ async function handleSlackRoute(pathname: string, rawBody: string, request: Requ
       // 未知の action_id: ACK のみ返し無視する。
       return new Response(null, { status: 200 });
     }
-    // view_submission
+    // view_submission: callback_id で kado_correction / kado_expense を分岐する（経費フェーズ §4.2）。
+    if (parsed.view.callback_id === EXPENSE_CALLBACK_ID) {
+      return handleExpenseSubmission({ env, ctx, payload: parsed });
+    }
+    // 未知の callback_id（本来は kado_correction のみのはず）は 404 にせず、これまでどおり
+    // handleViewSubmission に委ねる。この経路は WP6 以前は分岐が無く、あらゆる view_submission が
+    // 無条件で handleViewSubmission に渡っていた。kado_expense 以外を一律 404 にすると、
+    // 未知だが実質 kado_correction である想定外ケース（将来の callback_id 追加漏れ等）まで
+    // 拒否してしまい、既存の kado_correction フローに影響しうる。実際に飛んでくる callback_id は
+    // 2 種のみのはずなので、安全側（既存の単一経路を維持する）を選んだ。
     return handleViewSubmission({ env, ctx, payload: parsed });
   }
 

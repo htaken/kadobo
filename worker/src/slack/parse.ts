@@ -56,13 +56,31 @@ export interface SlackBlockActionsPayload {
   response_url?: string;
 }
 
-/** `view.state.values` の 1 要素（static_select / datepicker / timepicker / plain_text_input）。実装設計 §2.4。 */
+/**
+ * `file_input` の 1 ファイル分の値（実装設計 経費フェーズ §3.1, §4.5）。
+ *
+ * 実際のペイロード形は WP5 の S3（先行スパイク）で未検証のため、この型は「想定される形」を
+ * 表すのみ。実データから取り出す際は必ず {@link getStateFiles} を通し、実行時に形を検証すること
+ * （欠けたフィールドがあっても例外にせず `null` として扱う）。
+ */
+export interface SlackFileValue {
+  id: string;
+  name: string;
+  mimetype: string;
+  filetype: string;
+  size: number;
+  url_private: string;
+}
+
+/** `view.state.values` の 1 要素（static_select / datepicker / timepicker / plain_text_input / file_input）。実装設計 §2.4, 経費フェーズ §4.5。 */
 export interface SlackStateValue {
   type: string;
   value?: string;
   selected_option?: { value: string; text?: { type: string; text: string } };
   selected_date?: string;
   selected_time?: string;
+  /** `file_input` の値（経費フェーズ §2.2, §4.5）。実際の形は {@link SlackFileValue} を参照。 */
+  files?: SlackFileValue[];
 }
 
 export type SlackStateValues = Record<string, Record<string, SlackStateValue>>;
@@ -88,6 +106,45 @@ export function getStateValue(
   actionId: string,
 ): SlackStateValue | undefined {
   return values[blockId]?.[actionId];
+}
+
+/**
+ * `file_input` の値を安全に取り出す（実装設計 経費フェーズ §3.1, §4.5, WP6）。
+ *
+ * 実際のペイロード形は WP5 の S3 で未検証のため、`files` が配列であること・各要素が
+ * {@link SlackFileValue} の全フィールドを持つことを実行時に検証する。形が想定と違えば
+ * （ブロック自体が無い／`files` が配列でない／要素にフィールド欠落がある）`null` を返す。
+ * 呼び出し側はこれを「ファイルを認識できませんでした」バリデーションエラーにすること。
+ *
+ * 空配列（`files: []`）は形としては正しい（添付 0 件）ため `[]` を返す。件数の検証は
+ * 呼び出し側（§4.3 の「ちょうど1件」）が行う。
+ */
+export function getStateFiles(
+  values: SlackStateValues,
+  blockId: string,
+  actionId: string,
+): SlackFileValue[] | null {
+  const raw = getStateValue(values, blockId, actionId);
+  if (raw === undefined || !Array.isArray(raw.files)) {
+    return null;
+  }
+  const files: SlackFileValue[] = [];
+  for (const item of raw.files) {
+    if (
+      typeof item !== "object" ||
+      item === null ||
+      typeof (item as Partial<SlackFileValue>).id !== "string" ||
+      typeof (item as Partial<SlackFileValue>).name !== "string" ||
+      typeof (item as Partial<SlackFileValue>).mimetype !== "string" ||
+      typeof (item as Partial<SlackFileValue>).filetype !== "string" ||
+      typeof (item as Partial<SlackFileValue>).size !== "number" ||
+      typeof (item as Partial<SlackFileValue>).url_private !== "string"
+    ) {
+      return null;
+    }
+    files.push(item as SlackFileValue);
+  }
+  return files;
 }
 
 /** スラッシュコマンドのフォーム全体（実装設計 §2.1, §6.5）。 */
