@@ -130,19 +130,33 @@ export function getStateFiles(
   }
   const files: SlackFileValue[] = [];
   for (const item of raw.files) {
+    const candidate = item as Partial<SlackFileValue>;
     if (
       typeof item !== "object" ||
       item === null ||
-      typeof (item as Partial<SlackFileValue>).id !== "string" ||
-      typeof (item as Partial<SlackFileValue>).name !== "string" ||
-      typeof (item as Partial<SlackFileValue>).mimetype !== "string" ||
-      typeof (item as Partial<SlackFileValue>).filetype !== "string" ||
-      typeof (item as Partial<SlackFileValue>).size !== "number" ||
-      typeof (item as Partial<SlackFileValue>).url_private !== "string"
+      typeof candidate.id !== "string" ||
+      typeof candidate.name !== "string" ||
+      typeof candidate.mimetype !== "string" ||
+      typeof candidate.filetype !== "string" ||
+      typeof candidate.size !== "number" ||
+      typeof candidate.url_private !== "string"
     ) {
       return null;
     }
-    files.push(item as SlackFileValue);
+    // 🔄 本番実測で判明（コーディネーターからの指摘）: Slack の生 file object には
+    // `thumb_tiny`（サムネイルの Base64）・`permalink`・`shares` 等、数十の余剰フィールドが
+    // 載っている。`item` をそのまま push すると `GasRequest.file` 経由で D1 ジャーナルに
+    // 残ってしまう（実測で 1 件あたり約 10 倍に肥大化）。検証済みの 6 フィールドだけから
+    // 新しいオブジェクトリテラルを組み立てて詰め直す（`item` 自体は push しない・キャストも
+    // しない。オブジェクト全体のキャストがこの不具合を隠していたため）。
+    files.push({
+      id: candidate.id,
+      name: candidate.name,
+      mimetype: candidate.mimetype,
+      filetype: candidate.filetype,
+      size: candidate.size,
+      url_private: candidate.url_private,
+    });
   }
   return files;
 }

@@ -18,7 +18,7 @@ import {
   validateExpenseSubmission,
 } from "../src/handlers/expense";
 import { sha256Hex } from "../src/webcrypto";
-import type { SlackSlashCommand, SlackStateValues, SlackViewSubmissionPayload } from "../src/slack/parse";
+import { getStateFiles, type SlackSlashCommand, type SlackStateValues, type SlackViewSubmissionPayload } from "../src/slack/parse";
 import { createTestCtx, jsonResponse, makeEnv, createFetchStub } from "./support";
 
 const TODAY_JST = "2099-12-31"; // validateExpenseSubmission の純粋テストでは固定の「当日」を注入する。
@@ -51,6 +51,54 @@ function baseValues(): SlackStateValues {
     },
   };
 }
+
+/**
+ * 本番実測（コーディネーターからの指摘）で確認された、Slack の生 file object の実物大の例。
+ * サムネイル画像の Base64（`thumb_tiny` 等）や `permalink`・`shares` など、
+ * {@link SlackFileValue} の 6 フィールド以外に数十のフィールドが載っている。
+ * `getStateFiles` はこれらを詰め直しの過程で必ず捨てなければならない。
+ */
+function makeBloatedRawFile(overrides?: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: "F1",
+    name: "receipt.pdf",
+    mimetype: "application/pdf",
+    filetype: "pdf",
+    size: 1000,
+    url_private: "https://files.slack.com/files-pri/T1-F1/receipt.pdf",
+    // ↓ ここから先が本番で混入していた余剰フィールド（一部を抜粋）。
+    thumb_64: "https://files.slack.com/files-tmb/T1-F1-abc/receipt_64.jpg",
+    thumb_80: "https://files.slack.com/files-tmb/T1-F1-abc/receipt_80.jpg",
+    thumb_360: "https://files.slack.com/files-tmb/T1-F1-abc/receipt_360.jpg",
+    thumb_360_w: 360,
+    thumb_360_h: 480,
+    thumb_480: "https://files.slack.com/files-tmb/T1-F1-abc/receipt_480.jpg",
+    thumb_160: "https://files.slack.com/files-tmb/T1-F1-abc/receipt_160.jpg",
+    thumb_720: "https://files.slack.com/files-tmb/T1-F1-abc/receipt_720.jpg",
+    thumb_800: "https://files.slack.com/files-tmb/T1-F1-abc/receipt_800.jpg",
+    thumb_960: "https://files.slack.com/files-tmb/T1-F1-abc/receipt_960.jpg",
+    thumb_1024: "https://files.slack.com/files-tmb/T1-F1-abc/receipt_1024.jpg",
+    original_w: 1200,
+    original_h: 1600,
+    thumb_tiny: "AwAwACGSMJ5algSeeelP8iLBJT8iajjP7pdoyQCcDqeen0OKsZ3KwHXkdf8",
+    permalink: "https://kadobo-ws.slack.com/files/U1/F1/receipt.pdf",
+    permalink_public: "https://slack-files.com/T1-F1-abcdef0123",
+    shares: { public: {}, private: {} },
+    channels: ["C1"],
+    groups: [],
+    ims: [],
+    user_team: "T1",
+    editable: false,
+    mode: "hosted",
+    is_external: false,
+    pretty_type: "PDF",
+    created: 1756260000,
+    timestamp: 1756260000,
+    ...overrides,
+  };
+}
+
+const EXPECTED_FILE_KEYS = ["filetype", "id", "mimetype", "name", "size", "url_private"].sort();
 
 // --- buildExpenseModalView（実装設計 経費フェーズ §2.2） ---
 
@@ -418,6 +466,32 @@ describe("validateExpenseSubmission", () => {
   });
 });
 
+// --- getStateFiles: 余剰フィールドの除去（本番実測で発覚した D1 肥大化バグの修正確認） ---
+
+describe("getStateFiles", () => {
+  it("実物大の生 file object（サムネイル Base64・permalink 等を含む）から6フィールドだけを詰め直す", () => {
+    const values: SlackStateValues = {
+      file: { file_upload: { type: "file_input", files: [makeBloatedRawFile() as any] } },
+    };
+
+    const result = getStateFiles(values, "file", "file_upload");
+    expect(result).toHaveLength(1);
+    const file = result?.[0];
+    expect(file && Object.keys(file).sort()).toEqual(EXPECTED_FILE_KEYS);
+    expect(file).toEqual({
+      id: "F1",
+      name: "receipt.pdf",
+      mimetype: "application/pdf",
+      filetype: "pdf",
+      size: 1000,
+      url_private: "https://files.slack.com/files-pri/T1-F1/receipt.pdf",
+    });
+    // thumb_tiny（Base64 のサムネイル画像）が確実に落ちていることを明示的に確認する。
+    expect(file).not.toHaveProperty("thumb_tiny");
+    expect(file).not.toHaveProperty("permalink");
+  });
+});
+
 // --- handleExpenseSubmission / handleSlashCommand（DB を使う統合テスト） ---
 
 const server = createTestHarness({ workers: [{ configPath: "./wrangler.jsonc" }] });
@@ -558,6 +632,37 @@ describe("handleExpenseSubmission", () => {
     expect(sent.source).toBe("modal");
     expect(typeof sent.received_at_ms).toBe("number");
     expect(calls.some((c) => c.url === env.GAS_URL)).toBe(true);
+  });
+
+  it("正常送信（実物大の生 file object）: journal に保存される GasRequest.file のキーがちょうど6個（本番実測で発覚した D1 肥大化の回帰確認）", async () => {
+    const env = makeEnv(db);
+    const { ctx, flush } = createTestCtx();
+    const { fetchImpl } = createFetchStub((url) => {
+      if (url === env.GAS_URL) {
+        return jsonResponse({ ok: true, applied: true });
+      }
+      return undefined;
+    });
+    const values = baseValues();
+    values.file = { file_upload: { type: "file_input", files: [makeBloatedRawFile() as any] } };
+    const payload = makeExpensePayload(values);
+
+    const res = await handleExpenseSubmission({ env, ctx, payload, fetchImpl });
+    const body = (await res.json()) as any;
+    expect(body.response_action).toBe("clear");
+
+    await flush();
+    const rows = await allJournalRows();
+    const sent = JSON.parse(rows[0].payload);
+    expect(Object.keys(sent.file).sort()).toEqual(EXPECTED_FILE_KEYS);
+    expect(sent.file).toEqual({
+      id: "F1",
+      name: "receipt.pdf",
+      mimetype: "application/pdf",
+      filetype: "pdf",
+      size: 1000,
+      url_private: "https://files.slack.com/files-pri/T1-F1/receipt.pdf",
+    });
   });
 
   it("冪等キーが `${view_id}:${sha256hex(state.values).slice(0,16)}` である", async () => {
