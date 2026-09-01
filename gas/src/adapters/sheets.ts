@@ -21,6 +21,7 @@ const SHEET_NAMES = {
   monthlyBill: "月次請求",
   expenseLedger: "経費台帳",
   internal: "内部",
+  correctionRequest: "訂正削除申請",
 } as const;
 
 const RAW_LOG_HEADERS = [
@@ -130,6 +131,26 @@ const EXPENSE_SYSTEM_COLUMN_PROTECTION_DESCRIPTION =
 
 const INTERNAL_HEADERS = ["kind", "key", "value", "updated_at"] as const;
 
+/**
+ * 訂正削除申請シート（事務処理規程・電子取引 第2条）。国税庁ひな形の「取引情報訂正・削除申請書」に
+ * 記載すべき 8 項目をそのまま列名にする（法的文書との対応を保つため言い換えない）。
+ *
+ * 経費台帳の訂正・取消フロー（実装設計 経費フェーズ §5.7, runbook §H.2）は `処理状態` を
+ * `CORRECTED`／`VOID` にし `訂正理由`・`訂正元証憑ID` を記録するが、規程第2条が求める
+ * 「申請日」「訂正・削除日付」「訂正・削除内容」の置き場所が無い。このシートは GAS の
+ * 書込ポートを持たず、人手で 8 項目を記入する（runbook §H.2 参照）。
+ */
+const CORRECTION_REQUEST_HEADERS = [
+  "申請日",
+  "取引伝票番号",
+  "取引件名",
+  "取引先名",
+  "訂正・削除日付",
+  "訂正・削除内容",
+  "訂正・削除理由",
+  "処理担当者名",
+] as const;
+
 const SHEET_HEADERS: Record<string, readonly string[]> = {
   [SHEET_NAMES.rawLog]: RAW_LOG_HEADERS,
   [SHEET_NAMES.dailySummary]: DAILY_SUMMARY_HEADERS,
@@ -137,6 +158,7 @@ const SHEET_HEADERS: Record<string, readonly string[]> = {
   [SHEET_NAMES.monthlyBill]: MONTHLY_BILL_HEADERS,
   [SHEET_NAMES.expenseLedger]: EXPENSE_LEDGER_HEADERS,
   [SHEET_NAMES.internal]: INTERNAL_HEADERS,
+  [SHEET_NAMES.correctionRequest]: CORRECTION_REQUEST_HEADERS,
 };
 
 /** 警告付き保護をかけるシート（実装設計 §7.1）。 */
@@ -170,6 +192,12 @@ const NON_TEXT_COLUMNS: Partial<Record<string, readonly number[]>> = {
   [SHEET_NAMES.expenseLedger]: [4, 11, 12, 20, 22],
   // updated_at（kind/key/value は text。value がカードの Slack ts で最重要）
   [SHEET_NAMES.internal]: [4],
+  // 訂正削除申請（事務処理規程・電子取引 第2条）: 空配列＝全 8 列を text 化する。
+  // 「取引伝票番号」は証憑ID（`R-YYYYMMDD-NNN`）、「申請日」「訂正・削除日付」は
+  // `YYYY-MM-DD` で、いずれも Sheets に `Date` 化・数値化されると規程が求める記録として
+  // 読めなくなる（`business_date` と同じ理由）。このシートは人手で記入するが、
+  // `単価マスタ` と同じく GAS が書込ポートを持たない列でも先回りで text 化しておく。
+  [SHEET_NAMES.correctionRequest]: [],
 };
 
 /** シートの text 化すべき列（1-based）を返す。`NON_TEXT_COLUMNS` に無いシートは対象外（`[]`）。 */

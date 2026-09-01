@@ -137,6 +137,23 @@ const EXPENSE_HEADERS_V2 = [
   "訂正理由",
 ] as const;
 
+// 訂正削除申請シート（事務処理規程・電子取引 第2条）。国税庁ひな形の「取引情報訂正・削除
+// 申請書」の 8 項目をそのまま列名にする。`sheets.ts` の同名の定数と同じ値。
+const CORRECTION_REQUEST_SHEET = "訂正削除申請";
+const CORRECTION_REQUEST_HEADERS = [
+  "申請日",
+  "取引伝票番号",
+  "取引件名",
+  "取引先名",
+  "訂正・削除日付",
+  "訂正・削除内容",
+  "訂正・削除理由",
+  "処理担当者名",
+] as const;
+
+// 既存 6 シート（訂正削除申請シート追加前から存在するシート）の名称一覧。
+const EXISTING_SHEET_NAMES = [RAW_LOG_SHEET, "日次集計", "単価マスタ", "月次請求", EXPENSE_SHEET, INTERNAL_SHEET];
+
 let harness: ReturnType<typeof installFakeSpreadsheetApp>;
 
 beforeEach(() => {
@@ -757,5 +774,99 @@ describe("経費台帳の型自動変換バグ対策（読み書きラウンド�
     const adapter = new SheetsAdapter(SPREADSHEET_ID);
     const found = adapter.getExpenseByReceiptId(row.receipt_id);
     expect(found?.date).toBe("2026-09-01");
+  });
+});
+
+describe("訂正削除申請シート（事務処理規程・電子取引 第2条、runbook §H.2）", () => {
+  it("setupSpreadsheet で「訂正削除申請」シートが 8 列のヘッダー付きで作成される", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const sheet = harness.spreadsheet.getSheetByName(CORRECTION_REQUEST_SHEET);
+    expect(sheet).not.toBeNull();
+
+    const header = CORRECTION_REQUEST_HEADERS.map((_, i) => sheet?.getCell(1, i + 1));
+    expect(header).toEqual([...CORRECTION_REQUEST_HEADERS]);
+  });
+
+  it("2 回実行してもヘッダーが壊れない・重複しない（冪等）", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    setupSpreadsheet(SPREADSHEET_ID);
+    const sheet = harness.spreadsheet.getSheetByName(CORRECTION_REQUEST_SHEET);
+    expect(sheet).not.toBeNull();
+
+    const header = CORRECTION_REQUEST_HEADERS.map((_, i) => sheet?.getCell(1, i + 1));
+    expect(header).toEqual([...CORRECTION_REQUEST_HEADERS]);
+    // ヘッダー行が 2 回書き足されて増えていないこと（「空なら書く」ガードによる冪等性）。
+    expect(sheet?.getLastRow()).toBe(1);
+  });
+
+  it("全 8 列に text 書式が適用され、伝票番号・日付列が Date 化・数値化されない", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const sheet = harness.spreadsheet.getSheetByName(CORRECTION_REQUEST_SHEET);
+    if (sheet === null) {
+      throw new Error("correction request sheet missing");
+    }
+
+    for (let col = 1; col <= CORRECTION_REQUEST_HEADERS.length; col++) {
+      expect(sheet.getFormat(2, col)).toBe(TEXT_FORMAT);
+    }
+
+    // 実機挙動の再現（fakeSpreadsheetApp の coerce）: text 書式が既に適用されたセルに
+    // 「取引伝票番号」（証憑ID `R-YYYYMMDD-NNN`）・日付 2 列を書いても Date 化・数値化されない。
+    const manualRow = [
+      "2026-09-01", // 申請日
+      "R-20260901-001", // 取引伝票番号（証憑ID）
+      "作業委託費 訂正", // 取引件名
+      "○○商事", // 取引先名
+      "2026-09-01", // 訂正・削除日付
+      "金額誤り 12,000円→11,000円へ訂正", // 訂正・削除内容
+      "入力誤り", // 訂正・削除理由
+      "竹之内治日", // 処理担当者名
+    ];
+    sheet.getRange(2, 1, 1, manualRow.length).setValues([manualRow]);
+
+    expect(sheet.getCell(2, 1)).toBe("2026-09-01");
+    expect(sheet.getCell(2, 1) instanceof Date).toBe(false);
+    expect(sheet.getCell(2, 2)).toBe("R-20260901-001");
+    expect(sheet.getCell(2, 5)).toBe("2026-09-01");
+    expect(sheet.getCell(2, 5) instanceof Date).toBe(false);
+  });
+
+  it("保護（PROTECTED_SHEETS）はかけない。人手で記入するシートのため", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const sheet = harness.spreadsheet.getSheetByName(CORRECTION_REQUEST_SHEET);
+    if (sheet === null) {
+      throw new Error("correction request sheet missing");
+    }
+    expect(sheet.getProtections("SHEET")).toHaveLength(0);
+  });
+
+  it("既存 6 シートの生成・経費台帳の 24 列移行に影響しない", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+
+    for (const name of EXISTING_SHEET_NAMES) {
+      expect(harness.spreadsheet.getSheetByName(name)).not.toBeNull();
+    }
+
+    const expenseSheet = harness.spreadsheet.getSheetByName(EXPENSE_SHEET);
+    const expenseHeader = EXPENSE_HEADERS_V2.map((_, i) => expenseSheet?.getCell(1, i + 1));
+    expect(expenseHeader).toEqual([...EXPENSE_HEADERS_V2]);
+
+    const rawLog = harness.spreadsheet.getSheetByName(RAW_LOG_SHEET);
+    expect(rawLog?.getFormat(2, COL.business_date)).toBe(TEXT_FORMAT);
+  });
+
+  it("MVP の 14 列から 24 列への経費台帳マイグレーションと共存しても壊れない", () => {
+    plantLegacyExpenseLedgerSheet(harness.spreadsheet);
+
+    expect(() => setupSpreadsheet(SPREADSHEET_ID)).not.toThrow();
+
+    const expenseSheet = harness.spreadsheet.getSheetByName(EXPENSE_SHEET);
+    const expenseHeader = EXPENSE_HEADERS_V2.map((_, i) => expenseSheet?.getCell(1, i + 1));
+    expect(expenseHeader).toEqual([...EXPENSE_HEADERS_V2]);
+
+    const correctionSheet = harness.spreadsheet.getSheetByName(CORRECTION_REQUEST_SHEET);
+    expect(correctionSheet).not.toBeNull();
+    const header = CORRECTION_REQUEST_HEADERS.map((_, i) => correctionSheet?.getCell(1, i + 1));
+    expect(header).toEqual([...CORRECTION_REQUEST_HEADERS]);
   });
 });
