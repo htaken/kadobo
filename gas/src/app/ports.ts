@@ -8,6 +8,7 @@
  * インメモリのフェイクに差し替えてユースケースをテストする。
  */
 
+import type { ExpenseCategory, ExpenseState, ReceiptType } from "@kadobo/shared/expense";
 import type { DailyStatus, UnitPriceRow } from "../core/aggregate";
 import type { RecentDay } from "../core/businessDate";
 import type { LogEventType } from "../core/state";
@@ -88,13 +89,69 @@ export interface MonthlyBillRow {
   updated_at: number;
 }
 
+/**
+ * 経費台帳 1 行（実装設計 経費フェーズ §5.1 の 24 列）。プロパティ名は既存の `RawLogRow` 等と
+ * 同じ英語 snake_case（シート上の見出しは日本語だが、TS 側は他シートと同じ命名規約に揃える）。
+ * コメントに対応するシート見出し（日本語）を併記する。
+ */
+export interface ExpenseLedgerRow {
+  /** 証憑ID。`R-YYYYMMDD-NNN`（実装設計 §5.5 `makeReceiptId`）。 */
+  receipt_id: string;
+  /** 証憑区分。 */
+  receipt_type: ReceiptType;
+  /** 日付。`YYYY-MM-DD`（JST、取引年月日）。 */
+  date: string;
+  /** 金額。税込円。 */
+  amount: number;
+  /** 取引先。 */
+  partner: string;
+  /** カテゴリ。 */
+  category: ExpenseCategory;
+  /** メモ。未入力は `''`。 */
+  memo: string;
+  /** Driveリンク。 */
+  drive_link: string;
+  /** ファイルハッシュ。SHA-256 の hex 文字列。 */
+  file_hash: string;
+  /** 元MIME。ダウンロード時の Content-Type。 */
+  mime_type: string;
+  /** サイズ。実ダウンロードのバイト数。 */
+  size: number;
+  /** 入力日時。UTC epoch ms。 */
+  input_at: number;
+  /** 処理状態。`RECEIVED | FILE_SAVED | COMPLETED | ERROR | CORRECTED | VOID`（実装設計 §5.1）。 */
+  state: ExpenseState;
+  /** MF仕訳ID。月次で人手記入するため既定は `null`。 */
+  mf_journal_id: string | null;
+  /** idempotency_key（システム列。実装設計 §5.1 #E6。保護・非表示）。 */
+  idempotency_key: string;
+  /** slack_file_id（システム列）。元ファイルの特定・再取得に使う。 */
+  slack_file_id: string;
+  /** drive_file_id（システム列）。Drive 側の存在確認に使う（実装設計 §5.6）。 */
+  drive_file_id: string;
+  /** 元ファイル名（システム列）。Drive 上のファイル名は規約で付け替えるため監査用に残す。 */
+  original_file_name: string;
+  /** last_error（システム列）。システムエラーを `メモ`（利用者入力）に混ぜないための列。 */
+  last_error: string | null;
+  /** state_updated_at（システム列）。UTC epoch ms。停滞行の検出に使う。 */
+  state_updated_at: number;
+  /** 税区分。要件定義 §4.3.1 の任意項目（列のみ用意）。 */
+  tax_category: string;
+  /** 事業使用割合。既定値 100（実装設計 §7 #E5）。 */
+  business_use_ratio: number;
+  /** 訂正元証憑ID。訂正・取消フロー（実装設計 §5.7）で使う。無ければ `null`。 */
+  correction_of_receipt_id: string | null;
+  /** 訂正理由。実装設計 §5.7。無ければ `null`。 */
+  correction_reason: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // SheetsPort
 // ---------------------------------------------------------------------------
 
 /**
- * スプレッドシート I/O（実装設計 §7.1）。生ログは追記のみ（更新・削除は行わない）。
- * 経費台帳は WP3 では作成のみ（`setupSpreadsheet` 側）で、書込ポートは定義しない。
+ * スプレッドシート I/O（実装設計 §7.1, 経費フェーズ §5.1・§5.3）。生ログは追記のみ
+ * （更新・削除は行わない）。経費台帳は `handleExpenseSubmit`（WP8b）から使われる書込ポートを持つ。
  */
 export interface SheetsPort {
   /** 生ログに 1 行追記する。 */
@@ -124,6 +181,27 @@ export interface SheetsPort {
   getInternalValue(kind: string, key: string): string | null;
   /** 内部シートの key-value を設定する（`kind + key`）。 */
   setInternalValue(kind: string, key: string, value: string): void;
+
+  // -------------------------------------------------------------------------
+  // 経費台帳（実装設計 経費フェーズ §5.3）
+  // -------------------------------------------------------------------------
+
+  /** 経費台帳の末尾に 1 行追記する（実装設計 §5.4 フェーズ 1）。 */
+  appendExpense(row: ExpenseLedgerRow): void;
+  /**
+   * 経費台帳を `idempotency_key` 列で完全一致検索する（実装設計 §5.4 フェーズ 1 の再開判定）。
+   * 無ければ `null`。
+   */
+  findExpenseByIdempotencyKey(idempotencyKey: string): ExpenseLedgerRow | null;
+  /** 経費台帳を `証憑ID` 列で完全一致検索する（実装設計 §5.4 フェーズ 3 の状態再確認）。無ければ `null`。 */
+  getExpenseByReceiptId(receiptId: string): ExpenseLedgerRow | null;
+  /**
+   * `証憑ID` に一致する行を部分更新する（実装設計 §5.4）。対象行が無い場合は例外を投げる
+   * （フェーズ 1 で必ず先に行を作ってから呼ぶ設計のため、無いのは呼び出し順序の誤り）。
+   */
+  updateExpense(receiptId: string, patch: Partial<ExpenseLedgerRow>): void;
+  /** 全行を返す（週次照合用。月数十件規模なので全件で足りる）。 */
+  getAllExpenses(): ExpenseLedgerRow[];
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +259,135 @@ export interface SlackPort {
    * 呼び出し側が best-effort で使えるよう例外にせず握りつぶす。それ以外のエラーは例外を投げる。
    */
   deleteMessage(input: { channel: string; ts: string }): void;
+}
+
+// ---------------------------------------------------------------------------
+// SlackFilesPort（実装設計 経費フェーズ §5.3, §5.5, §3.2）
+// ---------------------------------------------------------------------------
+
+/**
+ * `SlackFilesPort.download` が 404 を受け取ったときに投げる例外（`url_private` が指す
+ * ファイルが既に無い＝ユーザーがファイルを削除した）。`FILE_NOT_FOUND`（`retryable:false`）に
+ * 対応する。
+ */
+export class SlackFileNotFoundError extends Error {
+  constructor() {
+    super("SLACK_FILE_NOT_FOUND");
+    this.name = "SlackFileNotFoundError";
+  }
+}
+
+/**
+ * `SlackFilesPort.download` が 401/403 を受け取ったとき、またはホスト検証
+ * （`SLACK_FILE_ALLOWED_HOSTS`、§5.5 の SSRF 対策）に失敗したときに投げる例外。
+ * `FILE_FORBIDDEN`（`retryable:false`）に対応する。スコープ未付与・トークン失効等の
+ * **設定エラー**を示すため、Worker 側は運用者向けの警告文言にする（§3.2）。
+ */
+export class SlackFileForbiddenError extends Error {
+  constructor(message = "SLACK_FILE_FORBIDDEN") {
+    super(message);
+    this.name = "SlackFileForbiddenError";
+  }
+}
+
+/**
+ * 🔄 `SlackFilesPort.download` が 429 を除く未分類の 4xx（例: 400・410）を受け取ったときに
+ * 投げる例外。`FILE_UNAVAILABLE`（`retryable:false`）に対応する（実装設計 経費フェーズ §3.2 の
+ * 改訂で追加）。
+ *
+ * Cron 再送には回数上限が無く（`RETRY_NOTIFY_AT` 到達後も `RETRY_NOTIFY_EVERY` ごとに通知する
+ * だけで諦めない）、恒久的な 4xx を `retryable:true` にすると無限に再送され続け、行が永久に
+ * `pending` のまま残ってしまう。HTTP のセマンティクス（4xx＝クライアント誤りで自然には
+ * 直らない）に従い、429（レート制限。時間経過で直る）と 401・403・404（別の専用例外）を除く
+ * 4xx はここに分類する。
+ */
+export class SlackFileUnavailableError extends Error {
+  constructor(message = "SLACK_FILE_UNAVAILABLE") {
+    super(message);
+    this.name = "SlackFileUnavailableError";
+  }
+}
+
+/**
+ * `SlackFilesPort.download` が 429・5xx・通信失敗、および 3xx 等それ以外の未分類コードを
+ * 受け取ったときに投げる例外。`FILE_FETCH_FAILED`（`retryable:true`。Cron 再送の対象）に
+ * 対応する。429 の場合は `Retry-After` をメッセージに含める（§3.2）。
+ */
+export class SlackFileFetchError extends Error {
+  constructor(message = "SLACK_FILE_FETCH_FAILED") {
+    super(message);
+    this.name = "SlackFileFetchError";
+  }
+}
+
+/**
+ * Slack の `url_private` からファイル本体を取得するポート（実装設計 §5.3, §5.5）。
+ * `handleExpenseSubmit`（WP8b）のフェーズ 2（ロック外の重い I/O）から呼ばれる。
+ */
+export interface SlackFilesPort {
+  /**
+   * `url_private` を `Authorization: Bearer <SLACK_BOT_TOKEN>` 付きで取得する。
+   *
+   * - ホストが `SLACK_FILE_ALLOWED_HOSTS`（`@kadobo/shared/expense` の
+   *   `isAllowedSlackFileUrl`）以外 → {@link SlackFileForbiddenError}
+   * - 404 → {@link SlackFileNotFoundError}
+   * - 401・403 → {@link SlackFileForbiddenError}
+   * - 429・5xx・通信失敗・3xx 等その他の未分類コード → {@link SlackFileFetchError}
+   *   （429 は `Retry-After` をメッセージに含める）
+   * - 🔄 429 を除く未分類の 4xx（例: 400・410）→ {@link SlackFileUnavailableError}
+   *   （`retryable:false`。恒久的なクライアントエラーを無限に再送しないため）
+   *
+   * 戻り値の `bytes` は `Uint8Array` ではなく `number[]`（GAS の `Utilities`/`Blob` の byte array
+   * に合わせる。実装は符号なし 0〜255 に正規化して返す）。
+   */
+  download(urlPrivate: string): { bytes: number[]; contentType: string };
+}
+
+// ---------------------------------------------------------------------------
+// DrivePort（実装設計 経費フェーズ §5.3, §5.9）
+// ---------------------------------------------------------------------------
+
+/** Drive 上のファイル情報（実装設計 §5.3）。存在確認・再利用判断に必要な項目のみ。 */
+export interface DriveFileInfo {
+  id: string;
+  name: string;
+  size: number;
+  /** UTC epoch ms。 */
+  createdAtMs: number;
+  trashed: boolean;
+  url: string;
+}
+
+/**
+ * Drive I/O（実装設計 §5.3, §5.9）。`DRIVE_RECEIPT_ROOT_ID`（Script Property）を起点に
+ * `folderPath`（`/` 区切り、例 `経費証憑/紙/2026/09`）を辿る。ルートフォルダ自体の自動作成は
+ * しない（§5.9: 未設定なら fail closed で例外を投げる）。
+ */
+export interface DrivePort {
+  /**
+   * `folderPath` 配下を `filename` 完全一致で検索する（実装設計 §5.4 フェーズ 3。
+   * Drive 保存前に必ず呼ぶことで冪等性を保証する）。`folderPath` の途中フォルダが
+   * 1 つでも存在しなければ `[]`（未作成のフォルダを検索した場合はまだ何も保存されていない
+   * という意味なので、これは正常系）。
+   */
+  findByName(folderPath: string, filename: string): DriveFileInfo[];
+  /** `folderPath` を辿り、無ければ作成したうえでファイルを保存する。 */
+  saveFile(input: { folderPath: string; filename: string; bytes: number[]; mimeType: string }): DriveFileInfo;
+  /** `drive_file_id` から現在の情報を引く（週次照合用、実装設計 §5.6）。無ければ `null`。 */
+  getById(fileId: string): DriveFileInfo | null;
+}
+
+// ---------------------------------------------------------------------------
+// DigestPort（実装設計 経費フェーズ §5.3, §5.9）
+// ---------------------------------------------------------------------------
+
+/** ハッシュ計算ポート（実装設計 §5.3）。証憑ファイルの同一性確認（§5.6）に使う。 */
+export interface DigestPort {
+  /**
+   * SHA-256 を計算し hex 文字列で返す。`Utilities.computeDigest` の入出力に合わせ
+   * `number[]`（byte array）を扱う（`Uint8Array` ではない）。
+   */
+  sha256Hex(bytes: number[]): string;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,4 +468,8 @@ export interface AppPorts {
   random: RandomPort;
   hmac: HmacPort;
   workerStatus: WorkerStatusPort;
+  /** 経費フェーズ（実装設計 経費フェーズ §5.3）。 */
+  slackFiles: SlackFilesPort;
+  drive: DrivePort;
+  digest: DigestPort;
 }

@@ -142,11 +142,39 @@ export class FakeRange {
   createTextFinder(text: string): FakeTextFinder {
     return new FakeTextFinder(this, text);
   }
+
+  /** 実 GAS の `Range#protect()`（`sheet.ts` の経費台帳システム列保護、実装設計 §5.1）。 */
+  protect(): FakeProtection {
+    return this.sheet.addProtection("RANGE");
+  }
 }
 
 export interface FakeProtection {
+  getDescription(): string;
   setDescription(description: string): FakeProtection;
   setWarningOnly(warningOnly: boolean): FakeProtection;
+}
+
+/** `ProtectionType.SHEET`（`sheet.protect()`）か `ProtectionType.RANGE`（`range.protect()`）か。 */
+type FakeProtectionType = "SHEET" | "RANGE";
+
+class FakeProtectionImpl implements FakeProtection {
+  private description = "";
+
+  constructor(readonly protectionType: FakeProtectionType) {}
+
+  getDescription(): string {
+    return this.description;
+  }
+
+  setDescription(description: string): FakeProtection {
+    this.description = description;
+    return this;
+  }
+
+  setWarningOnly(_warningOnly: boolean): FakeProtection {
+    return this;
+  }
 }
 
 export class FakeSheet {
@@ -156,11 +184,17 @@ export class FakeSheet {
   private lastRow = 0;
   private lastCol = 0;
   private maxRows: number;
-  private readonly protections: FakeProtection[] = [];
+  private maxCols: number;
+  private readonly protections: FakeProtectionImpl[] = [];
+  private readonly hiddenColumns = new Set<number>();
 
-  constructor(name: string, initialMaxRows = 1000) {
+  // 実 Google Sheets の新規シートは既定で 26 列を持つ（`sheets.ts` の経費台帳マイグレーション
+  // §5.1 の 🔄 で列数ガードを検証するテストのため、列削除で 26 未満になっている状態を
+  // `setMaxColumnsForTest` で明示的に再現できるようにする）。
+  constructor(name: string, initialMaxRows = 1000, initialMaxCols = 26) {
     this.name = name;
     this.maxRows = initialMaxRows;
+    this.maxCols = initialMaxCols;
   }
 
   private key(row: number, col: number): string {
@@ -183,6 +217,9 @@ export class FakeSheet {
     if (row > this.maxRows) {
       this.maxRows = row;
     }
+    if (col > this.maxCols) {
+      this.maxCols = col;
+    }
   }
 
   getFormat(row: number, col: number): string {
@@ -193,6 +230,9 @@ export class FakeSheet {
     this.formats.set(this.key(row, col), format);
     if (row > this.maxRows) {
       this.maxRows = row;
+    }
+    if (col > this.maxCols) {
+      this.maxCols = col;
     }
   }
 
@@ -208,7 +248,37 @@ export class FakeSheet {
     return this.maxRows;
   }
 
+  getMaxColumns(): number {
+    return this.maxCols;
+  }
+
+  /**
+   * 実 GAS の `Sheet#insertColumnsAfter(afterPosition, howMany)`。このフェイクでは
+   * `sheets.ts` の呼び出し方（常に現在の末尾へ追加する）にしか対応しない単純な実装で足りるため、
+   * 単に `maxCols` を増やすだけにする（既存セルの位置はシフトしない）。
+   */
+  insertColumnsAfter(_afterPosition: number, howMany: number): void {
+    this.maxCols += howMany;
+  }
+
+  /** テスト専用: 列削除を再現するため `getMaxColumns()` の値を直接指定する。 */
+  setMaxColumnsForTest(maxCols: number): void {
+    this.maxCols = maxCols;
+  }
+
   getRange(row: number, col: number, numRows = 1, numCols = 1): FakeRange {
+    // 実 GAS は要求したレンジがシートの実際の列数・行数を超えると内部エラーを投げる
+    // （`sheets.ts` の経費台帳マイグレーションで列数ガードを入れた理由そのもの）。
+    if (col + numCols - 1 > this.maxCols) {
+      throw new Error(
+        `The number of columns in the range (${col + numCols - 1}) is greater than the number of columns in the sheet (${this.maxCols}).`,
+      );
+    }
+    if (row + numRows - 1 > this.maxRows) {
+      throw new Error(
+        `The number of rows in the range (${row + numRows - 1}) is greater than the number of rows in the sheet (${this.maxRows}).`,
+      );
+    }
     return new FakeRange(this, row, col, numRows, numCols);
   }
 
@@ -218,17 +288,39 @@ export class FakeSheet {
     this.getRange(rowIndex, 1, 1, values.length).setValues([values]);
   }
 
-  getProtections(_type: unknown): FakeProtection[] {
-    return this.protections;
+  /** `type` は `SpreadsheetApp.ProtectionType.SHEET`/`RANGE`（フェイクではただの文字列）。 */
+  getProtections(type: unknown): FakeProtection[] {
+    return this.protections.filter((p) => p.protectionType === type);
   }
 
+  /** 実 GAS の `Sheet#protect()`（シート全体の警告付き保護）。 */
   protect(): FakeProtection {
-    const protection: FakeProtection = {
-      setDescription: () => protection,
-      setWarningOnly: () => protection,
-    };
+    return this.addProtection("SHEET");
+  }
+
+  /** `Sheet#protect()`（シート全体）・`Range#protect()`（列範囲）どちらからも呼ぶ共通実装。 */
+  addProtection(protectionType: FakeProtectionType): FakeProtection {
+    const protection = new FakeProtectionImpl(protectionType);
     this.protections.push(protection);
     return protection;
+  }
+
+  /** 実 GAS の `Sheet#hideColumns(columnIndex, numColumns)`（実装設計 経費フェーズ §5.1 の 🔄）。 */
+  hideColumns(columnIndex: number, numColumns = 1): void {
+    for (let i = 0; i < numColumns; i++) {
+      this.hiddenColumns.add(columnIndex + i);
+    }
+  }
+
+  showColumns(columnIndex: number, numColumns = 1): void {
+    for (let i = 0; i < numColumns; i++) {
+      this.hiddenColumns.delete(columnIndex + i);
+    }
+  }
+
+  /** 実 GAS の `Sheet#isColumnHiddenByUser(columnPosition)`。テストからの検証用。 */
+  isColumnHiddenByUser(columnPosition: number): boolean {
+    return this.hiddenColumns.has(columnPosition);
   }
 }
 
@@ -248,14 +340,14 @@ export class FakeSpreadsheet {
 
 export interface FakeSpreadsheetAppGlobal {
   openById(id: string): FakeSpreadsheet;
-  ProtectionType: { SHEET: string };
+  ProtectionType: { SHEET: string; RANGE: string };
 }
 
 function makeFakeSpreadsheetApp(): { app: FakeSpreadsheetAppGlobal; spreadsheet: FakeSpreadsheet } {
   const spreadsheet = new FakeSpreadsheet();
   const app: FakeSpreadsheetAppGlobal = {
     openById: () => spreadsheet,
-    ProtectionType: { SHEET: "SHEET" },
+    ProtectionType: { SHEET: "SHEET", RANGE: "RANGE" },
   };
   return { app, spreadsheet };
 }

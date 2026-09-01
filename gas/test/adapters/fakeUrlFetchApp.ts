@@ -22,7 +22,17 @@ export interface FakeFetchCall {
   params: FakeFetchParams;
 }
 
-interface QueuedResponse {
+/** `queueResponse` の追加オプション（`slackFiles.ts` のバイナリ取得・ヘッダー検証テスト用）。 */
+export interface FakeFetchResponseOptions {
+  /** `res.getHeaders()` が返すヘッダー（`slackFiles.ts` は `Retry-After` を読む）。 */
+  headers?: Record<string, string>;
+  /** `res.getBlob().getBytes()` が返すバイト列（`slackFiles.ts` のダウンロード内容）。 */
+  bytes?: number[];
+  /** `res.getBlob().getContentType()` が返す Content-Type。 */
+  contentType?: string;
+}
+
+interface QueuedResponse extends FakeFetchResponseOptions {
   code: number;
   body: unknown;
 }
@@ -32,16 +42,29 @@ export class FakeUrlFetchApp {
   private queue: QueuedResponse[] = [];
 
   /** 次回以降の `fetch` 呼び出しが返すレスポンスを 1 件積む（FIFO）。 */
-  queueResponse(body: unknown, code = 200): void {
-    this.queue.push({ code, body });
+  queueResponse(body: unknown, code = 200, options?: FakeFetchResponseOptions): void {
+    this.queue.push({ code, body, ...options });
   }
 
-  fetch(url: string, params?: FakeFetchParams): { getContentText(): string; getResponseCode(): number } {
+  fetch(
+    url: string,
+    params?: FakeFetchParams,
+  ): {
+    getContentText(): string;
+    getResponseCode(): number;
+    getHeaders(): object;
+    getBlob(): { getBytes(): number[]; getContentType(): string | null };
+  } {
     this.calls.push({ url, params: params ?? {} });
     const next = this.queue.shift() ?? { code: 200, body: { ok: true } };
     return {
       getContentText: () => JSON.stringify(next.body),
       getResponseCode: () => next.code,
+      getHeaders: () => next.headers ?? {},
+      getBlob: () => ({
+        getBytes: () => next.bytes ?? [],
+        getContentType: () => next.contentType ?? null,
+      }),
     };
   }
 }

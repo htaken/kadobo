@@ -19,12 +19,15 @@ import {
 import { CacheAdapter } from "./adapters/cache";
 import { CalendarAdapter } from "./adapters/calendar";
 import { ClockAdapter } from "./adapters/clock";
+import { DigestAdapter } from "./adapters/digest";
+import { DriveAdapter } from "./adapters/drive";
 import { HmacAdapter } from "./adapters/hmac";
 import { LockAdapter } from "./adapters/lock";
 import { PropsAdapter } from "./adapters/props";
 import { RandomAdapter } from "./adapters/random";
 import { SheetsAdapter, setupSpreadsheet as setupSpreadsheetImpl } from "./adapters/sheets";
 import { SlackAdapter } from "./adapters/slack";
+import { SlackFilesAdapter } from "./adapters/slackFiles";
 import { installTriggers as installTriggersImpl } from "./adapters/triggers";
 import { WorkerStatusAdapter } from "./adapters/workerStatus";
 
@@ -46,6 +49,10 @@ function buildPorts(): AppPorts {
     random,
     hmac,
     workerStatus: new WorkerStatusAdapter(props, hmac, random, clock),
+    // 経費フェーズ（実装設計 経費フェーズ §5.3, §5.9）。
+    slackFiles: new SlackFilesAdapter(props),
+    drive: new DriveAdapter(props),
+    digest: new DigestAdapter(),
   };
 }
 
