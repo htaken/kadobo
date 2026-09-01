@@ -5,6 +5,7 @@
  * `DRIVE_RECEIPT_ROOT_ID` が未設定なら例外を投げて停止する（fail closed。§5.9）。
  * ルートフォルダ自体の自動作成はしない（誤ったフォルダが乱立するのを防ぐため、手動作成が前提）。
  */
+import { ConfigMissingError } from "../app/ports";
 import type { DriveFileInfo, DrivePort, PropsPort } from "../app/ports";
 
 function toFileInfo(file: GoogleAppsScript.Drive.File): DriveFileInfo {
@@ -24,7 +25,8 @@ export class DriveAdapter implements DrivePort {
   private rootFolder(): GoogleAppsScript.Drive.Folder {
     const rootId = this.props.get("DRIVE_RECEIPT_ROOT_ID");
     if (rootId === null || rootId === "") {
-      throw new Error(
+      throw new ConfigMissingError(
+        "DRIVE_RECEIPT_ROOT_ID",
         "DRIVE_RECEIPT_ROOT_ID が未設定です（実装設計 経費フェーズ §5.9）。" +
           "証憑ルートフォルダを手動で作成し、Script Property に ID を設定してから経費機能を有効化してください。",
       );

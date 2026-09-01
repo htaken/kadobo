@@ -134,3 +134,84 @@ describe("dispatch — 一時エラー", () => {
     expect(result).toEqual({ ok: false, error: "sheets_temporary_error", retryable: true });
   });
 });
+
+describe("dispatch — expense_submit（実装設計 経費フェーズ §5.8）", () => {
+  // stamp 系のテストが使う既定 ts（1756260000 秒 = 2025-08-27）は req.date（2026-09-01）より
+  // 過去になり「未来の日付」検証に落ちるため、expense_submit 用に独自の ts・クロックを使う。
+  const EXPENSE_TS_SEC = Math.floor(Date.parse("2026-09-01T12:00:00+09:00") / 1000);
+
+  function readyExpensePorts() {
+    const ports = makeFakePorts(EXPENSE_TS_SEC * 1000);
+    ports.props.set("GAS_SHARED_SECRET", SECRET);
+    return ports;
+  }
+
+  function makeExpensePayload(
+    overrides: Partial<Extract<GasRequest, { kind: "expense_submit" }>> = {},
+  ): Extract<GasRequest, { kind: "expense_submit" }> {
+    const base: Extract<GasRequest, { kind: "expense_submit" }> = {
+      kind: "expense_submit",
+      idempotency_key: "V1:0123456789abcdef",
+      user_id: "U1",
+      view_id: "V1",
+      channel_id: "C1",
+      receipt_type: "paper",
+      date: "2026-09-01",
+      amount: 1200,
+      category: "消耗品費",
+      partner: "○○商店",
+      memo: "",
+      file: {
+        id: "F1",
+        name: "receipt.jpg",
+        mimetype: "image/jpeg",
+        filetype: "jpg",
+        size: 8,
+        url_private: "https://files.slack.com/files-pri/T1-F1/receipt.jpg",
+      },
+      received_at_ms: EXPENSE_TS_SEC * 1000,
+      source: "modal",
+    };
+    return { ...base, ...overrides };
+  }
+
+  it("handleExpenseSubmit を経由して正常に処理される（BAD_REQUEST に落ちない）", () => {
+    const ports = readyExpensePorts();
+    const envelope = buildEnvelope(makeExpensePayload(), { ts: EXPENSE_TS_SEC });
+
+    const result = dispatch(envelope, ports);
+
+    expect(result).toEqual({ ok: true, applied: true });
+    expect(ports.sheets.expenses).toHaveLength(1);
+  });
+
+  it("ロック外で呼ばれる: フェーズ2の最中に別のロック取得（打刻相当）が成功する", () => {
+    const ports = readyExpensePorts();
+    let concurrentLockSucceeded = false;
+    const originalDownload = ports.slackFiles.download.bind(ports.slackFiles);
+    ports.slackFiles.download = (url: string) => {
+      ports.lock.withLock(() => {
+        concurrentLockSucceeded = true;
+      });
+      return originalDownload(url);
+    };
+    const envelope = buildEnvelope(makeExpensePayload(), { ts: EXPENSE_TS_SEC });
+
+    const result = dispatch(envelope, ports);
+
+    expect(concurrentLockSucceeded).toBe(true);
+    expect(result).toEqual({ ok: true, applied: true });
+  });
+
+  it("ユースケース内の例外は他の種別と同じく retryable:true にマップされる", () => {
+    const ports = readyExpensePorts();
+    ports.sheets.updateExpense = () => {
+      throw new Error("sheets_temporary_error");
+    };
+    const envelope = buildEnvelope(makeExpensePayload(), { ts: EXPENSE_TS_SEC });
+
+    const result = dispatch(envelope, ports);
+
+    expect(result).toEqual({ ok: false, error: "sheets_temporary_error", retryable: true });
+  });
+});

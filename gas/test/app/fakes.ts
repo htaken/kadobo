@@ -213,13 +213,31 @@ export class FakeCache implements CachePort {
 export class FakeLock implements LockPort {
   /** `true` にすると次回の `withLock` 呼び出しで `LockTimeoutError` を投げる（テスト用）。 */
   throwTimeoutOnce = false;
+  /**
+   * 現在ロックを保持中か（実 `LockService.getScriptLock()` の相互排他を模す）。
+   *
+   * 経費フェーズ §5.8 の「`expense_submit` はフェーズ2でロックを持たない」を検証するため、
+   * `withLock` の呼び出し中に**別の** `withLock` 呼び出しが割り込むと（＝この場でロックを
+   * 保持中に再入すると）`LockTimeoutError` を投げるようにする。`handleExpenseSubmit` の
+   * フェーズ1・フェーズ3はそれぞれ独立して `withLock` を呼ぶだけ（ネストしない）ので、
+   * この相互排他モデルでも正しく動く。
+   */
+  private locked = false;
 
   withLock<T>(fn: () => T): T {
     if (this.throwTimeoutOnce) {
       this.throwTimeoutOnce = false;
       throw new LockTimeoutError();
     }
-    return fn();
+    if (this.locked) {
+      throw new LockTimeoutError();
+    }
+    this.locked = true;
+    try {
+      return fn();
+    } finally {
+      this.locked = false;
+    }
   }
 }
 

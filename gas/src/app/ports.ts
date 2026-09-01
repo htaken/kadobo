@@ -413,6 +413,25 @@ export class LockTimeoutError extends Error {
   }
 }
 
+/**
+ * 必須の設定（Script Property）が未設定であることを表す例外（実装設計 経費フェーズ §5.9, §3.2）。
+ *
+ * アダプタが投げ、app 層が `instanceof` で識別して `CONFIG_MISSING`（**非再試行**）へ写像する。
+ * 設定不備は時間では直らないため、再試行に倒すと Cron が無限に再送し、行が永久に `pending` の
+ * まま残る。**メッセージの部分一致で識別してはならない**（アダプタ側の文言を変えた瞬間に識別が
+ * 外れ、無限再送へサイレントに退行するため）。
+ */
+export class ConfigMissingError extends Error {
+  constructor(
+    /** 未設定だった Script Property のキー（例: `DRIVE_RECEIPT_ROOT_ID`）。 */
+    readonly propertyKey: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ConfigMissingError";
+  }
+}
+
 /** Script Properties（実装設計 §7.8）。 */
 export interface PropsPort {
   get(key: string): string | null;
