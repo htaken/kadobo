@@ -15,6 +15,7 @@ import {
   trigEveningCheck as runEveningCheck,
   trigMonthly as runMonthly,
   trigMorningCard as runMorningCard,
+  trigWeeklyOrphanCheck as runWeeklyOrphanCheck,
 } from "./app/triggers";
 import { CacheAdapter } from "./adapters/cache";
 import { CalendarAdapter } from "./adapters/calendar";
@@ -94,4 +95,9 @@ export function trigEveningCheck(): void {
 /** 毎月 1 日 06 時台トリガー（実装設計 §7.7）。 */
 export function trigMonthly(): void {
   runMonthly(buildPorts());
+}
+
+/** 毎週月曜 07 時台トリガー（実装設計 経費フェーズ §5.6）。 */
+export function trigWeeklyOrphanCheck(): void {
+  runWeeklyOrphanCheck(buildPorts());
 }

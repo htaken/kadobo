@@ -40,6 +40,7 @@ const entryFns = [
   { name: "trigMorningCard", args: "" },
   { name: "trigEveningCheck", args: "" },
   { name: "trigMonthly", args: "" },
+  { name: "trigWeeklyOrphanCheck", args: "" },
 ];
 
 const wrappers = entryFns
