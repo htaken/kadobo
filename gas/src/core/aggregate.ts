@@ -266,6 +266,21 @@ export const ASSUMED_CONSUMPTION_TAX_RATE = 0.1;
 /** 源泉徴収率（`withholding === '10.21%'` のとき。実装設計 §7.1 単価マスタで明示された値）。 */
 export const WITHHOLDING_RATE = 0.1021;
 
+/**
+ * 率を掛ける計算は「整数どうしを掛けてから 10000 で割る」形に直して行う。
+ *
+ * `hours * unit_price` や `amount * 0.1` を浮動小数点でそのまま計算すると、真値をわずかに
+ * 下回る結果になることがある（例: `1.13 * 1800 === 2033.9999999999998`）。端数処理が
+ * `切捨` の場合、これがそのまま 1 円の過少計算になる。時間単価 1,800 円・月 400 時間までを
+ * 1 分刻みで全走査すると、報酬額で 842 件・消費税相当額で 280 件ずれる。
+ *
+ * 分子を整数に保ってから割ると、商が整数になる場合は必ず正確に表現されるため、この誤差が
+ * 消える（`gas/test/aggregate.test.ts` の全走査テストで担保）。
+ */
+const RATE_SCALE = 10000;
+const TAX_RATE_SCALED = Math.round(ASSUMED_CONSUMPTION_TAX_RATE * RATE_SCALE);
+const WITHHOLDING_RATE_SCALED = Math.round(WITHHOLDING_RATE * RATE_SCALE);
+
 function applyRounding(value: number, rounding: Rounding): number {
   switch (rounding) {
     case "切捨":
@@ -304,17 +319,23 @@ export function aggregateMonth(
     (sum, d) => sum + (d.worked_minutes ?? 0),
     0,
   );
-  const hours = Math.round((workedMinutes / 60) * 100) / 100;
-  const amount = applyRounding(hours * unitMasterRow.unit_price, unitMasterRow.rounding);
+  // 小数第 2 位までの時間数を「1/100 時間」単位の整数で保持し、単価との積を整数で求める
+  // （{@link RATE_SCALE} のコメント参照）。
+  const hoursHundredths = Math.round((workedMinutes * 100) / 60);
+  const hours = hoursHundredths / 100;
+  const amount = applyRounding(
+    (hoursHundredths * unitMasterRow.unit_price) / 100,
+    unitMasterRow.rounding,
+  );
 
   const taxAmount =
     unitMasterRow.tax_category === "課税"
-      ? applyRounding(amount * ASSUMED_CONSUMPTION_TAX_RATE, unitMasterRow.rounding)
+      ? applyRounding((amount * TAX_RATE_SCALED) / RATE_SCALE, unitMasterRow.rounding)
       : 0;
 
   const withholdingAmount =
     unitMasterRow.withholding === "10.21%"
-      ? applyRounding(amount * WITHHOLDING_RATE, unitMasterRow.rounding)
+      ? applyRounding((amount * WITHHOLDING_RATE_SCALED) / RATE_SCALE, unitMasterRow.rounding)
       : 0;
 
   const netAmount = amount + taxAmount - withholdingAmount;

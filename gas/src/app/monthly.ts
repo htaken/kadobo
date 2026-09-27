@@ -62,7 +62,7 @@ export function recomputeMonthly(client: string, month: string, ports: AppPorts)
   const toDate = lastDayOfMonthStr(month);
   const dailySummaries = ports.sheets.getDailySummariesInRange(fromDate, toDate).map(rowToDailySummary);
   const workedMinutes = dailySummaries.reduce((sum, d) => sum + (d.worked_minutes ?? 0), 0);
-  const hours = Math.round((workedMinutes / 60) * 100) / 100;
+  const hours = Math.round((workedMinutes * 100) / 60) / 100;
 
   const unitRows = ports.sheets.getUnitPriceRows();
   const selection = selectUnitPrice(unitRows, fromDate);

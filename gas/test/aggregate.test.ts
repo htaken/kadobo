@@ -326,3 +326,59 @@ describe("selectUnitPrice", () => {
     expect(result).toEqual({ error: "MULTIPLE_MATCHES" });
   });
 });
+
+describe("aggregateMonth — 浮動小数点誤差（A社契約: 時間単価 1,800 円・切捨）", () => {
+  it("1.13h × 1,800 円 = 2,034 円（1.13 * 1800 は浮動小数点で 2033.9999... になる）", () => {
+    const result = aggregateMonth(
+      [stubDaily(68)],
+      baseUnitPrice({ unit_price: 1800, tax_category: "課税", rounding: "切捨" }),
+    );
+    expect(result.hours).toBe(1.13);
+    expect(result.amount).toBe(2034);
+    expect(result.tax_amount).toBe(203);
+  });
+
+  it("2.05h × 1,800 円 = 3,690 円 / 消費税 369 円（報酬額・消費税の両方がずれていた例）", () => {
+    const result = aggregateMonth(
+      [stubDaily(123)],
+      baseUnitPrice({ unit_price: 1800, tax_category: "課税", rounding: "切捨" }),
+    );
+    expect(result.amount).toBe(3690);
+    expect(result.tax_amount).toBe(369);
+  });
+
+  it("月 400 時間まで 1 分刻みで全走査しても、整数演算の期待値と 1 円もずれない", () => {
+    const unit = baseUnitPrice({ unit_price: 1800, tax_category: "課税", rounding: "切捨" });
+    const mismatches: number[] = [];
+    for (let minutes = 0; minutes <= 400 * 60; minutes++) {
+      const result = aggregateMonth([stubDaily(minutes)], unit);
+      // 期待値は整数のみで計算する（1/100 時間単位 × 単価 ÷ 100、消費税は ×10 ÷ 100）。
+      const hoursHundredths = Math.round((minutes * 100) / 60);
+      const expectedAmount = Math.floor((hoursHundredths * 1800) / 100);
+      const expectedTax = Math.floor((expectedAmount * 10) / 100);
+      if (result.amount !== expectedAmount || result.tax_amount !== expectedTax) {
+        mismatches.push(minutes);
+      }
+    }
+    expect(mismatches).toEqual([]);
+  });
+
+  it("源泉徴収 10.21% でも整数演算の期待値と一致する", () => {
+    const unit = baseUnitPrice({
+      unit_price: 1800,
+      tax_category: "課税",
+      rounding: "切捨",
+      withholding: "10.21%",
+    });
+    const mismatches: number[] = [];
+    for (let minutes = 0; minutes <= 400 * 60; minutes++) {
+      const result = aggregateMonth([stubDaily(minutes)], unit);
+      const hoursHundredths = Math.round((minutes * 100) / 60);
+      const expectedAmount = Math.floor((hoursHundredths * 1800) / 100);
+      if (result.withholding_amount !== Math.floor((expectedAmount * 1021) / 10000)) {
+        mismatches.push(minutes);
+      }
+    }
+    expect(mismatches).toEqual([]);
+  });
+});
