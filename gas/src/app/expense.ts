@@ -20,6 +20,11 @@
  * ため、Drive への書込みは高々1回になる。サイズ一致は同一性の証明ではないが、証憑IDがファイル名
  * に入っている以上、別内容の同名ファイルは「過去の試行で別のバイト列を保存した」場合しか起こらず、
  * それは異常として `DRIVE_CONFLICT` で人手に回すのが正しい（実装設計 §5.4 の注記）。
+ *
+ * 🔄 **機能フラグ（実装設計 §5.9, §5.9.2, §9 WP9c）**: フェーズ1で `ENABLE_EXPENSE`/
+ * `ENABLE_E_DOC`（Script Properties）を判定する。判定するのは `findExpenseByIdempotencyKey`
+ * で新規行と分かった経路だけ——既存行（`RECEIVED`/`FILE_SAVED`）の再開はフラグに関係なく
+ * 続行する（詳細は `phase1` 内のコメント参照）。
  */
 import { EXPENSE_MAX_FILE_BYTES } from "@kadobo/shared/expense";
 import type { GasResponse } from "@kadobo/shared/protocol";
@@ -84,11 +89,34 @@ function phase1(req: ExpenseSubmitRequest, ports: AppPorts): Phase1Outcome {
       // （`CORRECTED` はこの分岐に来ない: 訂正フロー(WP8c)は別の証憑IDへ新規行を作る際に
       //   「旧行」へ設定するものであり、旧行の idempotency_key で expense_submit が
       //   再送されることは無い。）
+      //
+      // 🔄 実装設計 経費フェーズ §5.9.2, §9 WP9c: ここではフラグ（ENABLE_EXPENSE/ENABLE_E_DOC）
+      // を判定しない。既存行（RECEIVED/FILE_SAVED）の再開はフラグの状態に関係なく続行する。
+      // 理由は2つ: (1) §10.2 のロールバックは「Worker 側で新規受付を止め、pending が捌け切る
+      // のを待つ」手順であり、再開までフラグで止めると pending が永久に捌けない。
+      // (2) フェーズ3で Drive 保存まで済んで台帳更新前に落ちた行をフラグで止めると、Drive に
+      // ファイルが残ったまま行が `ERROR` で取り残され、§5.4 の冪等性が前提にしている再開が
+      // 効かなくなる。
       return {
         kind: "resume",
         receiptId: existing.receipt_id,
         needsDownload: existing.state === "RECEIVED",
       };
+    }
+
+    // 🔄 実装設計 経費フェーズ §5.9, §5.9.2, §9 WP9c: フラグ判定は
+    // `findExpenseByIdempotencyKey` の「後」（＝上の `existing !== null` 分岐がすべて
+    // 早期 return したあと）、かつ**新規行を作る経路だけ**に置く。理由は直上のコメントと同じ。
+    // `'1'` 以外・未設定はすべて無効（fail closed。実装設計 §5.9）。
+    const enableExpense = ports.props.get("ENABLE_EXPENSE") === "1";
+    if (!enableExpense) {
+      return { kind: "response", response: { ok: false, error: "EXPENSE_DISABLED", retryable: false } };
+    }
+    if (req.receipt_type === "e_doc") {
+      const enableEDoc = ports.props.get("ENABLE_E_DOC") === "1";
+      if (!enableEDoc) {
+        return { kind: "response", response: { ok: false, error: "E_DOC_DISABLED", retryable: false } };
+      }
     }
 
     // 新規受付。`validateExpenseInput` は台帳追記より前に呼ぶ（実装設計 §5.5 の 🔄 変更点）。

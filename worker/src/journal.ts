@@ -84,12 +84,26 @@ export async function listPending(db: D1Database, limit = 50): Promise<JournalRo
   return result.results;
 }
 
-/** `settings.forwarding_enabled` を読む（行が無い場合は安全側に倒して `false`）。実装設計 §5。 */
+/**
+ * `settings.<key>` を読む（行が無ければ `false`、値が `'1'` のときだけ `true`。
+ * 実装設計 経費フェーズ §5.9.1）。**D1 の読み取りが例外を投げた場合も `false`**（fail closed）。
+ * `forwarding_enabled`・`enable_expense`・`enable_e_doc` はいずれもこの関数を経由する。
+ */
+export async function isSettingEnabled(db: D1Database, key: string): Promise<boolean> {
+  try {
+    const row = await db.prepare(`SELECT value FROM settings WHERE key = ?`).bind(key).first<{ value: string }>();
+    return row?.value === "1";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `settings.forwarding_enabled` を読む（実装設計 §5）。
+ * 🔄 実装設計 経費フェーズ §5.9.1: 実体は `isSettingEnabled` に一般化した（外から見た挙動は変えない）。
+ */
 export async function isForwardingEnabled(db: D1Database): Promise<boolean> {
-  const row = await db
-    .prepare(`SELECT value FROM settings WHERE key = 'forwarding_enabled'`)
-    .first<{ value: string }>();
-  return row?.value === "1";
+  return isSettingEnabled(db, "forwarding_enabled");
 }
 
 /** `status IN ('done','rejected') AND updated_at < beforeMs` を削除する（実装設計 §5）。削除件数を返す。 */

@@ -57,9 +57,19 @@ function jsonResponse(body: unknown): Response {
  * 経費モーダルの JSON を組み立てる（実装設計 経費フェーズ §2.2）。データ参照は不要な静的な内容。
  * `private_metadata` は既定で空文字列（経費は稼働カードに紐づかないため）。
  * `/keihi` の呼び出し元がチャンネル通知先を積む必要がある場合は、呼び出し側で
- * `view.private_metadata` を上書きすること（本関数のシグネチャは契約どおり `todayJst` のみ）。
+ * `view.private_metadata` を上書きすること。
+ *
+ * 🔄 実装設計 経費フェーズ §5.9.2 (WP9c): `enableEDoc`（第 2 引数、既定 `true`）が `false` の
+ * とき、証憑区分の選択肢から `e_doc` を出さない（`paper` のみになる）。既存の呼び出し・
+ * テストを壊さないよう省略可能にしてある。
  */
-export function buildExpenseModalView(todayJst: string): SlackModalView {
+export function buildExpenseModalView(todayJst: string, enableEDoc = true): SlackModalView {
+  const receiptTypeOptions = [
+    { text: { type: "plain_text" as const, text: RECEIPT_TYPE_LABELS.paper }, value: "paper" },
+    ...(enableEDoc
+      ? [{ text: { type: "plain_text" as const, text: RECEIPT_TYPE_LABELS.e_doc }, value: "e_doc" }]
+      : []),
+  ];
   return {
     type: "modal",
     callback_id: EXPENSE_CALLBACK_ID,
@@ -76,10 +86,7 @@ export function buildExpenseModalView(todayJst: string): SlackModalView {
         element: {
           type: "static_select",
           action_id: "receipt_type_select",
-          options: [
-            { text: { type: "plain_text", text: RECEIPT_TYPE_LABELS.paper }, value: "paper" },
-            { text: { type: "plain_text", text: RECEIPT_TYPE_LABELS.e_doc }, value: "e_doc" },
-          ],
+          options: receiptTypeOptions,
         },
       },
       {
@@ -309,18 +316,54 @@ export interface HandleExpenseSubmissionInput {
 }
 
 /**
- * `view_submission`（`callback_id: kado_expense`）ハンドラ（実装設計 経費フェーズ §4.2, §4.3）。
+ * `enable_expense`/`enable_e_doc` 無効時の `view_submission` エラー文言（実装設計 経費フェーズ §5.9.2）。
+ * 🔄 コーディネーターのレビュー指摘: フラグ無効は**設定状態**であり時間経過では直らないため、
+ * 一時障害を思わせる文言（「しばらくしてから」「現在停止中」）にしない。利用者は運用者
+ * 本人 1 名のため、内部の設定名（フラグ名）を出して構わない（§3.2 の `CONFIG_MISSING` と同じ
+ * 論点）。
  *
+ * 🔄 二度目のレビュー指摘（Blocker）: `E_DOC_DISABLED_ERROR` に「紙の証憑として登録してください」
+ * と書いていたのは**誤り**。要件定義 §4.3.3 のとおり電子取引は受領した電磁的記録そのものを
+ * 保存する義務があり、書面出力で電子データの保存に**代えることは不可**。区分を `paper` に
+ * 変えて登録すると、紙の運用（`経費証憑/紙/...`）に入ってしまい電子取引としての保存になら
+ * ない＝電帳法違反になりうる。よって「紙へ変更するな」を明示し、要件定義 §4.3.3 末尾の
+ * **暫定運用**（電子取引の元データは Drive の所定フォルダに手動保存し、台帳には手入力する）
+ * へ誘導する。また、停止理由を「法令ゲート G-2・G-3 の完了待ち」のように固定断定しない
+ * （フラグはロールバック中や D1 読み取り失敗でも無効になりうるため、理由を決め打ちできない）。
+ */
+const EXPENSE_DISABLED_ERROR = "経費機能は無効になっています（フラグ `enable_expense`）。有効化してから登録してください";
+const E_DOC_DISABLED_ERROR =
+  "電子取引の証憑はいま受け付けていません。区分を「紙」に変えて登録しないでください" +
+  "（電子取引データは電子のまま保存する必要があります）。" +
+  "元データは暫定運用のとおり Drive の所定フォルダへ手動保存し、台帳に手入力してください";
+
+/**
+ * `view_submission`（`callback_id: kado_expense`）ハンドラ（実装設計 経費フェーズ §4.2, §4.3, §5.9.2）。
+ *
+ * 0. 🔄 §4.3 の検証より**前**に `enable_expense` を判定する。無効なら `{response_action:'errors'}`
+ *    を返す（D1 に INSERT しない・GAS へ送らない）
  * 1. `state.values` を §4.3 に従って検証 → NG なら `{response_action:'errors'}` を同期で返す
+ * 1.5 🔄 検証が通ったあと、`receipt_type==='e_doc'` かつ `enable_e_doc` が無効なら同じく
+ *    `{response_action:'errors'}` を返す（INSERT しない）
  * 2. 冪等キー生成 → D1 INSERT
  *    - 成功／重複 → `{response_action:'clear'}` を返す
  *    - 🔄 INSERT 自体が失敗 → `clear` せず `{response_action:'errors'}` で
  *      「受け付けに失敗しました。もう一度お試しください」を返す（入力内容を失わせない）
  * 3. `waitUntil`: GAS へ POST（§3）。失敗は `pending` のまま Cron 再送
+ *
+ * いずれのフラグエラーも `errors` のキーは `receipt_type`（実在する block_id）を使う。
  */
 export async function handleExpenseSubmission(input: HandleExpenseSubmissionInput): Promise<Response> {
   const { env, ctx, payload } = input;
   const fetchImpl = input.fetchImpl ?? fetch;
+
+  const enableExpense = await journal.isSettingEnabled(env.DB, "enable_expense");
+  if (!enableExpense) {
+    return jsonResponse({
+      response_action: "errors",
+      errors: { receipt_type: EXPENSE_DISABLED_ERROR },
+    });
+  }
 
   const values = payload.view.state.values;
   const now = Date.now();
@@ -328,6 +371,16 @@ export async function handleExpenseSubmission(input: HandleExpenseSubmissionInpu
   const validated = validateExpenseSubmission(values, todayJst);
   if (!validated.ok) {
     return jsonResponse({ response_action: "errors", errors: validated.errors });
+  }
+
+  if (validated.value.receipt_type === "e_doc") {
+    const enableEDoc = await journal.isSettingEnabled(env.DB, "enable_e_doc");
+    if (!enableEDoc) {
+      return jsonResponse({
+        response_action: "errors",
+        errors: { receipt_type: E_DOC_DISABLED_ERROR },
+      });
+    }
   }
 
   const channelId = parseExpensePrivateMetadata(payload.view.private_metadata);

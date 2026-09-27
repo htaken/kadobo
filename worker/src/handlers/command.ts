@@ -1,10 +1,11 @@
 /**
  * スラッシュコマンドハンドラ（実装設計 §6.5, §2.1、経費フェーズ §4.1）。
  *
- * 1. 🔄 `/keihi` → 実装設計 経費フェーズ §4.1: §2.2 の経費モーダルを組み立て、
- *    `views.open` の完了を待たずに `ctx.waitUntil` へ渡して直ちに 200 空ボディを返す
- *    （`trigger_id` は 3 秒で失効するため）。`views.open` 失敗時のみ `response_url` へ
- *    ephemeral でエラーを返す。GAS へは転送せず、D1 ジャーナルにも書かない
+ * 1. 🔄 `/keihi` → 実装設計 経費フェーズ §4.1, §5.9.2 (WP9c): まず D1 `settings.enable_expense`
+ *    を確認する。無効なら `views.open` を呼ばず、GAS 転送も D1 INSERT もせずに ephemeral で
+ *    停止中を伝えて終わる。有効なら §2.2 の経費モーダルを組み立て、`views.open` の完了を
+ *    待たずに `ctx.waitUntil` へ渡して直ちに 200 空ボディを返す（`trigger_id` は 3 秒で
+ *    失効するため）。`views.open` 失敗時のみ `response_url` へ ephemeral でエラーを返す
  * 2. `/kado …` → 引数を `''|'status'` に正規化（それ以外は ephemeral で使い方を返す）
  *    → D1 INSERT → 200 `{response_type:'ephemeral', text:'⏳ 処理中…'}` → `waitUntil` で GAS へ POST
  */
@@ -21,6 +22,16 @@ import { buildExpenseModalView } from "./expense";
 
 const KADO_USAGE_TEXT =
   "使い方: `/kado`（当日の稼働カードを表示） / `/kado status`（今週・今月の累計を表示）";
+
+/**
+ * `enable_expense` 無効時の `/keihi` 応答文言（実装設計 経費フェーズ §5.9.2, §10.1 ステップ6）。
+ * 🔄 コーディネーターのレビュー指摘: フラグ無効は**設定状態**であり時間経過では直らないため、
+ * 「しばらくしてから」のような一時障害を思わせる文言にしない（§3.2 の `CONFIG_MISSING` が
+ * 「運用者への設定依頼の文言にする」としているのと同じ論点。このシステムの利用者は運用者
+ * 本人 1 名のため、内部の設定名（フラグ名）を出して構わない）。
+ */
+const EXPENSE_DISABLED_TEXT =
+  "⚠️ 経費機能は無効になっています（フラグ `enable_expense`）。有効化するまで登録できません。運用手順に従って有効化してください。";
 
 function jsonResponse(body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -49,6 +60,12 @@ export async function handleSlashCommand(input: HandleSlashCommandInput): Promis
   const fetchImpl = input.fetchImpl ?? fetch;
 
   if (command.command === "/keihi") {
+    // 🔄 実装設計 経費フェーズ §5.9.2, §10.1 ステップ6: `views.open` を呼ぶ前に判定する
+    // （GAS 転送も D1 INSERT も無い経路なので、ここは単に ephemeral を返すだけでよい）。
+    const enableExpense = await journal.isSettingEnabled(env.DB, "enable_expense");
+    if (!enableExpense) {
+      return jsonResponse({ response_type: "ephemeral", text: EXPENSE_DISABLED_TEXT });
+    }
     ctx.waitUntil(openExpenseModal({ env, command, fetchImpl }));
     return new Response(null, { status: 200 });
   }
@@ -115,6 +132,9 @@ export async function handleSlashCommand(input: HandleSlashCommandInput): Promis
  * `view_submission` ペイロード自体には投稿元チャンネルの情報が含まれないため、モーダルの
  * 往復でチャンネルを運ぶ以外に手段が無かった（`buildExpenseModalView` 自体の契約は
  * `private_metadata: ''` のままなので、ここで上書きする）。
+ *
+ * 🔄 実装設計 経費フェーズ §5.9.2 (WP9c): `enable_e_doc` が無効なら証憑区分から `e_doc` の
+ * 選択肢を出さない（`buildExpenseModalView` の第 2 引数）。
  */
 async function openExpenseModal(input: {
   env: Env;
@@ -123,7 +143,8 @@ async function openExpenseModal(input: {
 }): Promise<void> {
   const { env, command, fetchImpl } = input;
   const todayJst = businessDateOf(Date.now());
-  const view = buildExpenseModalView(todayJst);
+  const enableEDoc = await journal.isSettingEnabled(env.DB, "enable_e_doc");
+  const view = buildExpenseModalView(todayJst, enableEDoc);
   view.private_metadata = JSON.stringify({ channel_id: command.channel_id });
   try {
     await viewsOpen(env.SLACK_BOT_TOKEN, { trigger_id: command.trigger_id, view }, fetchImpl);

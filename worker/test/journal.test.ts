@@ -153,6 +153,41 @@ describe("isForwardingEnabled", () => {
   });
 });
 
+// --- isSettingEnabled（実装設計 経費フェーズ §5.9.1, §9 WP9c） ---
+
+describe("isSettingEnabled", () => {
+  it("行が無ければ false", async () => {
+    expect(await journal.isSettingEnabled(db, "no_such_key")).toBe(false);
+  });
+
+  it("値が '0' なら false", async () => {
+    await db.exec("UPDATE settings SET value = '0' WHERE key = 'enable_expense'");
+    expect(await journal.isSettingEnabled(db, "enable_expense")).toBe(false);
+  });
+
+  it("値が '1' なら true", async () => {
+    await db.exec("UPDATE settings SET value = '1' WHERE key = 'enable_expense'");
+    expect(await journal.isSettingEnabled(db, "enable_expense")).toBe(true);
+  });
+
+  it("D1 の読み取りが例外を投げても false（fail closed）", async () => {
+    const throwingDb = {
+      prepare() {
+        return {
+          bind() {
+            return {
+              first() {
+                throw new Error("d1_unavailable");
+              },
+            };
+          },
+        };
+      },
+    } as unknown as D1Database;
+    expect(await journal.isSettingEnabled(throwingDb, "enable_expense")).toBe(false);
+  });
+});
+
 describe("deleteOldJournal", () => {
   it("30日超の done/rejected のみ削除し、pending は残す", async () => {
     const now = 100_000_000;

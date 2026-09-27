@@ -10,6 +10,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createTestHarness } from "wrangler";
 import { EXPENSE_CATEGORIES, EXPENSE_MAX_FILE_BYTES } from "@kadobo/shared/expense";
 import type { Env } from "../src/index";
+import { runRetryCron } from "../src/cron";
 import { handleSlashCommand } from "../src/handlers/command";
 import {
   buildExpenseModalView,
@@ -134,6 +135,19 @@ describe("buildExpenseModalView", () => {
     expect(block.element.action_id).toBe("receipt_type_select");
     expect(block.element.options.map((o: any) => o.value)).toEqual(["paper", "e_doc"]);
     expect(block.element.initial_option).toBeUndefined();
+  });
+
+  // 🔄 実装設計 経費フェーズ §5.9.2, §9 WP9c: enable_e_doc 無効時は e_doc の選択肢を出さない。
+  it("第2引数 enableEDoc=false: receipt_type の選択肢が paper だけになる", () => {
+    const view = buildExpenseModalView("2026-09-01", false);
+    const block = view.blocks.find((b) => b.block_id === "receipt_type") as any;
+    expect(block.element.options.map((o: any) => o.value)).toEqual(["paper"]);
+  });
+
+  it("第2引数を省略すると既定 true 扱いで e_doc も出る（既存呼び出しとの互換性）", () => {
+    const view = buildExpenseModalView("2026-09-01", true);
+    const block = view.blocks.find((b) => b.block_id === "receipt_type") as any;
+    expect(block.element.options.map((o: any) => o.value)).toEqual(["paper", "e_doc"]);
   });
 
   it("date: datepicker、initial_date が引数の todayJst", () => {
@@ -513,6 +527,12 @@ beforeEach(async () => {
   await db.exec("DELETE FROM journal");
   await db.exec("DELETE FROM nonces");
   await db.exec("UPDATE settings SET value = '1' WHERE key = 'forwarding_enabled'");
+  // 🔄 実装設計 経費フェーズ §5.9, §9 WP9c: 本番の既定は無効（fail closed）だが、この
+  // ファイルの既存テスト群は「経費機能が有効」を前提にしている（`forwarding_enabled` を
+  // 既定 '1' にしているのと同じ方針）。フラグ無効時の挙動はフラグ専用の describe で
+  // 明示的に '0' へ上書きして検証する。
+  await db.exec("UPDATE settings SET value = '1' WHERE key = 'enable_expense'");
+  await db.exec("UPDATE settings SET value = '1' WHERE key = 'enable_e_doc'");
 });
 
 async function allJournalRows() {
@@ -536,13 +556,20 @@ function makeExpensePayload(
   };
 }
 
-/** `prepare().bind().run()` が必ず例外を投げる D1Database もどき（INSERT 失敗のシミュレーション用）。 */
+/**
+ * `prepare().bind().run()` が必ず例外を投げる D1Database もどき（INSERT 失敗のシミュレーション用）。
+ * `first()` は `enable_expense` の読み取り（`isSettingEnabled`）が「有効」を返すよう固定値を返す
+ * （このテストの狙いは INSERT 失敗の経路だけであり、フラグ判定はここでは検証対象にしない）。
+ */
 function makeFailingDb(): D1Database {
   return {
     prepare() {
       return {
         bind() {
           return {
+            async first() {
+              return { value: "1" };
+            },
             run() {
               throw new Error("d1_unavailable");
             },
@@ -700,6 +727,147 @@ describe("handleExpenseSubmission", () => {
     expect(dmCall).toBeDefined();
     expect((dmCall?.body as any).channel).toBe("U1");
   });
+
+  // --- 機能フラグ（実装設計 経費フェーズ §5.9.2, §9 WP9c） ---
+  describe("機能フラグ（enable_expense / enable_e_doc）", () => {
+    it("enable_expense='0': §4.3 の検証より前に errors を返し、journal に INSERT しない・GAS へ送らない", async () => {
+      await db.exec("UPDATE settings SET value = '0' WHERE key = 'enable_expense'");
+      const env = makeEnv(db);
+      const { ctx, flush } = createTestCtx();
+      const { fetchImpl, calls } = createFetchStub();
+      // 必須項目を空にしても（§4.3 の検証エラーではなく）フラグのエラーが優先されることを確認する。
+      const payload = makeExpensePayload({});
+
+      const res = await handleExpenseSubmission({ env, ctx, payload, fetchImpl });
+      const body = (await res.json()) as any;
+      expect(body.response_action).toBe("errors");
+      expect(body.errors.receipt_type).toBeDefined();
+      // §4.3 の他ブロックのエラーは出ない（検証より前に短絡しているため）。
+      expect(body.errors.date).toBeUndefined();
+      expect(body.errors.amount).toBeUndefined();
+
+      await flush();
+      expect(await allJournalRows()).toHaveLength(0);
+      expect(calls).toHaveLength(0);
+    });
+
+    it("enable_e_doc='0': e_doc の送信だけが拒否され、paper は通る", async () => {
+      await db.exec("UPDATE settings SET value = '0' WHERE key = 'enable_e_doc'");
+      const env = makeEnv(db);
+
+      // e_doc: errors を返し、journal に INSERT しない。
+      {
+        const { ctx, flush } = createTestCtx();
+        const { fetchImpl, calls } = createFetchStub();
+        const values = baseValues();
+        values.receipt_type = {
+          receipt_type_select: { type: "static_select", selected_option: { value: "e_doc" } },
+        };
+        const payload = makeExpensePayload(values);
+
+        const res = await handleExpenseSubmission({ env, ctx, payload, fetchImpl });
+        const body = (await res.json()) as any;
+        expect(body.response_action).toBe("errors");
+        expect(body.errors.receipt_type).toBeDefined();
+
+        await flush();
+        expect(await allJournalRows()).toHaveLength(0);
+        expect(calls).toHaveLength(0);
+      }
+
+      // paper: 通常どおり通る。
+      {
+        const { ctx, flush } = createTestCtx();
+        const { fetchImpl } = createFetchStub((url) => {
+          if (url === env.GAS_URL) {
+            return jsonResponse({ ok: true, applied: true });
+          }
+          return undefined;
+        });
+        const payload = makeExpensePayload(baseValues());
+
+        const res = await handleExpenseSubmission({ env, ctx, payload, fetchImpl });
+        const body = (await res.json()) as any;
+        expect(body.response_action).toBe("clear");
+
+        await flush();
+        expect(await allJournalRows()).toHaveLength(1);
+      }
+    });
+
+    // 🔄 Codex 第二意見レビュー指摘: `isSettingEnabled` 単体だけでなく、実際に
+    // `handleExpenseSubmission` を通した経路でも「D1 の読み取りが例外を投げる → fail closed
+    // → INSERT も GAS 送信も起きない」ことを確認する。
+    it("D1 の読み取りが例外を投げる状況: handleExpenseSubmission まで通しても INSERT も GAS 送信も起きない（fail closed）", async () => {
+      const runCalls = { count: 0 };
+      const throwingDb = {
+        prepare() {
+          return {
+            bind() {
+              return {
+                async first() {
+                  throw new Error("d1_unavailable");
+                },
+                run() {
+                  // `isSettingEnabled` が fail closed で false を返す以上、ここに到達しては
+                  // ならない（INSERT が呼ばれてしまったことの検出用）。
+                  runCalls.count++;
+                  throw new Error("must not be called");
+                },
+              };
+            },
+          };
+        },
+      } as unknown as D1Database;
+      const env = makeEnv(throwingDb);
+      const { ctx, flush } = createTestCtx();
+      const { fetchImpl, calls } = createFetchStub();
+      const payload = makeExpensePayload(baseValues());
+
+      const res = await handleExpenseSubmission({ env, ctx, payload, fetchImpl });
+      const body = (await res.json()) as any;
+      expect(body.response_action).toBe("errors");
+      expect(body.errors.receipt_type).toBeDefined();
+
+      await flush();
+      expect(runCalls.count).toBe(0); // insertJournal（D1 の run()）は呼ばれていない
+      expect(calls).toHaveLength(0); // GAS へも送っていない
+    });
+
+    // 🔄 Codex 第二意見レビュー指摘: GAS が EXPENSE_DISABLED/E_DOC_DISABLED（retryable:false）を
+    // 返したとき、journal が rejected になり、次の Cron（listPending は status='pending' のみ
+    // 拾う）で再送されないことを確認する。
+    it.each(["EXPENSE_DISABLED", "E_DOC_DISABLED"] as const)(
+      "GAS が %s を返すとき journal は rejected になり、次の Cron で再送されない",
+      async (errorCode) => {
+        const env = makeEnv(db);
+        const { ctx, flush } = createTestCtx();
+        const { fetchImpl: submitFetch } = createFetchStub((url) => {
+          if (url === env.GAS_URL) {
+            return jsonResponse({ ok: false, error: errorCode, retryable: false });
+          }
+          return undefined;
+        });
+        const payload = makeExpensePayload(baseValues());
+
+        const res = await handleExpenseSubmission({ env, ctx, payload, fetchImpl: submitFetch });
+        expect(((await res.json()) as any).response_action).toBe("clear");
+        await flush();
+
+        const rows = await allJournalRows();
+        expect(rows).toHaveLength(1);
+        expect(rows[0].status).toBe("rejected");
+        expect(rows[0].last_error).toBe(errorCode);
+
+        const { fetchImpl: cronFetch, calls: cronCalls } = createFetchStub();
+        await runRetryCron(env, { fetchImpl: cronFetch });
+        // rejected は listPending（status='pending' のみ）に含まれないため、GAS へは送らない。
+        expect(cronCalls).toHaveLength(0);
+        const rowAfterCron = await db.prepare("SELECT * FROM journal WHERE id = ?").bind(rows[0].id).first<any>();
+        expect(rowAfterCron.status).toBe("rejected");
+      },
+    );
+  });
 });
 
 // --- /keihi（handleSlashCommand、実装設計 経費フェーズ §4.1） ---
@@ -756,5 +924,44 @@ describe("handleSlashCommand /keihi", () => {
     expect(notifyCall).toBeDefined();
     expect((notifyCall?.body as any).response_type).toBe("ephemeral");
     expect(await allJournalRows()).toHaveLength(0);
+  });
+
+  // --- 機能フラグ（実装設計 経費フェーズ §5.9.2, §10.1 ステップ6, §9 WP9c） ---
+  describe("機能フラグ（enable_expense / enable_e_doc）", () => {
+    it("enable_expense='0': views.open を呼ばず、ephemeral で停止中を伝えて終わる", async () => {
+      await db.exec("UPDATE settings SET value = '0' WHERE key = 'enable_expense'");
+      const env = makeEnv(db);
+      const { ctx, flush } = createTestCtx();
+      const { fetchImpl, calls } = createFetchStub();
+      const command = makeCommand();
+
+      const res = await handleSlashCommand({ env, ctx, command, fetchImpl });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as any;
+      expect(body.response_type).toBe("ephemeral");
+
+      await flush();
+      // §10.1 ステップ6: モーダルは開かない（views.open を含め、外部への fetch が一切無い）。
+      expect(calls).toHaveLength(0);
+      expect(await allJournalRows()).toHaveLength(0);
+    });
+
+    it("enable_e_doc='0': モーダルの receipt_type の選択肢が paper だけになる", async () => {
+      await db.exec("UPDATE settings SET value = '0' WHERE key = 'enable_e_doc'");
+      const env = makeEnv(db);
+      const { ctx, flush } = createTestCtx();
+      const { fetchImpl, calls } = createFetchStub();
+      const command = makeCommand();
+
+      const res = await handleSlashCommand({ env, ctx, command, fetchImpl });
+      expect(res.status).toBe(200);
+
+      await flush();
+      const viewsOpenCall = calls.find((c) => c.url.endsWith("/views.open"));
+      expect(viewsOpenCall).toBeDefined();
+      const sentView = (viewsOpenCall?.body as any).view;
+      const block = sentView.blocks.find((b: any) => b.block_id === "receipt_type");
+      expect(block.element.options.map((o: any) => o.value)).toEqual(["paper"]);
+    });
   });
 });

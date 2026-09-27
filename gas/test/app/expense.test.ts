@@ -414,6 +414,143 @@ describe("handleExpenseSubmit — ロック分割（実装設計 経費フェー
   });
 });
 
+describe("handleExpenseSubmit — 機能フラグ（実装設計 経費フェーズ §5.9, §5.9.2, §9 WP9c）", () => {
+  it("ENABLE_EXPENSE 未設定なら新規受付は EXPENSE_DISABLED（retryable:false）で台帳に行が増えない", () => {
+    const ports = makeFakePorts(NOW_MS);
+    ports.props.values.delete("ENABLE_EXPENSE");
+    const req = makeExpenseRequest();
+
+    const result = handleExpenseSubmit(req, ports);
+
+    expect(result).toEqual({ ok: false, error: "EXPENSE_DISABLED", retryable: false });
+    expect(ports.sheets.expenses).toHaveLength(0);
+  });
+
+  it("ENABLE_EXPENSE が '1' 以外の値なら無効", () => {
+    const ports = makeFakePorts(NOW_MS);
+    ports.props.set("ENABLE_EXPENSE", "true");
+    const req = makeExpenseRequest();
+
+    const result = handleExpenseSubmit(req, ports);
+
+    expect(result).toEqual({ ok: false, error: "EXPENSE_DISABLED", retryable: false });
+    expect(ports.sheets.expenses).toHaveLength(0);
+  });
+
+  it("ENABLE_E_DOC 未設定なら e_doc だけ E_DOC_DISABLED、paper は通る（法令ゲート §6 用）", () => {
+    const ports = makeFakePorts(NOW_MS);
+    ports.props.values.delete("ENABLE_E_DOC");
+
+    const eDocReq = makeExpenseRequest({
+      receipt_type: "e_doc",
+      idempotency_key: "V1:edoc0000000000001",
+    });
+    const eDocResult = handleExpenseSubmit(eDocReq, ports);
+    expect(eDocResult).toEqual({ ok: false, error: "E_DOC_DISABLED", retryable: false });
+    expect(ports.sheets.expenses).toHaveLength(0);
+
+    const paperReq = makeExpenseRequest();
+    const paperResult = handleExpenseSubmit(paperReq, ports);
+    expect(paperResult).toEqual({ ok: true, applied: true });
+    expect(ports.sheets.expenses).toHaveLength(1);
+  });
+
+  it(
+    "既に RECEIVED の行がある状態で ENABLE_EXPENSE を無効にしたまま再送 → " +
+      "フラグで止まらず再開する（本 WP の肝。§10.2 のロールバック手順が前提にする挙動）",
+    () => {
+      const ports = makeFakePorts(NOW_MS);
+      const req = makeExpenseRequest();
+
+      // FILE_SAVED への updateExpense だけを1回失敗させ、RECEIVED で止まる状況を作る
+      // （「故障注入: Drive 保存成功後の台帳更新失敗」と同じ手法）。
+      const originalUpdate = ports.sheets.updateExpense.bind(ports.sheets);
+      let failNext = true;
+      ports.sheets.updateExpense = (receiptId, patch) => {
+        if (failNext && patch.state === "FILE_SAVED") {
+          failNext = false;
+          throw new Error("stopped_before_file_saved");
+        }
+        originalUpdate(receiptId, patch);
+      };
+      expect(() => handleExpenseSubmit(req, ports)).toThrow("stopped_before_file_saved");
+      expect(ports.sheets.expenses[0]!.state).toBe("RECEIVED");
+      expect(ports.drive.saveCount).toBe(1);
+
+      // ロールバック手順（§10.2）を模す: Worker 側は既に enable_expense=0 だが、
+      // GAS 側の ENABLE_EXPENSE はまだ落としていない……という状況とは別に、ここでは
+      // GAS 側のフラグ自体が無効化された状態でも再開できることを確認する
+      // （既存行の再開はフラグの状態に関係なく続行する、という §5.9.2 の設計）。
+      ports.props.set("ENABLE_EXPENSE", "0");
+
+      const result = handleExpenseSubmit({ ...req, source: "retry" }, ports);
+
+      expect(result).toEqual({ ok: true, applied: true });
+      expect(ports.sheets.expenses[0]!.state).toBe("COMPLETED");
+      // 核心: 再開時に Drive への書込みは増えない（既存ファイルが再利用される）。
+      expect(ports.drive.saveCount).toBe(1);
+      expect(ports.sheets.expenses).toHaveLength(1);
+    },
+  );
+
+  it("既に FILE_SAVED の行がある状態で ENABLE_E_DOC を無効にしたまま e_doc を再送 → フラグで止まらず再開する", () => {
+    const ports = makeFakePorts(NOW_MS);
+    const req = makeExpenseRequest({ receipt_type: "e_doc" });
+
+    const originalUpdate = ports.sheets.updateExpense.bind(ports.sheets);
+    let failNext = true;
+    ports.sheets.updateExpense = (receiptId, patch) => {
+      if (failNext && patch.state === "COMPLETED") {
+        failNext = false;
+        throw new Error("stopped_after_file_saved");
+      }
+      originalUpdate(receiptId, patch);
+    };
+    expect(() => handleExpenseSubmit(req, ports)).toThrow("stopped_after_file_saved");
+    expect(ports.sheets.expenses[0]!.state).toBe("FILE_SAVED");
+
+    ports.props.set("ENABLE_E_DOC", "0");
+
+    const result = handleExpenseSubmit({ ...req, source: "retry" }, ports);
+
+    expect(result).toEqual({ ok: true, applied: true });
+    expect(ports.sheets.expenses[0]!.state).toBe("COMPLETED");
+    expect(ports.sheets.expenses).toHaveLength(1);
+  });
+
+  // 🔄 Codex 第二意見レビュー指摘: 上のテストは FILE_SAVED からの再開だけを見ていたため、
+  // より早い段階（RECEIVED、ダウンロードすら済んでいない）からの再開も別途確認する。
+  it("既に RECEIVED の e_doc 行がある状態で ENABLE_E_DOC を無効にしたまま再送 → フラグで止まらず再開する", () => {
+    const ports = makeFakePorts(NOW_MS);
+    const req = makeExpenseRequest({ receipt_type: "e_doc" });
+
+    // FILE_SAVED への updateExpense だけを1回失敗させ、RECEIVED のまま止まる状況を作る
+    // （Drive 保存自体は成功させる。「故障注入: Drive 保存成功後の台帳更新失敗」と同じ手法）。
+    const originalUpdate = ports.sheets.updateExpense.bind(ports.sheets);
+    let failNext = true;
+    ports.sheets.updateExpense = (receiptId, patch) => {
+      if (failNext && patch.state === "FILE_SAVED") {
+        failNext = false;
+        throw new Error("stopped_before_file_saved");
+      }
+      originalUpdate(receiptId, patch);
+    };
+    expect(() => handleExpenseSubmit(req, ports)).toThrow("stopped_before_file_saved");
+    expect(ports.sheets.expenses[0]!.state).toBe("RECEIVED");
+    expect(ports.drive.saveCount).toBe(1);
+
+    ports.props.set("ENABLE_E_DOC", "0");
+
+    const result = handleExpenseSubmit({ ...req, source: "retry" }, ports);
+
+    expect(result).toEqual({ ok: true, applied: true });
+    expect(ports.sheets.expenses[0]!.state).toBe("COMPLETED");
+    // 核心: 再開時に Drive への書込みは増えない（既存ファイルが再利用される）。
+    expect(ports.drive.saveCount).toBe(1);
+    expect(ports.sheets.expenses).toHaveLength(1);
+  });
+});
+
 describe("handleExpenseSubmit — Sheets 数式インジェクション対策（実装設計 §4.4）", () => {
   it("取引先が `=SUM(A1)` なら台帳には `'=SUM(A1)` として入る（数式にならない）", () => {
     const ports = makeFakePorts(NOW_MS);

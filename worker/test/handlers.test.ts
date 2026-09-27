@@ -35,6 +35,9 @@ beforeEach(async () => {
   await db.exec("DELETE FROM journal");
   await db.exec("DELETE FROM nonces");
   await db.exec("UPDATE settings SET value = '1' WHERE key = 'forwarding_enabled'");
+  // 🔄 実装設計 経費フェーズ §5.9, §9 WP9c: この既存テストの `/keihi` はモーダルが開くことを
+  // 前提にしている（フラグの検証自体は `expense.test.ts` に集約する）。
+  await db.exec("UPDATE settings SET value = '1' WHERE key = 'enable_expense'");
 });
 
 async function allJournalRows() {

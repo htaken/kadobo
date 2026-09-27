@@ -50,6 +50,38 @@ async function insertStampJournal(id: string, attempts: number, extra?: Record<s
   }
 }
 
+/** `expense_submit` の pending journal 行を直接 INSERT する（経費フェーズ §3.1）。 */
+async function insertExpenseSubmitJournal(id: string, attempts: number, extra?: Record<string, unknown>) {
+  const payload = JSON.stringify({
+    kind: "expense_submit",
+    idempotency_key: `key-${id}`,
+    user_id: "U1",
+    view_id: "V1",
+    channel_id: "C1",
+    receipt_type: "paper",
+    date: "2026-09-01",
+    amount: 1200,
+    category: "消耗品費",
+    partner: "○○商店",
+    memo: "",
+    file: {
+      id: "F1",
+      name: "receipt.pdf",
+      mimetype: "application/pdf",
+      filetype: "pdf",
+      size: 1000,
+      url_private: "https://files.slack.com/files-pri/T1-F1/receipt.pdf",
+    },
+    received_at_ms: 1756260000500,
+    source: "modal",
+    ...extra,
+  });
+  await journal.insertJournal(db, { id, idempotency_key: `key-${id}`, kind: "expense_submit", payload, now: 1000 });
+  if (attempts > 0) {
+    await db.prepare("UPDATE journal SET attempts = ? WHERE id = ?").bind(attempts, id).run();
+  }
+}
+
 describe("runRetryCron", () => {
   it("forwarding_enabled='0' なら GAS へは送らずスキップする", async () => {
     await db.exec("UPDATE settings SET value = '0' WHERE key = 'forwarding_enabled'");
@@ -220,6 +252,30 @@ describe("runRetryCron", () => {
 
     await runRetryCron(env, { fetchImpl });
     expect(order).toEqual(["k1", "k2"]); // created_at 昇順
+  });
+
+  // 🔄 Codex 第二意見レビュー指摘（実装設計 経費フェーズ §5.9.2, §10.2 の裏返しの確認）:
+  // `enable_expense` は Worker 側の**新規受付**（`/keihi`・`view_submission`）だけを止める設計。
+  // ロールバック中（Worker 側 `enable_expense='0'`、GAS 側はまだ有効）に既に `pending` として
+  // 溜まっている `expense_submit` は、`runRetryCron` が見るのは `forwarding_enabled` だけなので
+  // 引き続き GAS へ届く（§10.2:「Worker 側の enable_expense=0 にして新規受付を止める。
+  // …pending が 0 件になるまで待つ」が成立するための前提）。
+  it("enable_expense='0'（ロールバック中）でも既に pending の expense_submit は Cron 再送で GAS へ届く", async () => {
+    await db.exec("UPDATE settings SET value = '0' WHERE key = 'enable_expense'");
+    await insertExpenseSubmitJournal("J1", 0);
+    const env = makeEnv(db);
+    const { fetchImpl, calls } = createFetchStub((url) => {
+      if (url === env.GAS_URL) {
+        return jsonResponse({ ok: true, applied: true });
+      }
+      return undefined;
+    });
+
+    await runRetryCron(env, { fetchImpl });
+
+    expect(calls.some((c) => c.url === env.GAS_URL)).toBe(true);
+    const row = await db.prepare("SELECT * FROM journal WHERE id = ?").bind("J1").first<any>();
+    expect(row.status).toBe("done");
   });
 });
 

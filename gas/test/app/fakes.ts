@@ -433,14 +433,26 @@ export interface FakePorts extends AppPorts {
   digest: FakeDigest;
 }
 
-/** 既定値入りのフェイク一式を作る。`nowMs` は固定時刻（既定は 2026-09-01 12:00 JST 相当）。 */
+/**
+ * 既定値入りのフェイク一式を作る。`nowMs` は固定時刻（既定は 2026-09-01 12:00 JST 相当）。
+ *
+ * `ENABLE_EXPENSE`/`ENABLE_E_DOC`（実装設計 経費フェーズ §5.9, §9 WP9c）は既定で `'1'`
+ * （有効）にしておく。本番の既定は無効（fail closed）だが、既存のテスト群
+ * （`gas/test/app/expense.test.ts`・`gas/test/app/dispatch.test.ts` 等）は
+ * `handleExpenseSubmit` が素通りすることを前提にしているため、`forwarding_enabled` を
+ * Worker 側のテストで既定 `'1'` にしているのと同じ方針を GAS 側でも取る。フラグ無効時の
+ * 挙動は `expense.test.ts` の専用テストで明示的に `'0'`/未設定へ上書きして検証する。
+ */
 export function makeFakePorts(nowMs = Date.parse("2026-09-01T12:00:00+09:00")): FakePorts {
+  const props = new FakeProps();
+  props.set("ENABLE_EXPENSE", "1");
+  props.set("ENABLE_E_DOC", "1");
   return {
     sheets: new FakeSheets(),
     slack: new FakeSlack(),
     cache: new FakeCache(),
     lock: new FakeLock(),
-    props: new FakeProps(),
+    props,
     calendar: new FakeCalendar(),
     clock: new FakeClock(nowMs),
     random: new FakeRandom(),
