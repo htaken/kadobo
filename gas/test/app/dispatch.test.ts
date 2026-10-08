@@ -135,6 +135,115 @@ describe("dispatch — 一時エラー", () => {
   });
 });
 
+describe("dispatch — month_close（実装設計 MF連携 §5.3, §10.1, §11.2 契約テスト）", () => {
+  function makeMonthClosePayload(
+    overrides: Partial<Extract<GasRequest, { kind: "month_close" }>> = {},
+  ): Extract<GasRequest, { kind: "month_close" }> {
+    const messageTs = "1756260000.000100";
+    const actionTs = "1756260120.000100";
+    const base: Extract<GasRequest, { kind: "month_close" }> = {
+      kind: "month_close",
+      idempotency_key: buttonIdempotencyKey({
+        user_id: "U1",
+        message_ts: messageTs,
+        action_id: "kado_month_close",
+        action_ts: actionTs,
+      }),
+      user_id: "U1",
+      channel_id: "C1",
+      message_ts: messageTs,
+      client: "A社",
+      month: "2026-10",
+      shown_net_amount: 0,
+      received_at_ms: 1756260000000,
+      source: "button",
+    };
+    return { ...base, ...overrides };
+  }
+
+  function readyMonthCloseSheets(ports: ReturnType<typeof readyPorts>): void {
+    // recomputeMonthly が単価エラーを note に書くと hasMonthBlockers が true になってしまうため、
+    // 単価マスタを用意しておく（実装設計 §5.1 末尾の blockers 定義）。
+    ports.sheets.unitPrices.push({
+      client: "A社",
+      unit_price: 1800,
+      tax_category: "課税",
+      tax_inclusive: false,
+      tax_display: "区分記載",
+      rounding: "切捨",
+      withholding: "なし",
+      valid_from: "2026-01-01",
+      valid_to: null,
+    });
+    ports.sheets.monthlyBills.set("A社|2026-10", {
+      client: "A社",
+      month: "2026-10",
+      worked_minutes: 0,
+      hours: 0,
+      unit_price: 0,
+      amount: 0,
+      tax_amount: 0,
+      withholding_amount: 0,
+      net_amount: 0,
+      state: "REVIEWING",
+      mf_invoice_id: null,
+      locked_at: null,
+      note: null,
+      updated_at: 1,
+      invoice_state: "",
+      invoice_error: null,
+      invoice_attempted_at: null,
+      close_card_ts: "1756260000.000100",
+    });
+  }
+
+  it("BAD_REQUEST に落ちない: isGasRequest（validateRequest）を通り、routeRequest 経由で処理される", () => {
+    const ports = readyPorts();
+    readyMonthCloseSheets(ports);
+    const envelope = buildEnvelope(makeMonthClosePayload());
+
+    const result = dispatch(envelope, ports);
+
+    // 締まって applied:true になる（NOT_READY/BAD_REQUEST のいずれでもない）。
+    expect(result).toEqual({ ok: true, applied: true });
+    expect(ports.sheets.getMonthlyBill("A社", "2026-10")?.state).toBe("LOCKED");
+  });
+
+  it("必須フィールド欠落は BAD_REQUEST（validateRequest に case が無いと落ちる回帰防止）", () => {
+    const ports = readyPorts();
+    const envelope = buildEnvelope({ kind: "month_close", user_id: "U1" });
+
+    const result = dispatch(envelope, ports);
+
+    expect(result).toEqual({ ok: false, error: "BAD_REQUEST", retryable: false });
+  });
+
+  it("withLock の中で呼ばれる: ロック取得不可なら LOCK_TIMEOUT", () => {
+    const ports = readyPorts();
+    readyMonthCloseSheets(ports);
+    ports.lock.throwTimeoutOnce = true;
+    const envelope = buildEnvelope(makeMonthClosePayload());
+
+    const result = dispatch(envelope, ports);
+
+    expect(result).toEqual({ ok: false, error: "LOCK_TIMEOUT", retryable: true });
+  });
+
+  it("契約テスト: Worker が生成する封筒（HMAC-SHA256, 同じ signing_string 形式）を GAS の実際の検証" +
+    "（verifyEnvelope → isGasRequest/validateRequest → routeRequest）がそのまま受理する", () => {
+    const ports = readyPorts();
+    readyMonthCloseSheets(ports);
+    // Worker（webcrypto）と同じ HMAC-SHA256・signing_string 形式で、Worker と全く同じ手順
+    // （buildEnvelope 相当）で署名した封筒を、GAS 側の実装（dispatch）にそのまま渡す。
+    const payload = makeMonthClosePayload();
+    const envelope = buildEnvelope(payload);
+
+    const result = dispatch(envelope, ports);
+
+    expect(result).toEqual({ ok: true, applied: true });
+  });
+});
+
 describe("dispatch — expense_submit（実装設計 経費フェーズ §5.8）", () => {
   // stamp 系のテストが使う既定 ts（1756260000 秒 = 2025-08-27）は req.date（2026-09-01）より
   // 過去になり「未来の日付」検証に落ちるため、expense_submit 用に独自の ts・クロックを使う。

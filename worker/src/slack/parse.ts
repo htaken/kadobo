@@ -6,13 +6,14 @@
  * 署名検証（`../slack/verify.ts`）より後に呼ぶこと（raw body はデコード前に検証する）。
  */
 
-/** ボタンの `action_id`（stamp 4 種 + 修正）。実装設計 §2.3。 */
+/** ボタンの `action_id`（stamp 4 種 + 修正 + 月次締め）。実装設計 §2.3, MF連携 §10.1。 */
 export type ActionId =
   | "kado_start"
   | "kado_break_start"
   | "kado_break_end"
   | "kado_end"
-  | "kado_correct";
+  | "kado_correct"
+  | "kado_month_close";
 
 export const STAMP_ACTION_IDS: readonly ActionId[] = [
   "kado_start",

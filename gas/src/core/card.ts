@@ -6,16 +6,18 @@
 
 import { jstToMs, toJst } from "@kadobo/shared/time";
 import { applyCorrections } from "./correction";
+import type { InvoiceState } from "./monthClose";
 import { isStampEvent, replay, type EventType, type LoggedEvent, type State } from "./state";
 import type { SessionSummary } from "./aggregate";
 
-/** `actions` ブロックのボタン `action_id`（実装設計 §2.3）。 */
+/** `actions` ブロックのボタン `action_id`（実装設計 §2.3, MF連携 §5.2）。 */
 export type CardActionId =
   | "kado_start"
   | "kado_break_start"
   | "kado_break_end"
   | "kado_end"
-  | "kado_correct";
+  | "kado_correct"
+  | "kado_month_close";
 
 const STATE_LABEL_JA: Record<State, string> = {
   IDLE: "未稼働",
@@ -334,4 +336,222 @@ export function renderCorrectionModal(events: LoggedEvent[], businessDate: strin
       },
     ],
   };
+}
+
+// ---------------------------------------------------------------------------
+// 月次締め確認カード（実装設計 MF連携 §5.2, §5.3）
+// ---------------------------------------------------------------------------
+
+/** `¥12,345` 形式（`app/monthly.ts` の `formatYen` と同じ規約。core はロケール API に依存しない）。 */
+function yen(n: number): string {
+  const sign = n < 0 ? "-" : "";
+  const abs = Math.abs(Math.round(n)).toString();
+  const withCommas = abs.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  return `${sign}${withCommas}円`;
+}
+
+/** 桁区切りのみ（円記号無し。単価表示用）。 */
+function commaNumber(n: number): string {
+  const sign = n < 0 ? "-" : "";
+  const abs = Math.abs(Math.round(n)).toString();
+  return sign + abs.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+/** `YYYY-MM` → `{YYYY}年{M}月分`（先頭ゼロを落とす）。 */
+function monthLabelOf(month: string): string {
+  const [yearStr, monthStr] = month.split("-");
+  const monthNum = Number(monthStr);
+  return `${yearStr}年${monthNum}月分`;
+}
+
+/** 締め確認カードの入力（実装設計 §5.2）。 */
+export interface MonthCloseCardInput {
+  client: string;
+  /** `YYYY-MM`。締める対象月。 */
+  month: string;
+  hours: number;
+  unit_price: number;
+  amount: number;
+  tax_amount: number;
+  withholding_amount: number;
+  net_amount: number;
+  /** `YYYY-MM-DD`（`core/invoice.ts` の `dueDateOf` で求めた値）。 */
+  due_date: string;
+  /** `MF_INVOICE_ENABLED` が無効ならボタン文言を変える（実装設計 §5.2, §11.3）。 */
+  invoiceEnabled: boolean;
+  /**
+   * `true` のとき、金額が変わった（古いカードの `shown_net_amount` と一致しない）旨の警告を
+   * 上部に追加する（実装設計 §5.3 手順5「金額が変わりました。確認してから押し直してください」）。
+   */
+  amountChanged?: boolean;
+}
+
+/** ボタンの `value`（JSON。実装設計 §5.2）。 */
+function monthCloseButtonValue(input: { client: string; month: string; net_amount: number }): string {
+  return JSON.stringify({ client: input.client, month: input.month, net_amount: input.net_amount });
+}
+
+/**
+ * 締め確認カードの Block Kit `blocks[]` を生成する（実装設計 §5.2）。
+ * `action_id: kado_month_close`、`value` に `{client, month, net_amount}` の JSON を埋め込む。
+ */
+export function renderMonthCloseCard(input: MonthCloseCardInput): object[] {
+  const blocks: object[] = [];
+
+  if (input.amountChanged === true) {
+    blocks.push({
+      type: "section",
+      block_id: "amount_changed",
+      text: {
+        type: "mrkdwn",
+        text: "⚠️ 金額が変わりました。確認してから押し直してください。",
+      },
+    });
+  }
+
+  blocks.push({
+    type: "section",
+    block_id: "header",
+    text: {
+      type: "mrkdwn",
+      text: `*📅 ${monthLabelOf(input.month)}の締め確認（${input.client}）*`,
+    },
+  });
+
+  blocks.push({
+    type: "section",
+    block_id: "detail",
+    text: {
+      type: "mrkdwn",
+      text:
+        `稼働 ${input.hours} 時間 × ${commaNumber(input.unit_price)} 円\n` +
+        `報酬額 ${yen(input.amount)} ／ 消費税相当額 ${yen(input.tax_amount)} ／ 源泉徴収 ${yen(input.withholding_amount)}\n` +
+        `請求額（差引入金予定額）${yen(input.net_amount)}\n` +
+        `支払期日 ${input.due_date}（${weekdayLabel(input.due_date)}）`,
+    },
+  });
+
+  const buttonLabel = input.invoiceEnabled ? "締めて請求書を作成" : "締める（請求書は手動で作成）";
+  blocks.push({
+    type: "actions",
+    block_id: "actions",
+    elements: [button("kado_month_close", buttonLabel, monthCloseButtonValue(input))],
+  });
+
+  return blocks;
+}
+
+/**
+ * 要修正あり（`hasBlockers` により `REVIEWING → OPEN` に戻った）ときの描き直し
+ * （実装設計 §5.2, §5.3 手順5）。ボタンは付けない（まだ締められる状態ではないため）。
+ */
+export function renderMonthCloseBlockedCard(input: { client: string; month: string }): object[] {
+  return [
+    {
+      type: "section",
+      block_id: "header",
+      text: {
+        type: "mrkdwn",
+        text: `*📅 ${monthLabelOf(input.month)}の締め確認（${input.client}）*`,
+      },
+    },
+    {
+      type: "section",
+      block_id: "blocked",
+      text: {
+        type: "mrkdwn",
+        text: "⚠️ 要修正があります。日次集計を確認してください。解消すると次回の確認で再び締められます。",
+      },
+    },
+  ];
+}
+
+/**
+ * 締めた直後の描き直し（実装設計 §5.3 手順6）。`invoiceState` が `PENDING`（有効）なら
+ * 「請求書を作成しています…」、`MANUAL`（`MF_INVOICE_ENABLED` 無効）なら
+ * 「請求書は手動で作成してください」。ボタンは付けない（締め済みのため）。
+ */
+export function renderMonthCloseLockedCard(input: {
+  client: string;
+  month: string;
+  invoiceState: "MANUAL" | "PENDING";
+}): object[] {
+  const statusText =
+    input.invoiceState === "PENDING"
+      ? "🔒 締めました。請求書を作成しています…"
+      : "🔒 締めました。請求書は手動で作成してください。";
+  return [
+    {
+      type: "section",
+      block_id: "header",
+      text: {
+        type: "mrkdwn",
+        text: `*📅 ${monthLabelOf(input.month)}の締め確認（${input.client}）*`,
+      },
+    },
+    {
+      type: "section",
+      block_id: "locked",
+      text: { type: "mrkdwn", text: statusText },
+    },
+  ];
+}
+
+/** {@link renderMonthCloseInvoiceStatusCard} の入力（実装設計 MF連携 §5.5, §5.7）。 */
+export interface MonthCloseInvoiceStatusCardInput {
+  client: string;
+  /** `YYYY-MM`。 */
+  month: string;
+  /** `state` が `LOCKED` を超えて進んだ場合（`MF_CREATED`/`SENT`/`PAID`）。`LOCKED` 自体は
+   * {@link renderMonthCloseLockedCard} を使う。 */
+  state: "MF_CREATED" | "SENT" | "PAID";
+  /** `state: "MF_CREATED"` のときだけ意味を持つ（`CREATED`/`MISMATCH`/`UNKNOWN`/`ERROR`）。 */
+  invoiceState: InvoiceState;
+}
+
+function invoiceStatusText(input: MonthCloseInvoiceStatusCardInput): string {
+  if (input.state === "SENT") {
+    return "📤 請求書を送付済みです。入金をお待ちください。";
+  }
+  if (input.state === "PAID") {
+    return "💰 入金を確認しました。";
+  }
+  // state === "MF_CREATED"
+  switch (input.invoiceState) {
+    case "CREATED":
+      return "✅ 請求書を作成しました（未送付）。MF で確認して送付してください。";
+    case "MISMATCH":
+      return "⚠️ 金額が一致しません。送付しないでください。MF で確認してください。";
+    case "UNKNOWN":
+      return "❓ 請求書が作成されたか確認できません。MF で確認してください。";
+    case "ERROR":
+      return "❌ 請求書の作成でエラーが発生しました。MF で確認してください。";
+    default:
+      // 通常は起こらない（MF_CREATED に至る前に必ず CREATED/MISMATCH が書かれる）が、
+      // 想定外の組合せでもカードが壊れないようフォールバックしておく。
+      return "🔒 請求書を確認しています…";
+  }
+}
+
+/**
+ * 締め確認カードの請求書状況による描き直し（実装設計 MF連携 §5.5, §5.7）。`state` が
+ * `MF_CREATED`／`SENT`／`PAID` に進んだときに使う（`handleMonthClose` の DUPLICATE 描き直し、
+ * `trackBillingStatus` の送付・入金遷移の両方から使う）。ボタンは付けない（締め済みのため）。
+ */
+export function renderMonthCloseInvoiceStatusCard(input: MonthCloseInvoiceStatusCardInput): object[] {
+  return [
+    {
+      type: "section",
+      block_id: "header",
+      text: {
+        type: "mrkdwn",
+        text: `*📅 ${monthLabelOf(input.month)}の締め確認（${input.client}）*`,
+      },
+    },
+    {
+      type: "section",
+      block_id: "invoice_status",
+      text: { type: "mrkdwn", text: invoiceStatusText(input) },
+    },
+  ];
 }

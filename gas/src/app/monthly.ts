@@ -4,6 +4,7 @@
  */
 import { businessDateOf } from "@kadobo/shared/time";
 import { aggregateDay, aggregateMonth, selectUnitPrice, type DailySummary } from "../core/aggregate";
+import { isMonthFrozen } from "../core/monthClose";
 import { lastDayOfMonthStr, weekdayLabelOf } from "./dateUtil";
 import type { AppPorts, DailySummaryRow, MonthlyBillRow } from "./ports";
 import { toLoggedEvent } from "./rawLog";
@@ -48,13 +49,62 @@ function rowToDailySummary(row: DailySummaryRow): DailySummary {
   };
 }
 
+/** `recomputeMonthly` が書く列（実装設計 MF連携 §0, §5.1: 数値列・`note`・`updated_at` だけ）。 */
+interface MonthlyNumericPatch {
+  worked_minutes: number;
+  hours: number;
+  unit_price: number;
+  amount: number;
+  tax_amount: number;
+  withholding_amount: number;
+  net_amount: number;
+  note: string | null;
+  updated_at: number;
+}
+
 /**
- * `client + month` の月次請求を再計算する（実装設計 §7.3 手順6）。
- * `LOCKED` の月は上書きしない（実装設計 §4.2.4: 締め後は金額を固定する）。
+ * 数値列だけの patch を書く。行が無いときだけ {@link SheetsPort.upsertMonthlyBill} で新規作成する
+ * （新規作成時の `state`/`invoice_*`/`close_card_ts`/`mf_invoice_id`/`locked_at` は既定値）。
+ * 既存行がある場合は {@link SheetsPort.updateMonthlyBillColumns} で数値列だけを書き、状態列・
+ * 請求書列には一切触れない（実装設計 §0 の B1 対応: 集計が締め状態を古い値で書き戻さない）。
+ */
+function writeMonthlyNumericColumns(
+  client: string,
+  month: string,
+  existing: MonthlyBillRow | null,
+  patch: MonthlyNumericPatch,
+  ports: AppPorts,
+): void {
+  if (existing === null) {
+    const row: MonthlyBillRow = {
+      client,
+      month,
+      ...patch,
+      state: "OPEN",
+      mf_invoice_id: null,
+      locked_at: null,
+      invoice_state: "",
+      invoice_error: null,
+      invoice_attempted_at: null,
+      close_card_ts: null,
+    };
+    ports.sheets.upsertMonthlyBill(row);
+    return;
+  }
+  ports.sheets.updateMonthlyBillColumns(client, month, patch);
+}
+
+/**
+ * `client + month` の月次請求を再計算する（実装設計 §7.3 手順6、MF連携 §5.1）。
+ * 凍結済みの月（{@link isMonthFrozen}）は上書きしない（実装設計 §4.2.4, MF連携 §5.1:
+ * 締め後は金額を固定する。旧実装は `LOCKED` だけを見ていたが、`MF_CREATED` 以降も凍結対象）。
+ *
+ * 🔄 書くのは数値列・`note`・`updated_at` だけ（実装設計 MF連携 §0）。状態列・請求書列は
+ * 締め処理・MF 同期だけが書く。
  */
 export function recomputeMonthly(client: string, month: string, ports: AppPorts): void {
   const existing = ports.sheets.getMonthlyBill(client, month);
-  if (existing !== null && existing.state === "LOCKED") {
+  if (existing !== null && isMonthFrozen(existing.state)) {
     return;
   }
 
@@ -68,9 +118,7 @@ export function recomputeMonthly(client: string, month: string, ports: AppPorts)
   const selection = selectUnitPrice(unitRows, fromDate);
 
   if ("error" in selection) {
-    const row: MonthlyBillRow = {
-      client,
-      month,
+    const patch: MonthlyNumericPatch = {
       worked_minutes: workedMinutes,
       hours,
       unit_price: 0,
@@ -78,20 +126,15 @@ export function recomputeMonthly(client: string, month: string, ports: AppPorts)
       tax_amount: 0,
       withholding_amount: 0,
       net_amount: 0,
-      state: existing?.state ?? "OPEN",
-      mf_invoice_id: existing?.mf_invoice_id ?? null,
-      locked_at: existing?.locked_at ?? null,
       note: selection.error === "NOT_FOUND" ? "単価マスタ: 該当なし" : "単価マスタ: 複数該当（要確認）",
       updated_at: ports.clock.nowMs(),
     };
-    ports.sheets.upsertMonthlyBill(row);
+    writeMonthlyNumericColumns(client, month, existing, patch, ports);
     return;
   }
 
   const monthly = aggregateMonth(dailySummaries, selection);
-  const row: MonthlyBillRow = {
-    client,
-    month,
+  const patch: MonthlyNumericPatch = {
     worked_minutes: monthly.worked_minutes,
     hours: monthly.hours,
     unit_price: selection.unit_price,
@@ -99,13 +142,10 @@ export function recomputeMonthly(client: string, month: string, ports: AppPorts)
     tax_amount: monthly.tax_amount,
     withholding_amount: monthly.withholding_amount,
     net_amount: monthly.net_amount,
-    state: existing?.state ?? "OPEN",
-    mf_invoice_id: existing?.mf_invoice_id ?? null,
-    locked_at: existing?.locked_at ?? null,
     note: null,
     updated_at: ports.clock.nowMs(),
   };
-  ports.sheets.upsertMonthlyBill(row);
+  writeMonthlyNumericColumns(client, month, existing, patch, ports);
 }
 
 /** 対象業務日の日次・（その月の）月次を続けて再計算する（stamp/correction_submit 用）。 */

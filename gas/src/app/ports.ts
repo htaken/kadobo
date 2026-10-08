@@ -11,6 +11,7 @@
 import type { ExpenseCategory, ExpenseState, ReceiptType } from "@kadobo/shared/expense";
 import type { DailyStatus, UnitPriceRow } from "../core/aggregate";
 import type { RecentDay } from "../core/businessDate";
+import type { InvoiceState } from "../core/monthClose";
 import type { LogEventType } from "../core/state";
 
 // ---------------------------------------------------------------------------
@@ -87,6 +88,18 @@ export interface MonthlyBillRow {
   note: string | null;
   /** UTC epoch ms。 */
   updated_at: number;
+  // -------------------------------------------------------------------------
+  // MF 連携フェーズで追加した 4 列（実装設計 MF連携 §5.1）。既存 14 列の後ろに追加する。
+  // 書くのは締め処理・MF 同期だけ（`recomputeMonthly` は書かない）。
+  // -------------------------------------------------------------------------
+  /** 請求書の進み具合。`state` が `LOCKED` 未満（`OPEN`/`REVIEWING`）の間は `''`。 */
+  invoice_state: InvoiceState;
+  /** 最後のエラー・不一致の要約。 */
+  invoice_error: string | null;
+  /** 最後に請求書作成を試みた時刻。UTC epoch ms。 */
+  invoice_attempted_at: number | null;
+  /** 締め確認カードの `message_ts`（実装設計 §5.2, §5.3 の `STALE_CARD` 判定に使う）。 */
+  close_card_ts: string | null;
 }
 
 /**
@@ -177,10 +190,21 @@ export interface SheetsPort {
   upsertMonthlyBill(row: MonthlyBillRow): void;
   /** 月次請求 1 行を取得する。無ければ `null`。 */
   getMonthlyBill(client: string, month: string): MonthlyBillRow | null;
+  /**
+   * 🔄 `client + month` に一致する月次請求行を**指定列だけ**更新する（実装設計 MF連携 §0, §8）。
+   * `recomputeMonthly` は数値列・`note`・`updated_at` だけを、締め処理・MF 同期は状態・
+   * 請求書関連の列だけをこれで書く。対象行が無い場合は例外を投げる（行が無いときの新規作成は
+   * `upsertMonthlyBill` を使う設計のため。`updateExpense` と同じ方針）。
+   */
+  updateMonthlyBillColumns(client: string, month: string, patch: Partial<MonthlyBillRow>): void;
+  /** 月次請求の全行を返す（実装設計 MF連携 §8）。 */
+  listMonthlyBills(): MonthlyBillRow[];
   /** 内部シートの key-value を取得する（`kind + key`）。無ければ `null`。 */
   getInternalValue(kind: string, key: string): string | null;
   /** 内部シートの key-value を設定する（`kind + key`）。 */
   setInternalValue(kind: string, key: string, value: string): void;
+  /** 内部シートの `kind` に属する全行を返す（実装設計 MF連携 §8。遅延打刻 `late_stamp/<event_id>` の読み出し等）。 */
+  getInternalRows(kind: string): { key: string; value: string }[];
 
   // -------------------------------------------------------------------------
   // 経費台帳（実装設計 経費フェーズ §5.3）
@@ -447,6 +471,8 @@ export interface ClockPort {
   nowMs(): number;
   /** UTC epoch 秒。 */
   nowSec(): number;
+  /** `Utilities.sleep` 相当（実装設計 MF連携 §4.1）。フェイクでは時計を進めるだけでよい。 */
+  sleep(ms: number): void;
 }
 
 /** ULID 用の乱数源（実装設計 §4.3）。 */
@@ -475,6 +501,66 @@ export interface WorkerStatusPort {
   fetchStatus(): WorkerStatusInfo | null;
 }
 
+// ---------------------------------------------------------------------------
+// MF 連携フェーズの新ポート（実装設計 MF連携 §4.1）
+// ---------------------------------------------------------------------------
+
+/**
+ * `UrlFetchApp` の薄いラッパ（実装設計 MF連携 §4.1）。`muteHttpExceptions: true` で呼ぶため、
+ * 例外は通信失敗・タイムアウト等、レスポンス自体を得られない場合のみ投げる
+ * （`app/mf/*Client.ts` 側がそれを「通信失敗」として分類する）。
+ */
+export interface HttpPort {
+  fetch(req: {
+    method: "get" | "post" | "put" | "delete";
+    url: string;
+    headers?: Record<string, string>;
+    /** JSON は呼び出し側で文字列化する。form は `application/x-www-form-urlencoded` の文字列。 */
+    payload?: string;
+    contentType?: string;
+  }): { status: number; headers: Record<string, string>; body: string }; // headers のキーは小文字化
+}
+
+/**
+ * 書き込み可能な Script Properties（実装設計 MF連携 §4.1）。トークン保存専用。
+ * {@link PropsPort} は読み取り専用のまま残す。
+ */
+export interface SecretStorePort {
+  get(key: string): string | null;
+  set(key: string, value: string): void;
+}
+
+/** 期限付きキャッシュ（`CacheService`。実装設計 MF連携 §4.1）。nonce 用の {@link CachePort} とは別物。 */
+export interface TtlCachePort {
+  get(key: string): string | null;
+  put(key: string, value: string, ttlSec: number): void;
+  remove(key: string): void;
+}
+
+/**
+ * トークン更新専用のロック（`LockService.getUserLock()`。実装設計 MF連携 §4.1）。
+ * スクリプトロック（{@link LockPort}）とは別物で、干渉しない。取得できなければ
+ * `MfTransientError`（`app/mf/errors.ts`）を投げる。
+ */
+export interface AuthLockPort {
+  withAuthLock<T>(fn: () => T): T;
+}
+
+/**
+ * 時間トリガーの動的な作成・確認・削除（`ScriptApp`。実装設計 MF連携 §7, §8）。
+ * WP-M2 では `trigMfSyncSoon`（締めボタンから 1 分後に 1 回だけ動く）にのみ使う。
+ */
+export type SchedulerHandler = "trigMfSyncSoon";
+
+export interface SchedulerPort {
+  /** `handler` という名前の時間トリガーを `afterMs` ミリ秒後に 1 回だけ動くよう作る。 */
+  scheduleOnce(handler: SchedulerHandler, afterMs: number): void;
+  /** `handler` という名前の時間トリガーが既に存在するか。 */
+  hasPending(handler: SchedulerHandler): boolean;
+  /** `handler` という名前の時間トリガーをすべて削除する。 */
+  clear(handler: SchedulerHandler): void;
+}
+
 /** app 層のユースケースに注入するポート一式。 */
 export interface AppPorts {
   sheets: SheetsPort;
@@ -491,4 +577,11 @@ export interface AppPorts {
   slackFiles: SlackFilesPort;
   drive: DrivePort;
   digest: DigestPort;
+  /** MF 連携フェーズ（実装設計 MF連携 §4.1, §8）。 */
+  http: HttpPort;
+  secrets: SecretStorePort;
+  ttlCache: TtlCachePort;
+  authLock: AuthLockPort;
+  /** 月次締め（実装設計 MF連携 §7, §8）。 */
+  scheduler: SchedulerPort;
 }

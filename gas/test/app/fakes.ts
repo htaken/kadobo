@@ -4,9 +4,11 @@
  */
 import { createHash, createHmac } from "node:crypto";
 import { shiftBusinessDate } from "../../src/app/dateUtil";
+import { MfTransientError } from "../../src/app/mf/errors";
 import { LockTimeoutError } from "../../src/app/ports";
 import type {
   AppPorts,
+  AuthLockPort,
   CachePort,
   CalendarPort,
   ClockPort,
@@ -16,11 +18,15 @@ import type {
   DrivePort,
   ExpenseLedgerRow,
   HmacPort,
+  HttpPort,
   LockPort,
   MonthlyBillRow,
   PropsPort,
   RandomPort,
   RawLogRow,
+  SchedulerHandler,
+  SchedulerPort,
+  SecretStorePort,
   SheetsPort,
   SlackBlocksMessage,
   SlackFilesPort,
@@ -30,6 +36,7 @@ import type {
   SlackViewsOpenInput,
   SlackViewsOpenResult,
   SlackViewsUpdateInput,
+  TtlCachePort,
   WorkerStatusInfo,
   WorkerStatusPort,
 } from "../../src/app/ports";
@@ -96,12 +103,36 @@ export class FakeSheets implements SheetsPort {
     return this.monthlyBills.get(`${client}|${month}`) ?? null;
   }
 
+  updateMonthlyBillColumns(client: string, month: string, patch: Partial<MonthlyBillRow>): void {
+    const key = `${client}|${month}`;
+    const current = this.monthlyBills.get(key);
+    if (current === undefined) {
+      throw new Error(`monthly_bill_not_found:${key}`);
+    }
+    this.monthlyBills.set(key, { ...current, ...patch });
+  }
+
+  listMonthlyBills(): MonthlyBillRow[] {
+    return [...this.monthlyBills.values()];
+  }
+
   getInternalValue(kind: string, key: string): string | null {
     return this.internal.get(`${kind}|${key}`) ?? null;
   }
 
   setInternalValue(kind: string, key: string, value: string): void {
     this.internal.set(`${kind}|${key}`, value);
+  }
+
+  getInternalRows(kind: string): { key: string; value: string }[] {
+    const prefix = `${kind}|`;
+    const result: { key: string; value: string }[] = [];
+    for (const [k, v] of this.internal.entries()) {
+      if (k.startsWith(prefix)) {
+        result.push({ key: k.slice(prefix.length), value: v });
+      }
+    }
+    return result;
   }
 
   appendExpense(row: ExpenseLedgerRow): void {
@@ -263,6 +294,8 @@ export class FakeCalendar implements CalendarPort {
 
 export class FakeClock implements ClockPort {
   currentMs: number;
+  /** `sleep()` に渡された ms の履歴（429 の `Retry-After` や 350ms 間隔の検証用）。 */
+  sleeps: number[] = [];
 
   constructor(initialMs: number) {
     this.currentMs = initialMs;
@@ -274,6 +307,12 @@ export class FakeClock implements ClockPort {
 
   nowSec(): number {
     return Math.floor(this.currentMs / 1000);
+  }
+
+  /** `Utilities.sleep` 相当。フェイクでは時計を進めるだけ（実装設計 MF連携 §4.1）。 */
+  sleep(ms: number): void {
+    this.sleeps.push(ms);
+    this.currentMs += ms;
   }
 }
 
@@ -417,6 +456,155 @@ export class FakeDigest implements DigestPort {
   }
 }
 
+// ---------------------------------------------------------------------------
+// MF 連携フェーズの新ポート（実装設計 MF連携 §4.1）
+// ---------------------------------------------------------------------------
+
+export interface FakeHttpRequest {
+  method: "get" | "post" | "put" | "delete";
+  url: string;
+  headers?: Record<string, string>;
+  payload?: string;
+  contentType?: string;
+}
+
+export interface FakeHttpResponse {
+  status: number;
+  headers?: Record<string, string>;
+  body?: string;
+}
+
+/**
+ * `HttpPort` のフェイク（実装設計 MF連携 §4.1）。`queueResponse` で積んだレスポンスを FIFO で
+ * 返す。キューが空なら既定で 200 の空 JSON を返す。`queueNetworkError` を積むと、その回の
+ * `fetch` が例外を投げる（`UrlFetchApp.fetch` の通信失敗を模す。`HttpPort` の契約どおり、
+ * ステータスコード付きの応答は例外にしない）。
+ */
+export class FakeHttp implements HttpPort {
+  calls: FakeHttpRequest[] = [];
+  private queue: (FakeHttpResponse | "network_error")[] = [];
+  defaultResponse: FakeHttpResponse = { status: 200, headers: {}, body: "{}" };
+
+  queueResponse(res: FakeHttpResponse): void {
+    this.queue.push(res);
+  }
+
+  queueNetworkError(): void {
+    this.queue.push("network_error");
+  }
+
+  fetch(req: FakeHttpRequest): { status: number; headers: Record<string, string>; body: string } {
+    this.calls.push(req);
+    const next = this.queue.shift() ?? this.defaultResponse;
+    if (next === "network_error") {
+      throw new Error("FAKE_HTTP_NETWORK_ERROR");
+    }
+    return { status: next.status, headers: next.headers ?? {}, body: next.body ?? "" };
+  }
+}
+
+/**
+ * `SecretStorePort` のフェイク（実装設計 MF連携 §4.1）。`armMismatchAfterNextWrite(n)` を
+ * 呼んでおくと、**その後最初に起きる `set()` より後**の `get()` が `n` 回だけ実際の保存値では
+ * なく `forceMismatchValue` を返す（`refreshInvoiceTokens` の「保存後の読み直しが一致しない」
+ * 経路のテスト用）。「その後最初の `set()` より後」にすることで、テストの下準備
+ * （`seedTokens` 等）で先に行った `set()` や、`refreshInvoiceTokens` 冒頭の
+ * `generation` 確認のための通常の読み取りには影響しない。
+ */
+export class FakeSecretStore implements SecretStorePort {
+  values = new Map<string, string>();
+  private forceMismatchReads = 0;
+  private mismatchArmed = false;
+  private mismatchPendingArm = false;
+  forceMismatchValue = "MISMATCH";
+
+  armMismatchAfterNextWrite(times: number): void {
+    this.forceMismatchReads = times;
+    this.mismatchArmed = false;
+    this.mismatchPendingArm = true;
+  }
+
+  get(key: string): string | null {
+    if (this.mismatchArmed && this.forceMismatchReads > 0) {
+      this.forceMismatchReads--;
+      return this.forceMismatchValue;
+    }
+    return this.values.get(key) ?? null;
+  }
+
+  set(key: string, value: string): void {
+    this.values.set(key, value);
+    if (this.mismatchPendingArm) {
+      this.mismatchArmed = true;
+      this.mismatchPendingArm = false;
+    }
+  }
+}
+
+/** `TtlCachePort` のフェイク（実装設計 MF連携 §4.1, §4.3）。 */
+export class FakeTtlCache implements TtlCachePort {
+  values = new Map<string, string>();
+  puts: { key: string; value: string; ttlSec: number }[] = [];
+
+  get(key: string): string | null {
+    return this.values.get(key) ?? null;
+  }
+
+  put(key: string, value: string, ttlSec: number): void {
+    this.values.set(key, value);
+    this.puts.push({ key, value, ttlSec });
+  }
+
+  remove(key: string): void {
+    this.values.delete(key);
+  }
+}
+
+/**
+ * `AuthLockPort` のフェイク（実装設計 MF連携 §4.1）。`fn` を素通しで呼ぶ（Node は単一スレッドの
+ * ため実際の排他制御は不要）。`throwOnce` で「ロックが取得できない」経路を注入できる。
+ */
+export class FakeAuthLock implements AuthLockPort {
+  throwOnce = false;
+
+  withAuthLock<T>(fn: () => T): T {
+    if (this.throwOnce) {
+      this.throwOnce = false;
+      throw new MfTransientError("MF_AUTH_LOCK_TIMEOUT");
+    }
+    return fn();
+  }
+}
+
+/**
+ * `SchedulerPort` のフェイク（実装設計 MF連携 §7, §8）。実 `ScriptApp` の代わりに `pending` の
+ * `Set` で「同名トリガーが存在するか」を再現する。`scheduleOnce` は既に pending なら何もしない
+ * （`SchedulerAdapter` と同じ二重予約防止。呼び出し側の `hasPending` チェックと合わせて二重に
+ * 安全側へ倒す）。
+ */
+export class FakeScheduler implements SchedulerPort {
+  pending = new Set<SchedulerHandler>();
+  scheduleOnceCalls: { handler: SchedulerHandler; afterMs: number }[] = [];
+  clearCalls: SchedulerHandler[] = [];
+
+  scheduleOnce(handler: SchedulerHandler, afterMs: number): void {
+    if (this.pending.has(handler)) {
+      return;
+    }
+    this.scheduleOnceCalls.push({ handler, afterMs });
+    this.pending.add(handler);
+  }
+
+  hasPending(handler: SchedulerHandler): boolean {
+    return this.pending.has(handler);
+  }
+
+  clear(handler: SchedulerHandler): void {
+    this.clearCalls.push(handler);
+    this.pending.delete(handler);
+  }
+}
+
 export interface FakePorts extends AppPorts {
   sheets: FakeSheets;
   slack: FakeSlack;
@@ -431,6 +619,11 @@ export interface FakePorts extends AppPorts {
   slackFiles: FakeSlackFiles;
   drive: FakeDrive;
   digest: FakeDigest;
+  http: FakeHttp;
+  secrets: FakeSecretStore;
+  ttlCache: FakeTtlCache;
+  authLock: FakeAuthLock;
+  scheduler: FakeScheduler;
 }
 
 /**
@@ -461,5 +654,10 @@ export function makeFakePorts(nowMs = Date.parse("2026-09-01T12:00:00+09:00")): 
     slackFiles: new FakeSlackFiles(),
     drive: new FakeDrive(),
     digest: new FakeDigest(),
+    http: new FakeHttp(),
+    secrets: new FakeSecretStore(),
+    ttlCache: new FakeTtlCache(),
+    authLock: new FakeAuthLock(),
+    scheduler: new FakeScheduler(),
   };
 }

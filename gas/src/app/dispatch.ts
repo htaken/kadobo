@@ -8,6 +8,7 @@ import { verifyEnvelope, type VerifyEnvelopeIo } from "../core/envelope";
 import { handleCommand } from "./command";
 import { handleCorrectionSubmit, handleOpenCorrection } from "./correction";
 import { handleExpenseSubmit } from "./expense";
+import { handleMonthClose } from "./monthClose";
 import { LockTimeoutError, type AppPorts } from "./ports";
 import { handleStamp } from "./stamp";
 import { isGasRequest } from "./validateRequest";
@@ -37,13 +38,15 @@ export function handlePostBody(rawBody: string, ports: AppPorts): GasResponse {
  * 🔄 `expense_submit` だけは `ports.lock.withLock()` に包まずに渡す（実装設計 経費フェーズ
  * §5.8）。`handleExpenseSubmit` はユースケース内部でフェーズ1・フェーズ3ごとに自前で
  * ロックを取得・解放する 3 段構成の saga であり（§5.4）、フェーズ2で 10MB 級の Slack
- * ファイルダウンロード＋ハッシュ計算という重い I/O を行う。ここを他の 4 種と同じ単一の
+ * ファイルダウンロード＋ハッシュ計算という重い I/O を行う。ここを他の種別と同じ単一の
  * `withLock` で包んでしまうと、その重い I/O の間ロックが専有され続け、本番稼働中の打刻
  * （`stamp`）が `LOCK_TIMEOUT` に巻き込まれる。既存 4 種（`stamp`/`open_correction`/
- * `correction_submit`/`command`）はこれまでどおり単一ロックで包む（挙動を変えない）。
+ * `correction_submit`/`command`）と `month_close`（実装設計 MF連携 §5.3）はこれまでどおり
+ * 単一ロックで包む（挙動を変えない。`month_close` の処理自体は MF を呼ばないため短時間で終わる）。
  *
  * 「生ログ追記後の Slack 更新失敗は `applied:true`」は各ユースケース
- * （`stamp.ts`/`correction.ts`/`expense.ts`）側で Slack 呼出の例外を握りつぶすことで満たしている。
+ * （`stamp.ts`/`correction.ts`/`expense.ts`/`monthClose.ts`）側で Slack 呼出の例外を
+ * 握りつぶすことで満たしている。
  */
 export function dispatch(body: unknown, ports: AppPorts): GasResponse {
   const secret = ports.props.get("GAS_SHARED_SECRET") ?? "";
@@ -87,7 +90,7 @@ function mapDispatchError(err: unknown): GasResponse {
   return { ok: false, error: errorMessage(err), retryable: true };
 }
 
-/** `expense_submit` を除く既存 4 種のみを扱う（実装設計 経費フェーズ §5.8）。 */
+/** `expense_submit` を除く 5 種（`month_close` を含む）を扱う（実装設計 経費フェーズ §5.8, MF連携 §5.3）。 */
 function routeRequest(req: Exclude<GasRequest, { kind: "expense_submit" }>, ports: AppPorts): GasResponse {
   switch (req.kind) {
     case "stamp":
@@ -98,6 +101,8 @@ function routeRequest(req: Exclude<GasRequest, { kind: "expense_submit" }>, port
       return handleCorrectionSubmit(req, ports);
     case "command":
       return handleCommand(req, ports);
+    case "month_close":
+      return handleMonthClose(req, ports);
   }
 }
 

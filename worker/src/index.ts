@@ -13,6 +13,7 @@ import type { Env } from "./env";
 import { handleKadoCorrect } from "./handlers/correct";
 import { handleSlashCommand } from "./handlers/command";
 import { EXPENSE_CALLBACK_ID, handleExpenseSubmission } from "./handlers/expense";
+import { handleKadoMonthClose } from "./handlers/monthClose";
 import { handleInternalStatus } from "./handlers/status";
 import { handleStamp } from "./handlers/stamp";
 import { handleViewSubmission } from "./handlers/view_submission";
@@ -50,6 +51,9 @@ async function handleSlackRoute(pathname: string, rawBody: string, request: Requ
       }
       if (action.action_id === "kado_correct") {
         return handleKadoCorrect({ env, ctx, action, payload: parsed });
+      }
+      if (action.action_id === "kado_month_close") {
+        return handleKadoMonthClose({ env, ctx, action, payload: parsed });
       }
       if (isStampActionId(action.action_id)) {
         return handleStamp({ env, ctx, action, payload: parsed });

@@ -19,22 +19,27 @@ import type { GasRequest } from "@kadobo/shared/protocol";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { handleStamp } from "../../src/app/stamp";
 import { toLoggedEvent } from "../../src/app/rawLog";
-import type { AppPorts, ExpenseLedgerRow } from "../../src/app/ports";
+import type { AppPorts, ExpenseLedgerRow, MonthlyBillRow } from "../../src/app/ports";
 import { SheetsAdapter, setupSpreadsheet } from "../../src/adapters/sheets";
 import { applyCorrections } from "../../src/core/correction";
 import { isStampEvent, replay } from "../../src/core/state";
 import {
+  FakeAuthLock,
   FakeCache,
   FakeCalendar,
   FakeClock,
   FakeDigest,
   FakeDrive,
   FakeHmac,
+  FakeHttp,
   FakeLock,
   FakeProps,
   FakeRandom,
+  FakeScheduler,
+  FakeSecretStore,
   FakeSlack,
   FakeSlackFiles,
+  FakeTtlCache,
   FakeWorkerStatus,
 } from "../app/fakes";
 import {
@@ -72,6 +77,36 @@ const COL = {
 
 // 内部シートの列番号（1-based、INTERNAL_HEADERS の並び）。
 const INTERNAL_COL = { kind: 1, key: 2, value: 3, updated_at: 4 } as const;
+
+// 月次請求（実装設計 MF連携 §5.1）。
+const MONTHLY_BILL_SHEET = "月次請求";
+
+/** 移行前（MVP §7.1）の月次請求ヘッダー 14 列。`sheets.ts` の同名の定数と同じ値。 */
+const MONTHLY_BILL_HEADERS_V1 = [
+  "client",
+  "month",
+  "worked_minutes",
+  "hours",
+  "unit_price",
+  "amount",
+  "tax_amount",
+  "withholding_amount",
+  "net_amount",
+  "state",
+  "mf_invoice_id",
+  "locked_at",
+  "note",
+  "updated_at",
+] as const;
+
+/** 移行後（実装設計 MF連携 §5.1）の月次請求ヘッダー 18 列。 */
+const MONTHLY_BILL_HEADERS_V2 = [
+  ...MONTHLY_BILL_HEADERS_V1,
+  "invoice_state",
+  "invoice_error",
+  "invoice_attempted_at",
+  "close_card_ts",
+] as const;
 
 // 経費台帳（実装設計 経費フェーズ §5.1）。
 const EXPENSE_SHEET = "経費台帳";
@@ -348,6 +383,11 @@ describe("handleStamp を SheetsAdapter（実アダプタ）に通した end-to-
       slackFiles: new FakeSlackFiles(),
       drive: new FakeDrive(),
       digest: new FakeDigest(),
+      http: new FakeHttp(),
+      secrets: new FakeSecretStore(),
+      ttlCache: new FakeTtlCache(),
+      authLock: new FakeAuthLock(),
+      scheduler: new FakeScheduler(),
     };
   }
 
@@ -453,6 +493,23 @@ function plantLegacyExpenseLedgerSheet(
 function plantMigratedExpenseLedgerSheet(spreadsheet: FakeSpreadsheet): FakeSheet {
   const sheet = spreadsheet.insertSheet(EXPENSE_SHEET);
   EXPENSE_HEADERS_V2.forEach((h, i) => sheet.setCell(1, i + 1, h));
+  return sheet;
+}
+
+/** 14 列（移行前）の月次請求ヘッダーを直接作る（実装設計 MF連携 §5.1）。 */
+function plantLegacyMonthlyBillSheet(spreadsheet: FakeSpreadsheet, dataRow?: unknown[]): FakeSheet {
+  const sheet = spreadsheet.insertSheet(MONTHLY_BILL_SHEET);
+  MONTHLY_BILL_HEADERS_V1.forEach((h, i) => sheet.setCell(1, i + 1, h));
+  if (dataRow !== undefined) {
+    dataRow.forEach((v, i) => sheet.setCell(2, i + 1, v));
+  }
+  return sheet;
+}
+
+/** 18 列（移行済み）の月次請求ヘッダーを直接作る。 */
+function plantMigratedMonthlyBillSheet(spreadsheet: FakeSpreadsheet): FakeSheet {
+  const sheet = spreadsheet.insertSheet(MONTHLY_BILL_SHEET);
+  MONTHLY_BILL_HEADERS_V2.forEach((h, i) => sheet.setCell(1, i + 1, h));
   return sheet;
 }
 
@@ -868,5 +925,160 @@ describe("訂正削除申請シート（事務処理規程・電子取引 第2�
     expect(correctionSheet).not.toBeNull();
     const header = CORRECTION_REQUEST_HEADERS.map((_, i) => correctionSheet?.getCell(1, i + 1));
     expect(header).toEqual([...CORRECTION_REQUEST_HEADERS]);
+  });
+});
+
+describe("月次請求の列マイグレーション（実装設計 MF連携 §5.1, §11.2 WP-M2 受入条件）", () => {
+  it("新規シート（データ無し）は最初から 18 列ヘッダーで作成される", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const sheet = harness.spreadsheet.getSheetByName(MONTHLY_BILL_SHEET);
+    expect(sheet).not.toBeNull();
+    const header = MONTHLY_BILL_HEADERS_V2.map((_, i) => sheet?.getCell(1, i + 1));
+    expect(header).toEqual([...MONTHLY_BILL_HEADERS_V2]);
+  });
+
+  it("既存 14 列ヘッダーから 18 列へ拡張し、既存 14 列のデータには一切触れない", () => {
+    const legacyRow = [
+      "A社",
+      "2026-08",
+      9600,
+      160,
+      1800,
+      288000,
+      28800,
+      0,
+      316800,
+      "LOCKED",
+      "INV-LEGACY",
+      Date.parse("2026-09-01T00:00:00+09:00"),
+      "",
+      Date.parse("2026-09-01T00:00:00+09:00"),
+    ];
+    const sheet = plantLegacyMonthlyBillSheet(harness.spreadsheet, legacyRow);
+
+    setupSpreadsheet(SPREADSHEET_ID);
+
+    const header = MONTHLY_BILL_HEADERS_V2.map((_, i) => sheet.getCell(1, i + 1));
+    expect(header).toEqual([...MONTHLY_BILL_HEADERS_V2]);
+    legacyRow.forEach((v, i) => {
+      expect(sheet.getCell(2, i + 1)).toBe(v);
+    });
+    for (let col = 15; col <= 18; col++) {
+      expect(sheet.getCell(2, col)).toBe("");
+    }
+  });
+
+  it("2 回実行しても壊れない（冪等）", () => {
+    plantLegacyMonthlyBillSheet(harness.spreadsheet);
+    setupSpreadsheet(SPREADSHEET_ID);
+
+    expect(() => setupSpreadsheet(SPREADSHEET_ID)).not.toThrow();
+
+    const sheet = harness.spreadsheet.getSheetByName(MONTHLY_BILL_SHEET);
+    const header = MONTHLY_BILL_HEADERS_V2.map((_, i) => sheet?.getCell(1, i + 1));
+    expect(header).toEqual([...MONTHLY_BILL_HEADERS_V2]);
+  });
+
+  it("既に 18 列（移行済み）なら何もしない", () => {
+    const sheet = plantMigratedMonthlyBillSheet(harness.spreadsheet);
+
+    expect(() => setupSpreadsheet(SPREADSHEET_ID)).not.toThrow();
+
+    const header = MONTHLY_BILL_HEADERS_V2.map((_, i) => sheet.getCell(1, i + 1));
+    expect(header).toEqual([...MONTHLY_BILL_HEADERS_V2]);
+  });
+
+  it("ヘッダーが 14 列とも 18 列とも一致しない場合、何も書き換えず例外を投げて中断する", () => {
+    const sheet = harness.spreadsheet.insertSheet(MONTHLY_BILL_SHEET);
+    ["client", "month", "amount"].forEach((h, i) => sheet.setCell(1, i + 1, h));
+    sheet.setCell(2, 1, "A社");
+
+    expect(() => setupSpreadsheet(SPREADSHEET_ID)).toThrow(/月次請求のヘッダーが想定と一致しません/);
+    expect(sheet.getCell(1, 1)).toBe("client");
+    expect(sheet.getCell(1, 2)).toBe("month");
+    expect(sheet.getCell(2, 1)).toBe("A社");
+  });
+});
+
+describe("SheetsAdapter.updateMonthlyBillColumns / listMonthlyBills（実装設計 MF連携 §0, §8）", () => {
+  function makeMonthlyBillRow(overrides: Partial<MonthlyBillRow> = {}): MonthlyBillRow {
+    return {
+      client: "A社",
+      month: "2026-10",
+      worked_minutes: 9615,
+      hours: 160.25,
+      unit_price: 1800,
+      amount: 288450,
+      tax_amount: 28845,
+      withholding_amount: 0,
+      net_amount: 317295,
+      state: "REVIEWING",
+      mf_invoice_id: null,
+      locked_at: null,
+      note: null,
+      updated_at: Date.parse("2026-11-01T00:00:00+09:00"),
+      invoice_state: "",
+      invoice_error: null,
+      invoice_attempted_at: null,
+      close_card_ts: "1756260000.000100",
+      ...overrides,
+    };
+  }
+
+  it("指定列だけを書き、他の列（数値列を含む）には触れない", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const adapter = new SheetsAdapter(SPREADSHEET_ID);
+    adapter.upsertMonthlyBill(makeMonthlyBillRow());
+
+    adapter.updateMonthlyBillColumns("A社", "2026-10", {
+      state: "LOCKED",
+      locked_at: 12345,
+      invoice_state: "PENDING",
+    });
+
+    const after = adapter.getMonthlyBill("A社", "2026-10");
+    expect(after?.state).toBe("LOCKED");
+    expect(after?.locked_at).toBe(12345);
+    expect(after?.invoice_state).toBe("PENDING");
+    // 数値列・close_card_ts 等、patch に含めなかった列は変わらない。
+    expect(after?.worked_minutes).toBe(9615);
+    expect(after?.hours).toBe(160.25);
+    expect(after?.net_amount).toBe(317295);
+    expect(after?.close_card_ts).toBe("1756260000.000100");
+  });
+
+  it("対象行が無い場合は例外を投げる", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const adapter = new SheetsAdapter(SPREADSHEET_ID);
+
+    expect(() => adapter.updateMonthlyBillColumns("A社", "2026-10", { state: "LOCKED" })).toThrow();
+  });
+
+  it("listMonthlyBills は全行を返す", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const adapter = new SheetsAdapter(SPREADSHEET_ID);
+    adapter.upsertMonthlyBill(makeMonthlyBillRow({ month: "2026-10" }));
+    adapter.upsertMonthlyBill(makeMonthlyBillRow({ month: "2026-11" }));
+
+    const all = adapter.listMonthlyBills();
+
+    expect(all.map((r) => r.month).sort()).toEqual(["2026-10", "2026-11"]);
+  });
+});
+
+describe("SheetsAdapter.getInternalRows（実装設計 MF連携 §8, §5.8 遅延打刻の読み出し）", () => {
+  it("kind に一致する行だけを key/value で返す", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const adapter = new SheetsAdapter(SPREADSHEET_ID);
+    adapter.setInternalValue("late_stamp", "EVENT1", "2026-09-01");
+    adapter.setInternalValue("late_stamp", "EVENT2", "2026-09-02");
+    adapter.setInternalValue("card", "C1:2026-09-01", "1700000000.000100");
+
+    const rows = adapter.getInternalRows("late_stamp");
+
+    expect(rows.sort((a, b) => (a.key < b.key ? -1 : 1))).toEqual([
+      { key: "EVENT1", value: "2026-09-01" },
+      { key: "EVENT2", value: "2026-09-02" },
+    ]);
   });
 });

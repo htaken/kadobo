@@ -12,3 +12,6 @@ export * from "./aggregate";
 export * from "./envelope";
 export * from "./card";
 export * from "./expense";
+export * from "./base64";
+export * from "./monthClose";
+export * from "./invoice";

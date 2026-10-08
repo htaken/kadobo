@@ -1,12 +1,18 @@
 /**
- * 時間トリガーの登録（実装設計 §7.7、経費フェーズ §5.6）。既存の同名トリガーを削除してから
- * 作り直す（冪等）。
+ * 時間トリガーの登録（実装設計 §7.7、経費フェーズ §5.6、MF連携 §7）。既存の同名トリガーを
+ * 削除してから作り直す（冪等）。
+ *
+ * 🔄 `trigMfSyncSoon` は締めボタン押下時に `SchedulerAdapter.scheduleOnce` が動的に作る
+ * 1 回限りのトリガーで、`installTriggers` では作り直さない（毎時等の定期実行ではないため）。
+ * ここに含めるのはあくまで「作り直しの際に古いものを消す」ため（実装設計 §7）。
  */
 const TRIGGER_FUNCTION_NAMES = [
   "trigMorningCard",
   "trigEveningCheck",
   "trigMonthly",
   "trigWeeklyOrphanCheck",
+  "trigMfSync",
+  "trigMfSyncSoon",
 ] as const;
 
 export function installTriggers(): void {
@@ -26,4 +32,6 @@ export function installTriggers(): void {
     .onWeekDay(ScriptApp.WeekDay.MONDAY)
     .atHour(7)
     .create();
+  // MF連携 §7: 毎時。
+  ScriptApp.newTrigger("trigMfSync").timeBased().everyHours(1).create();
 }

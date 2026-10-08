@@ -6,6 +6,7 @@ import { formatJst, jstToMs } from "@kadobo/shared/time";
 import type { GasRequest, GasResponse } from "@kadobo/shared/protocol";
 import { renderCorrectionModal } from "../core/card";
 import { applyCorrections } from "../core/correction";
+import { isMonthFrozen } from "../core/monthClose";
 import { isStampEvent, replay } from "../core/state";
 import { redrawCardForBusinessDate } from "./cardHelpers";
 import { recomputeDailyAndMonthly } from "./monthly";
@@ -71,11 +72,13 @@ export function handleCorrectionSubmit(req: CorrectionSubmitRequest, ports: AppP
     return { ok: true, applied: false, reason: "DUPLICATE" };
   }
 
-  // 2. LOCKED 月チェック（実装設計 §4.2.4）。
+  // 2. 凍結月チェック（実装設計 §4.2.4, MF連携 §5.1）。`LOCKED` だけでなく `MF_CREATED` 以降も
+  // 凍結対象にする（`isMonthFrozen`）。旧実装は `LOCKED` だけを見ていたため、請求書を作成した
+  // 後の月に訂正が通り、請求書とシートの金額がずれる不具合があった（必須修正）。
   const client = ports.props.get("CLIENT_DEFAULT") ?? "A社";
   const month = req.business_date.slice(0, 7);
   const bill = ports.sheets.getMonthlyBill(client, month);
-  if (bill !== null && bill.state === "LOCKED") {
+  if (bill !== null && isMonthFrozen(bill.state)) {
     notifyCorrectionFailure(ports, req.user_id, req.idempotency_key, "締め済みの月のため修正できません");
     return { ok: true, applied: false, reason: "LOCKED_MONTH" };
   }

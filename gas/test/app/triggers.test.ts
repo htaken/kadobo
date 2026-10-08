@@ -1,12 +1,42 @@
 import { describe, expect, it } from "vitest";
 import {
   trigEveningCheck,
+  trigMfSync,
+  trigMfSyncSoon,
   trigMonthly,
   trigMorningCard,
   trigWeeklyOrphanCheck,
 } from "../../src/app/triggers";
-import type { DailySummaryRow, ExpenseLedgerRow, RawLogRow } from "../../src/app/ports";
+import { MF_INVOICE_TOKENS_KEY } from "../../src/app/mf/invoiceClient";
+import {
+  LockTimeoutError,
+  type DailySummaryRow,
+  type ExpenseLedgerRow,
+  type MonthlyBillRow,
+  type RawLogRow,
+} from "../../src/app/ports";
 import { makeFakePorts } from "./fakes";
+
+function seedInvoiceTokens(ports: ReturnType<typeof makeFakePorts>): void {
+  ports.secrets.set(
+    MF_INVOICE_TOKENS_KEY,
+    JSON.stringify({ access_token: "AT1", refresh_token: "RT1", refreshed_at: 1000, generation: 1 }),
+  );
+}
+
+function seedUnitPrice(ports: ReturnType<typeof makeFakePorts>): void {
+  ports.sheets.unitPrices.push({
+    client: "A社",
+    unit_price: 1800,
+    tax_category: "課税",
+    tax_inclusive: false,
+    tax_display: "区分記載",
+    rounding: "切捨",
+    withholding: "なし",
+    valid_from: "2026-01-01",
+    valid_to: null,
+  });
+}
 
 function setupChannel(ports: ReturnType<typeof makeFakePorts>): void {
   ports.props.set("SLACK_CHANNEL_ID", "C1");
@@ -221,6 +251,167 @@ describe("trigMonthly", () => {
     expect(ports.slack.posted[0]?.text).toContain("2026-08");
     expect(ports.slack.posted[0]?.text).toContain("2026-08-10");
   });
+
+  it("再集計（日次ループ＋月次）はスクリプトロックの中で行う（実装設計 MF連携 §5.2, B1）", () => {
+    const ports = makeFakePorts(Date.parse("2026-09-01T06:30:00+09:00"));
+    setupChannel(ports);
+    ports.lock.throwTimeoutOnce = true;
+
+    // ロックが取れなければ例外が伝播する（＝再集計が実際にロックの中で行われている証拠）。
+    // 既存の `trigMonthly` は try/catch していないため、このまま呼び出し元へ抜ける。
+    expect(() => trigMonthly(ports)).toThrow(LockTimeoutError);
+  });
+
+  it("集計後に evaluateMonthClose を呼ぶ（実装設計 MF連携 §5.2, §7）", () => {
+    const ports = makeFakePorts(Date.parse("2026-09-01T06:30:00+09:00")); // 前月 = 2026-08
+    setupChannel(ports);
+    ports.props.set("MF_BILLING_START_MONTH", "2026-08");
+    seedUnitPrice(ports);
+    // 要修正な日が無い、正常な1セッション（3時間）。
+    ports.sheets.rawLog.push(startRow("2026-08-11", Date.parse("2026-08-11T09:00:00+09:00")));
+    ports.sheets.rawLog.push(
+      startRow("2026-08-11", Date.parse("2026-08-11T12:00:00+09:00"), {
+        event_id: "E-2026-08-11-end",
+        event_type: "END",
+      }),
+    );
+
+    trigMonthly(ports);
+
+    // 既存の月次集計通知 ＋ 締め確認カードで計 2 件投稿される。
+    expect(ports.slack.posted).toHaveLength(2);
+    const bill = ports.sheets.getMonthlyBill("A社", "2026-08");
+    expect(bill?.state).toBe("REVIEWING");
+    expect(bill?.close_card_ts).not.toBeNull();
+    expect(ports.http.calls).toHaveLength(0); // MF は一切呼ばない
+  });
+});
+
+describe("trigMfSync（実装設計 MF連携 §7）", () => {
+  it("evaluateMonthClose を呼ぶ（MF は呼ばない）", () => {
+    const ports = makeFakePorts(Date.parse("2026-11-15T06:00:00+09:00"));
+    setupChannel(ports);
+    ports.props.set("MF_BILLING_START_MONTH", "2026-10");
+    seedUnitPrice(ports);
+
+    trigMfSync(ports);
+
+    const bill = ports.sheets.getMonthlyBill("A社", "2026-10");
+    expect(bill?.state).toBe("REVIEWING");
+    expect(ports.http.calls).toHaveLength(0);
+  });
+
+  it("evaluateMonthClose が例外を投げても trigMfSync 自体は例外を投げない（独立した try/catch）", () => {
+    const ports = makeFakePorts(Date.parse("2026-11-15T06:00:00+09:00"));
+    setupChannel(ports);
+    ports.props.set("MF_BILLING_START_MONTH", "2026-10");
+    ports.sheets.getMonthlyBill = () => {
+      throw new Error("boom");
+    };
+
+    expect(() => trigMfSync(ports)).not.toThrow();
+  });
+
+  it("フラグ有効: ensureInvoiceCreated・trackBillingStatus・warnMismatchDaily を呼ぶ（実装設計 MF連携 §5.5, §5.7, §7）", () => {
+    const ports = makeFakePorts(Date.parse("2026-11-15T06:00:00+09:00"));
+    setupChannel(ports);
+    ports.props.set("MF_ENABLED", "true");
+    ports.props.set("MF_INVOICE_ENABLED", "true");
+    seedInvoiceTokens(ports);
+
+    // MISMATCH の月（warnMismatchDaily が毎回拾う）。
+    const mismatchBill: MonthlyBillRow = {
+      client: "A社",
+      month: "2026-08",
+      worked_minutes: 0,
+      hours: 0,
+      unit_price: 0,
+      amount: 0,
+      tax_amount: 0,
+      withholding_amount: 0,
+      net_amount: 0,
+      state: "MF_CREATED",
+      mf_invoice_id: "INV1",
+      locked_at: 1,
+      note: null,
+      updated_at: 1,
+      invoice_state: "MISMATCH",
+      invoice_error: "差額あり",
+      invoice_attempted_at: null,
+      close_card_ts: null,
+    };
+    ports.sheets.monthlyBills.set("A社|2026-08", mismatchBill);
+
+    trigMfSync(ports);
+
+    // trackBillingStatus が GET /billings/{id} を呼ぶ（既定応答は変化なしなので state は変わらない）。
+    expect(ports.http.calls.some((c) => c.url.includes("/billings/INV1"))).toBe(true);
+    // warnMismatchDaily が MISMATCH の月を警告する。
+    expect(ports.slack.posted.some((p) => p.text.includes("送付しないでください"))).toBe(true);
+  });
+
+  it("ensureInvoiceCreated が例外を投げても trackBillingStatus・warnMismatchDaily は実行される（各ステップが独立）", () => {
+    const ports = makeFakePorts(Date.parse("2026-11-15T06:00:00+09:00"));
+    setupChannel(ports);
+    ports.props.set("MF_ENABLED", "true");
+    ports.props.set("MF_INVOICE_ENABLED", "true");
+    seedInvoiceTokens(ports);
+
+    const mismatchBill: MonthlyBillRow = {
+      client: "A社",
+      month: "2026-08",
+      worked_minutes: 0,
+      hours: 0,
+      unit_price: 0,
+      amount: 0,
+      tax_amount: 0,
+      withholding_amount: 0,
+      net_amount: 0,
+      state: "MF_CREATED",
+      mf_invoice_id: "INV1",
+      locked_at: 1,
+      note: null,
+      updated_at: 1,
+      invoice_state: "MISMATCH",
+      invoice_error: "差額あり",
+      invoice_attempted_at: null,
+      close_card_ts: null,
+    };
+    ports.sheets.monthlyBills.set("A社|2026-08", mismatchBill);
+
+    // `listMonthlyBills` は ensureInvoiceCreated・trackBillingStatus・warnMismatchDaily の
+    // それぞれから 1 回ずつ呼ばれる。1 回目（ensureInvoiceCreated）だけ例外を投げる。
+    let calls = 0;
+    const original = ports.sheets.listMonthlyBills.bind(ports.sheets);
+    ports.sheets.listMonthlyBills = () => {
+      calls++;
+      if (calls === 1) {
+        throw new Error("boom");
+      }
+      return original();
+    };
+
+    expect(() => trigMfSync(ports)).not.toThrow();
+    // ensureInvoiceCreated は失敗したが、warnMismatchDaily は実行され警告が投稿されている。
+    expect(ports.slack.posted.some((p) => p.text.includes("送付しないでください"))).toBe(true);
+  });
+});
+
+describe("trigMfSyncSoon（実装設計 MF連携 §5.3, §7）", () => {
+  it("最初に自分と同名のトリガーを削除してから trigMfSync と同じ処理を行う", () => {
+    const ports = makeFakePorts(Date.parse("2026-11-15T06:00:00+09:00"));
+    setupChannel(ports);
+    ports.props.set("MF_BILLING_START_MONTH", "2026-10");
+    seedUnitPrice(ports);
+    ports.scheduler.pending.add("trigMfSyncSoon");
+
+    trigMfSyncSoon(ports);
+
+    expect(ports.scheduler.clearCalls).toEqual(["trigMfSyncSoon"]);
+    expect(ports.scheduler.hasPending("trigMfSyncSoon")).toBe(false);
+    const bill = ports.sheets.getMonthlyBill("A社", "2026-10");
+    expect(bill?.state).toBe("REVIEWING");
+  });
 });
 
 const WEEKLY_NOW = Date.parse("2026-09-07T07:30:00+09:00"); // 月曜 07 時台
@@ -406,5 +597,39 @@ describe("trigWeeklyOrphanCheck — チャンネル未設定", () => {
 
     expect(ports.slack.posted).toHaveLength(0);
     expect(ports.sheets.getInternalValue("expense_scan", "last_success_at")).toBeNull();
+  });
+});
+
+describe("trigWeeklyOrphanCheck — weeklyInvoiceKeepalive（実装設計 MF連携 §4.2, §7）", () => {
+  it("フラグ有効: 末尾で GET /office を 1 回呼ぶ", () => {
+    const ports = makeFakePorts(WEEKLY_NOW);
+    setupChannel(ports);
+    ports.props.set("MF_ENABLED", "true");
+    ports.props.set("MF_INVOICE_ENABLED", "true");
+    seedInvoiceTokens(ports);
+
+    trigWeeklyOrphanCheck(ports);
+
+    expect(ports.http.calls).toHaveLength(1);
+    expect(ports.http.calls[0]!.url).toBe("https://invoice.moneyforward.com/api/v3/office");
+  });
+
+  it("フラグ無効なら呼ばない", () => {
+    const ports = makeFakePorts(WEEKLY_NOW);
+    setupChannel(ports);
+
+    trigWeeklyOrphanCheck(ports);
+
+    expect(ports.http.calls).toHaveLength(0);
+  });
+
+  it("weeklyInvoiceKeepalive が例外を投げても trigWeeklyOrphanCheck 自体は例外を投げない", () => {
+    const ports = makeFakePorts(WEEKLY_NOW);
+    setupChannel(ports);
+    ports.props.set("MF_ENABLED", "true");
+    ports.props.set("MF_INVOICE_ENABLED", "true");
+    // トークン未設定 -> MfReauthRequiredError が投げられる。
+
+    expect(() => trigWeeklyOrphanCheck(ports)).not.toThrow();
   });
 });

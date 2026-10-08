@@ -69,6 +69,10 @@ const UNIT_PRICE_HEADERS = [
   "valid_to",
 ] as const;
 
+/**
+ * 月次請求の列（実装設計 MF連携 §5.1）。既存 14 列（`MONTHLY_BILL_HEADERS_V1`）に、締めの状態機械
+ * が使う 4 列（`invoice_state`〜`close_card_ts`）を末尾に追加した 18 列。
+ */
 const MONTHLY_BILL_HEADERS = [
   "client",
   "month",
@@ -84,7 +88,15 @@ const MONTHLY_BILL_HEADERS = [
   "locked_at",
   "note",
   "updated_at",
+  // 🔄 MF連携フェーズで追加（実装設計 §5.1）。書くのは締め処理・MF 同期だけ。
+  "invoice_state",
+  "invoice_error",
+  "invoice_attempted_at",
+  "close_card_ts",
 ] as const;
+
+/** 移行前（MVP/経費フェーズ時点）の月次請求ヘッダー。`migrateMonthlyBill` の一致判定専用。 */
+const MONTHLY_BILL_HEADERS_V1 = MONTHLY_BILL_HEADERS.slice(0, 14);
 
 /**
  * 経費台帳の列（実装設計 経費フェーズ §5.1）。MVP（WP3）の 14 列に、at-least-once 配送・監査・
@@ -186,8 +198,8 @@ const NON_TEXT_COLUMNS: Partial<Record<string, readonly number[]>> = {
   // unit_price / tax_inclusive
   [SHEET_NAMES.unitPrice]: [2, 4],
   // worked_minutes / hours / unit_price / amount / tax_amount / withholding_amount / net_amount /
-  // locked_at（現状の型に合わせ number のまま） / updated_at
-  [SHEET_NAMES.monthlyBill]: [3, 4, 5, 6, 7, 8, 9, 12, 14],
+  // locked_at（現状の型に合わせ number のまま） / updated_at / invoice_attempted_at
+  [SHEET_NAMES.monthlyBill]: [3, 4, 5, 6, 7, 8, 9, 12, 14, 17],
   // 金額 / サイズ / 入力日時 / state_updated_at / 事業使用割合
   [SHEET_NAMES.expenseLedger]: [4, 11, 12, 20, 22],
   // updated_at（kind/key/value は text。value がカードの Slack ts で最重要）
@@ -246,17 +258,17 @@ function applyTextFormat(
  * 「空なら書く」ガードとは独立。単価マスタ等、GAS が書込ポートを持たず人手で編集される列も
  * ここで先回りして text 化しておく）。
  *
- * 🔄 経費台帳（`SHEET_NAMES.expenseLedger`）だけはこの汎用ループから除外し、
- * {@link migrateExpenseLedger} で個別に扱う。本番シートには既に MVP（14 列）のヘッダーが
- * あるため、他シートと同じ「空なら書く」ガードでは 24 列への拡張ができない。かつ
- * ヘッダーが 14 列・24 列のどちらとも一致しない異常な状態では**何も書き換えず例外を投げて
- * 中断する**（fail closed。実装設計 §5.1 の 🔄）ため、単純な「不足列を末尾に足す」処理には
- * できない。
+ * 🔄 経費台帳（`SHEET_NAMES.expenseLedger`）・月次請求（`SHEET_NAMES.monthlyBill`）はこの汎用
+ * ループから除外し、それぞれ {@link migrateExpenseLedger}・{@link migrateMonthlyBill} で個別に
+ * 扱う。本番シートには既に旧バージョンの列数のヘッダーがあるため、他シートと同じ「空なら書く」
+ * ガードでは新しい列への拡張ができない。かつヘッダーが旧列数・新列数のどちらとも一致しない
+ * 異常な状態では**何も書き換えず例外を投げて中断する**（fail closed。実装設計 経費フェーズ
+ * §5.1・MF連携 §5.1 の 🔄）ため、単純な「不足列を末尾に足す」処理にはできない。
  */
 export function setupSpreadsheet(spreadsheetId: string): void {
   const ss = SpreadsheetApp.openById(spreadsheetId);
   for (const [name, headers] of Object.entries(SHEET_HEADERS)) {
-    if (name === SHEET_NAMES.expenseLedger) {
+    if (name === SHEET_NAMES.expenseLedger || name === SHEET_NAMES.monthlyBill) {
       continue;
     }
     let sheet = ss.getSheetByName(name);
@@ -278,6 +290,7 @@ export function setupSpreadsheet(spreadsheetId: string): void {
     }
   }
   migrateExpenseLedger(ss);
+  migrateMonthlyBill(ss);
 }
 
 /** 配列の内容が過不足なく完全一致するか（`migrateExpenseLedger` の見出し比較専用）。 */
@@ -379,6 +392,52 @@ function protectAndHideExpenseSystemColumns(sheet: GoogleAppsScript.Spreadsheet.
       .setWarningOnly(true);
   }
   sheet.hideColumns(EXPENSE_SYSTEM_COLUMN_START, EXPENSE_SYSTEM_COLUMN_COUNT);
+}
+
+/**
+ * 月次請求の列マイグレーション（実装設計 MF連携 §5.1）。`migrateExpenseLedger` と同じ流儀
+ * （既存列には一切触れず、末尾にヘッダーだけを追記する一度きりの移行）。
+ *
+ * - シートが無ければ新規作成し、最初から 18 列ヘッダーを書く
+ * - 既存ヘッダーが旧 14 列（{@link MONTHLY_BILL_HEADERS_V1}）と完全一致すれば、右へ 4 列
+ *   （`invoice_state`〜`close_card_ts`）を追加する
+ * - 既に 18 列（{@link MONTHLY_BILL_HEADERS}）と完全一致すれば何もしない（冪等）
+ * - どちらとも一致しなければ、何も書き換えず例外を投げて中断する（fail closed）
+ */
+function migrateMonthlyBill(ss: GoogleAppsScript.Spreadsheet.Spreadsheet): void {
+  const name = SHEET_NAMES.monthlyBill;
+  let sheet = ss.getSheetByName(name);
+  if (sheet === null) {
+    sheet = ss.insertSheet(name);
+  }
+  ensureMinColumns(sheet, MONTHLY_BILL_HEADERS.length);
+
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, MONTHLY_BILL_HEADERS.length).setValues([[...MONTHLY_BILL_HEADERS]]);
+  } else {
+    const header18 = (sheet.getRange(1, 1, 1, MONTHLY_BILL_HEADERS.length).getValues()[0] ?? []).map(str);
+    const alreadyMigrated = arraysEqual(header18, MONTHLY_BILL_HEADERS);
+    if (!alreadyMigrated) {
+      const header14 = header18.slice(0, MONTHLY_BILL_HEADERS_V1.length);
+      const extension = header18.slice(MONTHLY_BILL_HEADERS_V1.length);
+      const isUnmigratedV1 = arraysEqual(header14, MONTHLY_BILL_HEADERS_V1) && extension.every((v) => v === "");
+      if (!isUnmigratedV1) {
+        throw new Error(
+          `月次請求のヘッダーが想定と一致しません（既存 14 列にも移行後の 18 列にも一致しません）。` +
+            `自動移行は行わず中断しました。スプレッドシートを xlsx でバックアップしたうえで、` +
+            `実装設計 MF連携.md §5.1 の移行手順に従って手動で確認してください。`,
+        );
+      }
+      const newHeaders = MONTHLY_BILL_HEADERS.slice(MONTHLY_BILL_HEADERS_V1.length);
+      sheet.getRange(1, MONTHLY_BILL_HEADERS_V1.length + 1, 1, newHeaders.length).setValues([newHeaders]);
+    }
+    // alreadyMigrated なら何もしない（2 回目以降の実行に対する冪等性）。
+  }
+
+  const maxRows = sheet.getMaxRows();
+  if (maxRows >= 2) {
+    applyTextFormat(sheet, name, 2, maxRows - 1, MONTHLY_BILL_HEADERS.length);
+  }
 }
 
 function str(v: unknown): string {
@@ -542,6 +601,10 @@ function rowToMonthlyBill(row: unknown[]): MonthlyBillRow {
     locked_at: numOrNull(row[11]),
     note: strOrNull(row[12]),
     updated_at: Number(row[13]),
+    invoice_state: str(row[14]) as MonthlyBillRow["invoice_state"],
+    invoice_error: strOrNull(row[15]),
+    invoice_attempted_at: numOrNull(row[16]),
+    close_card_ts: strOrNull(row[17]),
   };
 }
 
@@ -561,6 +624,10 @@ function monthlyBillToRow(r: MonthlyBillRow): unknown[] {
     r.locked_at ?? "",
     r.note ?? "",
     r.updated_at,
+    r.invoice_state,
+    r.invoice_error ?? "",
+    r.invoice_attempted_at ?? "",
+    r.close_card_ts ?? "",
   ];
 }
 
@@ -772,6 +839,25 @@ export class SheetsAdapter implements SheetsPort {
     return found === undefined ? null : rowToMonthlyBill(found);
   }
 
+  /**
+   * 🔄 `client + month` の月次請求行を指定列だけ更新する（実装設計 MF連携 §0, §8）。
+   * 行が無い場合は例外を投げる（`updateExpense` と同じ方針。新規作成は `upsertMonthlyBill`）。
+   */
+  updateMonthlyBillColumns(client: string, month: string, patch: Partial<MonthlyBillRow>): void {
+    const values = this.dataRows(SHEET_NAMES.monthlyBill);
+    const idx = values.findIndex((r) => str(r[0]) === client && strMonth(r[1]) === month);
+    if (idx === -1) {
+      throw new Error(`monthly_bill_not_found:${client}|${month}`);
+    }
+    const current = rowToMonthlyBill(values[idx]!);
+    const merged: MonthlyBillRow = { ...current, ...patch };
+    this.setFormattedRow(SHEET_NAMES.monthlyBill, idx + 2, monthlyBillToRow(merged));
+  }
+
+  listMonthlyBills(): MonthlyBillRow[] {
+    return this.dataRows(SHEET_NAMES.monthlyBill).map(rowToMonthlyBill);
+  }
+
   getInternalValue(kind: string, key: string): string | null {
     const found = this.dataRows(SHEET_NAMES.internal).find((r) => str(r[0]) === kind && strDate(r[1]) === key);
     return found === undefined ? null : str(found[2]);
@@ -786,6 +872,12 @@ export class SheetsAdapter implements SheetsPort {
       return;
     }
     this.setFormattedRow(SHEET_NAMES.internal, idx + 2, rowValues);
+  }
+
+  getInternalRows(kind: string): { key: string; value: string }[] {
+    return this.dataRows(SHEET_NAMES.internal)
+      .filter((r) => str(r[0]) === kind)
+      .map((r) => ({ key: strDate(r[1]), value: str(r[2]) }));
   }
 
   // ---------------------------------------------------------------------------

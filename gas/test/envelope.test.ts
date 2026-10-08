@@ -40,7 +40,13 @@ describe("契約テスト: shared/test/vectors/envelope.json の sig が Node cr
 });
 
 describe("verifyEnvelope — 契約ベクタを受理する（payload が有効な JSON のもの）", () => {
-  const acceptableVectorNames = ["stamp_start", "command_status", "status_probe", "unicode_payload"];
+  const acceptableVectorNames = [
+    "stamp_start",
+    "command_status",
+    "status_probe",
+    "unicode_payload",
+    "month_close",
+  ];
 
   for (const name of acceptableVectorNames) {
     const v = vectors.vectors.find((x) => x.name === name)!;

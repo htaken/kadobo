@@ -9,4 +9,9 @@ export class ClockAdapter implements ClockPort {
   nowSec(): number {
     return Math.floor(Date.now() / 1000);
   }
+
+  /** `Utilities.sleep`（実装設計 MF連携 §4.1）。 */
+  sleep(ms: number): void {
+    Utilities.sleep(ms);
+  }
 }

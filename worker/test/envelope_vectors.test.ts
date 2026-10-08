@@ -33,8 +33,10 @@ interface VectorsFile {
 const vectorsFile = JSON.parse(readFileSync(vectorsPath, "utf-8")) as VectorsFile;
 
 describe("封筒署名の契約テスト（shared/test/vectors/envelope.json）", () => {
-  it("ベクタファイルに5件のベクタが含まれる", () => {
-    expect(vectorsFile.vectors.length).toBe(5);
+  it("ベクタファイルに6件のベクタが含まれる", () => {
+    // 🔄 実装設計 MF連携 §11.2 WP-M2: 署名付きの month_close が Worker → GAS の実際の検証を
+    // 通ることを示す契約テストベクタ（`month_close`）を追加した。
+    expect(vectorsFile.vectors.length).toBe(6);
   });
 
   for (const vector of vectorsFile.vectors) {

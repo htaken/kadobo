@@ -14,6 +14,9 @@ import {
   shiftBusinessDate,
   weekdayIndexOf,
 } from "./dateUtil";
+import { ensureInvoiceCreated, trackBillingStatus, warnMismatchDaily, weeklyInvoiceKeepalive } from "./invoice";
+import { notifyMfFailure, notifyMfSuccess } from "./mf/notify";
+import { evaluateMonthClose } from "./monthClose";
 import { formatYen, recomputeDaily, recomputeMonthly } from "./monthly";
 import type { AppPorts, DriveFileInfo } from "./ports";
 import { toLoggedEvent } from "./rawLog";
@@ -126,42 +129,101 @@ export function trigEveningCheck(ports: AppPorts): void {
 
 /**
  * 毎月 1 日 06 時台トリガー。前月の日次を再計算し、月次請求行を更新する（`state` は変更しない。
- * `LOCKED` 済みの月は `recomputeMonthly` 側で上書きしない）。要修正一覧と月合計を通知する。
+ * 凍結済みの月は `recomputeMonthly` 側で上書きしない）。要修正一覧と月合計を通知したあと、
+ * 締め確認の評価（{@link evaluateMonthClose}、実装設計 MF連携 §5.2, §7）を行う。
+ *
+ * 🔄 再集計（日次の再計算ループ＋月次の再計算）は短いスクリプトロックの中で行う（実装設計
+ * MF連携 §5.2, B1）。旧実装はロック無しで動いており、`trigMfSync`（毎時）と競合すると
+ * 締め状態を古い値で書き戻すおそれがあった。Slack への通知はロックの外で行う。
  */
 export function trigMonthly(ports: AppPorts): void {
   const today = businessDateOf(ports.clock.nowMs());
   const prevMonth = previousMonthOf(today);
   const fromDate = `${prevMonth}-01`;
   const toDate = lastDayOfMonthStr(prevMonth);
-
-  let cursor = fromDate;
-  while (cursor <= toDate) {
-    const rows = ports.sheets.getEventsForBusinessDate(cursor);
-    if (rows.length > 0) {
-      recomputeDaily(cursor, ports);
-    }
-    cursor = shiftBusinessDate(cursor, 1);
-  }
-
   const client = ports.props.get("CLIENT_DEFAULT") ?? "A社";
-  recomputeMonthly(client, prevMonth, ports);
+
+  ports.lock.withLock(() => {
+    let cursor = fromDate;
+    while (cursor <= toDate) {
+      const rows = ports.sheets.getEventsForBusinessDate(cursor);
+      if (rows.length > 0) {
+        recomputeDaily(cursor, ports);
+      }
+      cursor = shiftBusinessDate(cursor, 1);
+    }
+
+    recomputeMonthly(client, prevMonth, ports);
+  });
 
   const summaries = ports.sheets.getDailySummariesInRange(fromDate, toDate);
   const needsFix = summaries.filter((s) => s.status === "要修正").map((s) => s.business_date);
   const bill = ports.sheets.getMonthlyBill(client, prevMonth);
 
   const channelId = ports.props.get("SLACK_CHANNEL_ID");
-  if (channelId === null) {
-    return;
+  if (channelId !== null) {
+    const lines = [`📅 ${prevMonth} 月次集計`];
+    if (bill !== null) {
+      lines.push(`稼働 ${bill.hours}h ／ 金額 ${formatYen(bill.amount)}`);
+    }
+    lines.push(needsFix.length > 0 ? `⚠️ 要修正: ${needsFix.join(", ")}` : "要修正なし");
+
+    postBestEffort(ports, channelId, lines.join("\n"));
   }
 
-  const lines = [`📅 ${prevMonth} 月次集計`];
-  if (bill !== null) {
-    lines.push(`稼働 ${bill.hours}h ／ 金額 ${formatYen(bill.amount)}`);
-  }
-  lines.push(needsFix.length > 0 ? `⚠️ 要修正: ${needsFix.join(", ")}` : "要修正なし");
+  evaluateMonthClose(ports);
+}
 
-  postBestEffort(ports, channelId, lines.join("\n"));
+// ---------------------------------------------------------------------------
+// MF 連携: 月次締めのトリガー（実装設計 MF連携 §7）
+// ---------------------------------------------------------------------------
+
+/** 1 ステップを try/catch し、MF の例外は `notifyMfFailure`、成功したら `notifyMfSuccess` を呼ぶ（実装設計 §7）。 */
+function runInvoiceStep(ports: AppPorts, label: string, fn: (ports: AppPorts) => void): void {
+  try {
+    fn(ports);
+    notifyMfSuccess(ports, "invoice");
+  } catch (e) {
+    console.error(`trigMfSync: ${label} failed: ` + (e instanceof Error ? (e.stack || e.message) : String(e)));
+    notifyMfFailure(ports, "invoice", e);
+  }
+}
+
+/**
+ * 毎時トリガー（実装設計 §7）。① `evaluateMonthClose`（MF を呼ばない）→ ② `ensureInvoiceCreated`
+ * （実装設計 §5.5）→ ③ `trackBillingStatus`（送付・入金の追跡、実装設計 §5.7）→
+ * ④ `warnMismatchDaily`（`MISMATCH` の毎日の警告、実装設計 §5.5）。各ステップは独立に
+ * try/catch し、1 つが例外を投げても他のステップは実行される。②〜④ の MF 呼び出しの例外は
+ * `notifyMfFailure(ports, "invoice", err)`、成功したら `notifyMfSuccess(ports, "invoice")`
+ * を呼ぶ（`notifyMfFailure`/`notifyMfSuccess` はロック外から呼ぶ版。§4.4）。
+ *
+ * ⑤ 経費同期（WP-M4 で追加）。
+ */
+export function trigMfSync(ports: AppPorts): void {
+  try {
+    evaluateMonthClose(ports);
+  } catch (e) {
+    console.error("trigMfSync: evaluateMonthClose failed: " + (e instanceof Error ? (e.stack || e.message) : String(e)));
+  }
+
+  runInvoiceStep(ports, "ensureInvoiceCreated", ensureInvoiceCreated);
+  runInvoiceStep(ports, "trackBillingStatus", trackBillingStatus);
+  runInvoiceStep(ports, "warnMismatchDaily", warnMismatchDaily);
+
+  // ⑤ 経費同期（WP-M4 で追加）。
+}
+
+/**
+ * 締めボタンから 1 分後に 1 回だけ動く時間トリガー（実装設計 §5.3 手順6, §7）。
+ * 最初に自分と同名の時間トリガーをすべて削除してから {@link trigMfSync} と同じ処理を行う。
+ */
+export function trigMfSyncSoon(ports: AppPorts): void {
+  try {
+    ports.scheduler.clear("trigMfSyncSoon");
+  } catch (e) {
+    console.error("trigMfSyncSoon: clear failed: " + (e instanceof Error ? (e.stack || e.message) : String(e)));
+  }
+  trigMfSync(ports);
 }
 
 // ---------------------------------------------------------------------------
@@ -283,4 +345,17 @@ export function trigWeeklyOrphanCheck(ports: AppPorts): void {
   }
 
   ports.sheets.setInternalValue("expense_scan", "last_success_at", String(nowMs));
+
+  // MF 連携: 請求書 API の週次の疎通（実装設計 MF連携 §4.2, §7）。独立に try/catch し、
+  // 例外は notifyMfFailure（ロック外から呼ぶ版）、成功したら notifyMfSuccess を呼ぶ。
+  try {
+    weeklyInvoiceKeepalive(ports);
+    notifyMfSuccess(ports, "invoice");
+  } catch (e) {
+    console.error(
+      "trigWeeklyOrphanCheck: weeklyInvoiceKeepalive failed: " +
+        (e instanceof Error ? (e.stack || e.message) : String(e)),
+    );
+    notifyMfFailure(ports, "invoice", e);
+  }
 }

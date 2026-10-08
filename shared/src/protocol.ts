@@ -72,6 +72,8 @@ export type StampSource = "button" | "retry";
 export type CorrectionSubmitSource = "modal" | "retry";
 export type CommandSource = "command" | "retry";
 export type ExpenseSubmitSource = "modal" | "retry";
+/** 締めボタン（`kado_month_close`）の送信元（実装設計 MF連携 §5.3）。 */
+export type MonthCloseSource = "button" | "retry";
 
 /** スラッシュコマンドの正規化済み引数（実装設計 §2.1）。 */
 export type CommandText = "" | "status";
@@ -156,6 +158,22 @@ export type GasRequest =
       file: ExpenseSubmitFile;
       received_at_ms: number;
       source: ExpenseSubmitSource;
+    }
+  | {
+      kind: "month_close";
+      /** `buttonIdempotencyKey`（`action_id = kado_month_close`）。 */
+      idempotency_key: string;
+      user_id: string;
+      channel_id: string;
+      /** 押されたカードの `message_ts`（実装設計 MF連携 §5.3: `close_card_ts` との一致判定に使う）。 */
+      message_ts: string;
+      client: string;
+      /** `YYYY-MM`。 */
+      month: string;
+      /** カードに表示していた差引入金予定額（古いカードからの押下を検出する）。 */
+      shown_net_amount: number;
+      received_at_ms: number;
+      source: MonthCloseSource;
     };
 
 /**

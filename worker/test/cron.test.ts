@@ -82,6 +82,99 @@ async function insertExpenseSubmitJournal(id: string, attempts: number, extra?: 
   }
 }
 
+/** `month_close` の pending journal 行を直接 INSERT する（実装設計 MF連携 §5.3, §10.1）。 */
+async function insertMonthCloseJournal(id: string, attempts: number, extra?: Record<string, unknown>) {
+  const payload = JSON.stringify({
+    kind: "month_close",
+    idempotency_key: `key-${id}`,
+    user_id: "U1",
+    channel_id: "C1",
+    message_ts: "1756260000.000100",
+    client: "A社",
+    month: "2026-10",
+    shown_net_amount: 317295,
+    received_at_ms: 1756260000500,
+    source: "button",
+    ...extra,
+  });
+  await journal.insertJournal(db, { id, idempotency_key: `key-${id}`, kind: "month_close", payload, now: 1000 });
+  if (attempts > 0) {
+    await db.prepare("UPDATE journal SET attempts = ? WHERE id = ?").bind(attempts, id).run();
+  }
+}
+
+describe("runRetryCron — month_close（実装設計 MF連携 §10.1）", () => {
+  it("他の種別と同じく再送する: 成功したら done になり、source は 'retry' で送信される", async () => {
+    await insertMonthCloseJournal("MC1", 2);
+    const env = makeEnv(db);
+    let capturedBody: any;
+    const { fetchImpl } = createFetchStub((url, init) => {
+      if (url === env.GAS_URL) {
+        capturedBody = init?.body ? JSON.parse(JSON.parse(init.body as string).payload) : undefined;
+        return jsonResponse({ ok: true, applied: true });
+      }
+      return undefined;
+    });
+
+    await runRetryCron(env, { fetchImpl });
+
+    const row = await db.prepare("SELECT * FROM journal WHERE id = ?").bind("MC1").first<any>();
+    expect(row.status).toBe("done");
+    expect(row.attempts).toBe(3);
+    expect(capturedBody.kind).toBe("month_close");
+    expect(capturedBody.source).toBe("retry");
+  });
+
+  it("失敗（retryable）したら pending のまま attempts++", async () => {
+    await insertMonthCloseJournal("MC2", 0);
+    const env = makeEnv(db);
+    const { fetchImpl } = createFetchStub((url) => {
+      if (url === env.GAS_URL) {
+        return jsonResponse({ ok: false, error: "LOCK_TIMEOUT", retryable: true });
+      }
+      return undefined;
+    });
+
+    await runRetryCron(env, { fetchImpl });
+
+    const row = await db.prepare("SELECT * FROM journal WHERE id = ?").bind("MC2").first<any>();
+    expect(row.status).toBe("pending");
+    expect(row.attempts).toBe(1);
+  });
+
+  it("ok:true（applied:false・DUPLICATE 等）でも done として扱われる（実装設計 §3.3）", async () => {
+    await insertMonthCloseJournal("MC3", 0);
+    const env = makeEnv(db);
+    const { fetchImpl } = createFetchStub((url) => {
+      if (url === env.GAS_URL) {
+        return jsonResponse({ ok: true, applied: false, reason: "DUPLICATE" });
+      }
+      return undefined;
+    });
+
+    await runRetryCron(env, { fetchImpl });
+
+    const row = await db.prepare("SELECT * FROM journal WHERE id = ?").bind("MC3").first<any>();
+    expect(row.status).toBe("done");
+  });
+
+  it("ok:false,retryable:false → rejected になる", async () => {
+    await insertMonthCloseJournal("MC4", 0);
+    const env = makeEnv(db);
+    const { fetchImpl } = createFetchStub((url) => {
+      if (url === env.GAS_URL) {
+        return jsonResponse({ ok: false, error: "BAD_REQUEST", retryable: false });
+      }
+      return undefined;
+    });
+
+    await runRetryCron(env, { fetchImpl });
+
+    const row = await db.prepare("SELECT * FROM journal WHERE id = ?").bind("MC4").first<any>();
+    expect(row.status).toBe("rejected");
+  });
+});
+
 describe("runRetryCron", () => {
   it("forwarding_enabled='0' なら GAS へは送らずスキップする", async () => {
     await db.exec("UPDATE settings SET value = '0' WHERE key = 'forwarding_enabled'");

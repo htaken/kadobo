@@ -132,6 +132,10 @@ describe("handleCorrectionSubmit — LOCKED 月", () => {
       locked_at: Date.now(),
       note: null,
       updated_at: Date.now(),
+      invoice_state: "",
+      invoice_error: null,
+      invoice_attempted_at: null,
+      close_card_ts: null,
     };
     ports.sheets.monthlyBills.set("A社|2026-09", bill);
 
@@ -143,6 +147,44 @@ describe("handleCorrectionSubmit — LOCKED 月", () => {
     expect(ports.slack.dms).toHaveLength(1);
     expect(ports.slack.dms[0]?.userId).toBe("U1");
   });
+
+  // 回帰テスト（実装設計 MF連携 §5.1 の必須修正）: 旧実装は `bill.state === "LOCKED"` だけを
+  // 見ていたため、請求書を作成した後（`MF_CREATED`）の月に訂正が通り、請求書とシートの金額が
+  // ずれる不具合があった。`isMonthFrozen` への置換により `MF_CREATED` 以降も拒否されることを確認する。
+  it.each(["MF_CREATED", "SENT", "PAID", "VOID"])(
+    "対象月次請求が %s（LOCKED 以降）でも訂正は拒否される",
+    (state) => {
+      const ports = makeFakePorts();
+      ports.sheets.rawLog.push(startRow());
+      const bill: MonthlyBillRow = {
+        client: "A社",
+        month: "2026-09",
+        worked_minutes: 0,
+        hours: 0,
+        unit_price: 0,
+        amount: 0,
+        tax_amount: 0,
+        withholding_amount: 0,
+        net_amount: 0,
+        state,
+        mf_invoice_id: "INV-1",
+        locked_at: Date.now(),
+        note: null,
+        updated_at: Date.now(),
+        invoice_state: "CREATED",
+        invoice_error: null,
+        invoice_attempted_at: null,
+        close_card_ts: null,
+      };
+      ports.sheets.monthlyBills.set("A社|2026-09", bill);
+
+      const req = makeSubmitRequest();
+      const result = handleCorrectionSubmit(req, ports);
+
+      expect(result).toEqual({ ok: true, applied: false, reason: "LOCKED_MONTH" });
+      expect(ports.sheets.rawLog).toHaveLength(1); // 追記されない
+    },
+  );
 });
 
 describe("handleCorrectionSubmit — 対象が見つからない", () => {

@@ -3,8 +3,32 @@ import { formatJst } from "@kadobo/shared/time";
 import type { GasRequest } from "@kadobo/shared/protocol";
 import { describe, expect, it } from "vitest";
 import { handleStamp } from "../../src/app/stamp";
-import type { RawLogRow } from "../../src/app/ports";
+import type { MonthlyBillRow, RawLogRow } from "../../src/app/ports";
 import { makeFakePorts } from "./fakes";
+
+function frozenBillRow(overrides: Partial<MonthlyBillRow> = {}): MonthlyBillRow {
+  return {
+    client: "A社",
+    month: "2026-09",
+    worked_minutes: 6000,
+    hours: 100,
+    unit_price: 1800,
+    amount: 180000,
+    tax_amount: 18000,
+    withholding_amount: 0,
+    net_amount: 198000,
+    state: "LOCKED",
+    mf_invoice_id: null,
+    locked_at: Date.parse("2026-09-05T00:00:00+09:00"),
+    note: null,
+    updated_at: Date.parse("2026-09-05T00:00:00+09:00"),
+    invoice_state: "MANUAL",
+    invoice_error: null,
+    invoice_attempted_at: null,
+    close_card_ts: null,
+    ...overrides,
+  };
+}
 
 type StampRequest = Extract<GasRequest, { kind: "stamp" }>;
 
@@ -187,5 +211,106 @@ describe("handleStamp — Slack 更新失敗時の応答", () => {
     expect(ports.sheets.rawLog).toHaveLength(1); // 記録は成功している
     expect(ports.slack.posted).toHaveLength(0); // フォールバックしない
     expect(ports.sheets.getInternalValue("card", "C1:2026-09-01")).toBeNull(); // カード ts は保存されない
+  });
+});
+
+describe("handleStamp — 締めた月への遅延打刻の通知（実装設計 MF連携 §5.8）", () => {
+  it("凍結済み月への打刻: 生ログには追記され、月次行は変わらず、DM と late_stamp が記録される", () => {
+    const ports = makeFakePorts();
+    ports.sheets.monthlyBills.set("A社|2026-09", frozenBillRow());
+    const req = makeStampRequest();
+
+    const result = handleStamp(req, ports);
+
+    expect(result).toEqual({ ok: true, applied: true });
+    // 生ログへの追記はこれまでどおり行われる。
+    expect(ports.sheets.rawLog).toHaveLength(1);
+    // 日次再計算は行われる。
+    expect(ports.sheets.getDailySummary("2026-09-01")).not.toBeNull();
+    // 月次行は isMonthFrozen により変わらない（凍結前の値のまま）。
+    const bill = ports.sheets.getMonthlyBill("A社", "2026-09");
+    expect(bill?.state).toBe("LOCKED");
+    expect(bill?.worked_minutes).toBe(6000);
+    // DM で通知される。
+    expect(ports.slack.dms).toHaveLength(1);
+    expect(ports.slack.dms[0]?.userId).toBe("U1");
+    expect(ports.slack.dms[0]?.text).toContain("2026-09");
+    expect(ports.slack.dms[0]?.text).toContain("翌月調整");
+    // 内部シート late_stamp/<event_id> に記録される。
+    const eventId = ports.sheets.rawLog[0]!.event_id;
+    expect(ports.sheets.getInternalValue("late_stamp", eventId)).toBe("2026-09-01");
+  });
+
+  it("凍結されていない月（OPEN）への打刻は通知しない", () => {
+    const ports = makeFakePorts();
+    const req = makeStampRequest();
+
+    const result = handleStamp(req, ports);
+
+    expect(result).toEqual({ ok: true, applied: true });
+    expect(ports.slack.dms).toHaveLength(0);
+    expect(ports.sheets.getInternalRows("late_stamp")).toHaveLength(0);
+  });
+
+  it("REVIEWING の月への打刻も通知しない（凍結は LOCKED 以降のみ）", () => {
+    const ports = makeFakePorts();
+    ports.sheets.monthlyBills.set("A社|2026-09", frozenBillRow({ state: "REVIEWING", invoice_state: "" }));
+    const req = makeStampRequest();
+
+    handleStamp(req, ports);
+
+    expect(ports.slack.dms).toHaveLength(0);
+  });
+
+  it("再送（重複押下）で二重に DM しない: 1 回目で記録された late_stamp を 2 回目はそのまま使う", () => {
+    const ports = makeFakePorts();
+    ports.sheets.monthlyBills.set("A社|2026-09", frozenBillRow());
+    const req = makeStampRequest();
+
+    handleStamp(req, ports);
+    expect(ports.slack.dms).toHaveLength(1);
+
+    // 2 回目（同じ idempotency_key）は重複分岐に入るが、DM は再送しない。
+    const second = handleStamp(req, ports);
+    expect(second).toEqual({ ok: true, applied: false, reason: "DUPLICATE" });
+    expect(ports.slack.dms).toHaveLength(1);
+  });
+
+  it("締め前に追記 → 締め → 同じ idempotency_key の再送: DUPLICATE 経路では DM しない（誤報防止）", () => {
+    const ports = makeFakePorts();
+    const req = makeStampRequest();
+
+    // 1 回目: まだ OPEN のときに新規追記される（この時点では締め後ではないので通知は無い）。
+    const first = handleStamp(req, ports);
+    expect(first).toEqual({ ok: true, applied: true });
+    expect(ports.sheets.rawLog).toHaveLength(1);
+    expect(ports.slack.dms).toHaveLength(0);
+
+    // 締める: この打刻はすでに追記済み（＝締めた金額に含まれている）。
+    ports.sheets.updateMonthlyBillColumns("A社", "2026-09", { state: "LOCKED", invoice_state: "MANUAL" });
+
+    // 2 回目（同じ idempotency_key の再送）: 重複分岐に入る。生ログは追記されないが、
+    // 再計算・カード再描画はやり直す。この打刻は締めより前に届いていたので「遅れて届いた」
+    // わけではなく、DM してはいけない（誤報防止。今回のレビュー指摘）。
+    const second = handleStamp(req, ports);
+    expect(second).toEqual({ ok: true, applied: false, reason: "DUPLICATE" });
+    expect(ports.sheets.rawLog).toHaveLength(1); // 追記は増えない
+    expect(ports.slack.dms).toHaveLength(0); // DM は出ない
+    expect(ports.sheets.getInternalRows("late_stamp")).toHaveLength(0);
+  });
+
+  it("MF_CREATED 以降（LOCKED だけでなく）も凍結として扱う", () => {
+    const ports = makeFakePorts();
+    ports.sheets.monthlyBills.set(
+      "A社|2026-09",
+      frozenBillRow({ state: "MF_CREATED", invoice_state: "CREATED" }),
+    );
+    const req = makeStampRequest();
+
+    handleStamp(req, ports);
+
+    expect(ports.slack.dms).toHaveLength(1);
+    const bill = ports.sheets.getMonthlyBill("A社", "2026-09");
+    expect(bill?.state).toBe("MF_CREATED");
   });
 });

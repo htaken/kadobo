@@ -41,6 +41,10 @@ const entryFns = [
   { name: "trigEveningCheck", args: "" },
   { name: "trigMonthly", args: "" },
   { name: "trigWeeklyOrphanCheck", args: "" },
+  { name: "trigMfSync", args: "" },
+  { name: "trigMfSyncSoon", args: "" },
+  { name: "mfInvoicePing", args: "" },
+  { name: "mfAccountingPing", args: "" },
 ];
 
 const wrappers = entryFns

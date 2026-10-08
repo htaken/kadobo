@@ -10,6 +10,7 @@ import { createTestHarness } from "wrangler";
 import type { Env } from "../src/index";
 import { handleKadoCorrect } from "../src/handlers/correct";
 import { handleSlashCommand } from "../src/handlers/command";
+import { handleKadoMonthClose } from "../src/handlers/monthClose";
 import { handleStamp, isCardSafeToOverwrite, withStatusBlock } from "../src/handlers/stamp";
 import { handleViewSubmission } from "../src/handlers/view_submission";
 import * as journal from "../src/journal";
@@ -391,6 +392,200 @@ describe("handleKadoCorrect", () => {
 
     const rows = await allJournalRows();
     expect(rows).toHaveLength(0);
+  });
+});
+
+// --- handleKadoMonthClose（実装設計 MF連携 §5.3, §10.1） ---
+
+describe("handleKadoMonthClose", () => {
+  function makeMonthClosePayload(overrides?: Partial<SlackBlockActionsPayload>): SlackBlockActionsPayload {
+    return {
+      type: "block_actions",
+      user: { id: "U1" },
+      channel: { id: "C1" },
+      message: { ts: "1756260000.000100", text: "締め確認", blocks: [] },
+      actions: [],
+      trigger_id: "T1",
+      ...overrides,
+    };
+  }
+  function makeMonthCloseAction(overrides?: Partial<SlackBlockAction>): SlackBlockAction {
+    return {
+      action_id: "kado_month_close",
+      action_ts: "1756260000.999999",
+      value: JSON.stringify({ client: "A社", month: "2026-10", net_amount: 317295 }),
+      text: { type: "plain_text", text: "締めて請求書を作成" },
+      ...overrides,
+    };
+  }
+
+  it("正常な value: journal に month_close/done で記録され、GAS へ転送される。カードは一切書き換えない", async () => {
+    const env = makeEnv(db);
+    const { ctx, flush } = createTestCtx();
+    const { fetchImpl, calls } = createFetchStub((url) => {
+      if (url === env.GAS_URL) {
+        return jsonResponse({ ok: true, applied: true });
+      }
+      return undefined;
+    });
+
+    const res = await handleKadoMonthClose({
+      env,
+      ctx,
+      action: makeMonthCloseAction(),
+      payload: makeMonthClosePayload(),
+      fetchImpl,
+    });
+    expect(res.status).toBe(200);
+    await flush();
+
+    const rows = await allJournalRows();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe("month_close");
+    expect(rows[0].status).toBe("done");
+    const sentPayload = JSON.parse(rows[0].payload);
+    expect(sentPayload).toMatchObject({
+      kind: "month_close",
+      client: "A社",
+      month: "2026-10",
+      shown_net_amount: 317295,
+      channel_id: "C1",
+      message_ts: "1756260000.000100",
+      source: "button",
+    });
+    // Worker はカードを一切書き換えない（chat.update/chat.postMessage を呼ばない）。
+    expect(calls.some((c) => c.url.endsWith("/chat.update"))).toBe(false);
+    expect(calls.some((c) => c.url.endsWith("/chat.postMessage"))).toBe(false);
+  });
+
+  it("value が JSON として不正: ACK のみで journal に何も記録せず、GAS へも送らない", async () => {
+    const env = makeEnv(db);
+    const { ctx, flush } = createTestCtx();
+    const { fetchImpl, calls } = createFetchStub();
+
+    const res = await handleKadoMonthClose({
+      env,
+      ctx,
+      action: makeMonthCloseAction({ value: "{not json" }),
+      payload: makeMonthClosePayload(),
+      fetchImpl,
+    });
+    expect(res.status).toBe(200);
+    await flush();
+
+    expect(await allJournalRows()).toHaveLength(0);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("value の形は正しいが必須フィールドの型が違う: ACK のみで無視する", async () => {
+    const env = makeEnv(db);
+    const { ctx, flush } = createTestCtx();
+    const { fetchImpl, calls } = createFetchStub();
+
+    const res = await handleKadoMonthClose({
+      env,
+      ctx,
+      action: makeMonthCloseAction({ value: JSON.stringify({ client: "A社", month: "2026-10", net_amount: "not-a-number" }) }),
+      payload: makeMonthClosePayload(),
+      fetchImpl,
+    });
+    expect(res.status).toBe(200);
+    await flush();
+
+    expect(await allJournalRows()).toHaveLength(0);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("value が無い（undefined）: ACK のみで無視する", async () => {
+    const env = makeEnv(db);
+    const { ctx, flush } = createTestCtx();
+    const { fetchImpl, calls } = createFetchStub();
+
+    const res = await handleKadoMonthClose({
+      env,
+      ctx,
+      action: makeMonthCloseAction({ value: undefined }),
+      payload: makeMonthClosePayload(),
+      fetchImpl,
+    });
+    expect(res.status).toBe(200);
+    await flush();
+
+    expect(await allJournalRows()).toHaveLength(0);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("重複押下（同じ idempotency_key）: 2 回目は journal 追加なしで即 200", async () => {
+    const env = makeEnv(db);
+    const action = makeMonthCloseAction();
+    const payload = makeMonthClosePayload();
+
+    const first = createTestCtx();
+    const stub1 = createFetchStub((url) => (url === env.GAS_URL ? jsonResponse({ ok: true, applied: true }) : undefined));
+    await handleKadoMonthClose({ env, ctx: first.ctx, action, payload, fetchImpl: stub1.fetchImpl });
+    await first.flush();
+
+    const second = createTestCtx();
+    const stub2 = createFetchStub();
+    const res2 = await handleKadoMonthClose({ env, ctx: second.ctx, action, payload, fetchImpl: stub2.fetchImpl });
+    await second.flush();
+
+    expect(res2.status).toBe(200);
+    expect(stub2.calls).toHaveLength(0);
+    expect(await allJournalRows()).toHaveLength(1);
+  });
+
+  it("GAS: ok:false,retryable:false（rejected）→ journal は rejected、本人へ DM 通知", async () => {
+    const env = makeEnv(db);
+    const { ctx, flush } = createTestCtx();
+    const { fetchImpl, calls } = createFetchStub((url) => {
+      if (url === env.GAS_URL) {
+        return jsonResponse({ ok: false, error: "BAD_REQUEST", retryable: false });
+      }
+      return undefined;
+    });
+
+    await handleKadoMonthClose({ env, ctx, action: makeMonthCloseAction(), payload: makeMonthClosePayload(), fetchImpl });
+    await flush();
+
+    const rows = await allJournalRows();
+    expect(rows[0].status).toBe("rejected");
+    const dm = calls.find((c) => c.url.endsWith("/chat.postMessage") && (c.body as any).channel === "U1");
+    expect(dm).toBeDefined();
+  });
+
+  it("GAS: ok:false,retryable:true → journal は pending・attempts++（Cron 再送に委ねる）", async () => {
+    const env = makeEnv(db);
+    const { ctx, flush } = createTestCtx();
+    const { fetchImpl } = createFetchStub((url) => {
+      if (url === env.GAS_URL) {
+        return jsonResponse({ ok: false, error: "LOCK_TIMEOUT", retryable: true });
+      }
+      return undefined;
+    });
+
+    await handleKadoMonthClose({ env, ctx, action: makeMonthCloseAction(), payload: makeMonthClosePayload(), fetchImpl });
+    await flush();
+
+    const rows = await allJournalRows();
+    expect(rows[0].status).toBe("pending");
+    expect(rows[0].attempts).toBe(1);
+    expect(rows[0].last_error).toBe("LOCK_TIMEOUT");
+  });
+
+  it("forwarding_enabled が無効なら GAS へ送らず pending のまま残す（Cron 再送に委ねる）", async () => {
+    await db.exec("UPDATE settings SET value = '0' WHERE key = 'forwarding_enabled'");
+    const env = makeEnv(db);
+    const { ctx, flush } = createTestCtx();
+    const { fetchImpl, calls } = createFetchStub();
+
+    await handleKadoMonthClose({ env, ctx, action: makeMonthCloseAction(), payload: makeMonthClosePayload(), fetchImpl });
+    await flush();
+
+    const rows = await allJournalRows();
+    expect(rows[0].status).toBe("pending");
+    expect(rows[0].attempts).toBe(0);
+    expect(calls.some((c) => c.url === env.GAS_URL)).toBe(false);
   });
 });
 

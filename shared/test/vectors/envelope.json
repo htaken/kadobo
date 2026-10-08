@@ -44,6 +44,14 @@
       "payload": "",
       "signing_string": "1756260300.10000000000000000000000000000000.",
       "sig": "ee904b626a20960f112fe355fe414b6147536f4adf2b5db602e5dc4e4087a605"
+    },
+    {
+      "name": "month_close",
+      "ts": 1756260400,
+      "nonce": "22223333444455556666777788889999",
+      "payload": "{\"kind\":\"month_close\",\"idempotency_key\":\"U1:1756260000.000100:kado_month_close:1756260130.000100\",\"user_id\":\"U1\",\"channel_id\":\"C1\",\"message_ts\":\"1756260000.000100\",\"client\":\"A社\",\"month\":\"2026-10\",\"shown_net_amount\":317295,\"received_at_ms\":1756260130500,\"source\":\"button\"}",
+      "signing_string": "1756260400.22223333444455556666777788889999.{\"kind\":\"month_close\",\"idempotency_key\":\"U1:1756260000.000100:kado_month_close:1756260130.000100\",\"user_id\":\"U1\",\"channel_id\":\"C1\",\"message_ts\":\"1756260000.000100\",\"client\":\"A社\",\"month\":\"2026-10\",\"shown_net_amount\":317295,\"received_at_ms\":1756260130500,\"source\":\"button\"}",
+      "sig": "0f974df671c6943bc70213a2a15b346fc1ae3edfc494be42159a2e1430292fd0"
     }
   ]
 }

@@ -70,3 +70,29 @@ export function previousMonthOf(dateStr: string): string {
   const m = String(prevMonthLastDay.getUTCMonth() + 1).padStart(2, "0");
   return `${y}-${m}`;
 }
+
+/** `monthStr`（`YYYY-MM`）を暦月単位で `n` か月シフトする（実装設計 MF連携 §5.2）。 */
+export function shiftMonth(monthStr: string, n: number): string {
+  const [yearStr, monthNumStr] = monthStr.split("-");
+  const year = Number(yearStr);
+  const monthNum = Number(monthNumStr);
+  const total = year * 12 + (monthNum - 1) + n;
+  const y = Math.floor(total / 12);
+  const m = (total % 12) + 1;
+  return `${String(y).padStart(4, "0")}-${String(m).padStart(2, "0")}`;
+}
+
+/**
+ * `fromMonth`（含む）から `toMonthExclusive`（含まない）までの月を昇順で列挙する
+ * （実装設計 MF連携 §5.2 `evaluateMonthClose` の対象月列挙）。`YYYY-MM` は辞書式順序で
+ * 暦の順序と一致するため文字列比較でよい。`fromMonth >= toMonthExclusive` なら空配列。
+ */
+export function monthsInRange(fromMonth: string, toMonthExclusive: string): string[] {
+  const result: string[] = [];
+  let cursor = fromMonth;
+  while (cursor < toMonthExclusive) {
+    result.push(cursor);
+    cursor = shiftMonth(cursor, 1);
+  }
+  return result;
+}

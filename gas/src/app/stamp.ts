@@ -6,6 +6,7 @@ import { businessDateOf, formatJst } from "@kadobo/shared/time";
 import type { GasRequest, GasResponse, StampActionId } from "@kadobo/shared/protocol";
 import { resolveBusinessDate } from "../core/businessDate";
 import { applyCorrections } from "../core/correction";
+import { isMonthFrozen } from "../core/monthClose";
 import { isStampEvent, replay, transition, type EventType, type State } from "../core/state";
 import { redrawCardForBusinessDate } from "./cardHelpers";
 import { recomputeDailyAndMonthly } from "./monthly";
@@ -29,6 +30,40 @@ const INVALID_TRANSITION_MESSAGES: Record<State, string> = {
   CLOSED: "本日の記録は確定しています。",
 };
 
+/**
+ * 締めた月への打刻の遅延到着を検出し、DM 通知・内部シート記録を行う（実装設計 MF連携 §5.8）。
+ *
+ * 生ログへの追記・日次再計算はこれまでどおり行う（月次行は `isMonthFrozen` により
+ * `recomputeMonthly` で書かれない）。内部シート `late_stamp/<event_id>` に既に記録済みなら
+ * 何もしない（冪等。この関数自体は呼び出し側で毎回無条件に呼んでも安全）。
+ *
+ * 🔄 レビュー指摘: **新規に生ログを追記した経路（`handleStamp` 手順6.5）からのみ呼ぶこと。**
+ * 重複判定（`findRawLogByIdempotencyKey` が既存行を見つける分岐）から呼んではいけない。
+ * その分岐に来るのは「生ログには既に追記済みの打刻の再送」であり、元の追記が締めより前なら
+ * その打刻は既に締めた金額に含まれている。締め後に再送が届いただけで「遅れて届きました」と
+ * DM するのは誤報になる。
+ */
+function notifyLateStampIfFrozen(ports: AppPorts, userId: string, eventId: string, businessDate: string): void {
+  const client = ports.props.get("CLIENT_DEFAULT") ?? "A社";
+  const month = businessDate.slice(0, 7);
+  const bill = ports.sheets.getMonthlyBill(client, month);
+  if (bill === null || !isMonthFrozen(bill.state)) {
+    return;
+  }
+  if (ports.sheets.getInternalValue("late_stamp", eventId) !== null) {
+    return;
+  }
+  ports.sheets.setInternalValue("late_stamp", eventId, businessDate);
+  try {
+    ports.slack.dm(
+      userId,
+      `⚠️ 締め済みの${month}への打刻が遅れて届きました。差異は翌月調整として扱ってください。`,
+    );
+  } catch {
+    // DM 失敗は握りつぶす（実装設計 §5.6 と同じ「通知はベストエフォート」方針）。
+  }
+}
+
 export function handleStamp(req: StampRequest, ports: AppPorts): GasResponse {
   const nowMs = ports.clock.nowMs();
 
@@ -38,6 +73,11 @@ export function handleStamp(req: StampRequest, ports: AppPorts): GasResponse {
   // Worker への応答が届かなかった」ケースを含む。したがって重複分岐でも初回と同じ
   // 「再計算 → カード再描画」を必ずやり直す（再計算を飛ばすと、日次・月次が欠落したまま
   // D1 だけ done になり、二度と復旧しない）。どちらも冪等なので追記なしで安全に反復できる。
+  //
+  // 🔄 レビュー指摘: この分岐は「生ログには既に追記済みの打刻の再送」であり、元の追記が
+  // 締めより前なら、その打刻は既に締めた金額に含まれている。ここで §5.8 の遅延打刻通知
+  // （`notifyLateStampIfFrozen`）を呼ぶと、締め後に再送が届いただけで「遅れて届きました」と
+  // 誤報することになるため、呼ばない（通知は新規追記した経路＝手順6.5のみで行う）。
   const existing = ports.sheets.findRawLogByIdempotencyKey(req.idempotency_key);
   if (existing !== null) {
     recomputeDailyAndMonthly(existing.business_date, ports);
@@ -101,6 +141,9 @@ export function handleStamp(req: StampRequest, ports: AppPorts): GasResponse {
 
   // 6. 日次・月次再計算 → カード再描画（実装設計 §7.5: 追記後の Slack 更新失敗は applied:true）。
   recomputeDailyAndMonthly(businessDate, ports);
+  // 6.5 締めた月への遅延打刻の通知（実装設計 §5.8）。月次行自体は isMonthFrozen により
+  // recomputeMonthly で書き換わらない。
+  notifyLateStampIfFrozen(ports, req.user_id, row.event_id, businessDate);
   redrawCardForBusinessDate(businessDate, req.channel_id, ports, {
     preferredMessageTs: req.message_ts,
   });

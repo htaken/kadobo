@@ -123,6 +123,20 @@ export function isGasRequest(x: unknown): x is GasRequest {
         isFiniteNum(o.received_at_ms) &&
         (o.source === "modal" || o.source === "retry")
       );
+    // 🔄 実装設計 MF連携 §10.1: 追加を忘れると本番の締めボタン押下が BAD_REQUEST になる
+    // （経費フェーズで `expense_submit` が同じ漏れを起こした。本ファイル冒頭の注記を参照）。
+    case "month_close":
+      return (
+        isStr(o.idempotency_key) &&
+        isStr(o.user_id) &&
+        isStr(o.channel_id) &&
+        isStr(o.message_ts) &&
+        isStr(o.client) &&
+        isStr(o.month) &&
+        isFiniteNum(o.shown_net_amount) &&
+        isFiniteNum(o.received_at_ms) &&
+        (o.source === "button" || o.source === "retry")
+      );
     default:
       return false;
   }
