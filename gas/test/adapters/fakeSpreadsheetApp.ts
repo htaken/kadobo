@@ -150,6 +150,16 @@ export class FakeRange {
     return new FakeTextFinder(this, text);
   }
 
+  /** 実 GAS の `Range#getNumberFormat()`（レンジ左上セルの書式）。診断関数（`diagnoseExpenseRow`）用。 */
+  getNumberFormat(): string {
+    return this.sheet.getFormat(this.row, this.col);
+  }
+
+  /** 実 GAS の `Range#getDataValidation()`（左上セル）。フェイクは `setValidationForTest` で置いたものだけ返す。 */
+  getDataValidation(): FakeDataValidation | null {
+    return this.sheet.getValidation(this.row, this.col);
+  }
+
   /** 実 GAS の `Range#protect()`（`sheet.ts` の経費台帳システム列保護、実装設計 §5.1）。 */
   protect(): FakeProtection {
     return this.sheet.addProtection("RANGE");
@@ -184,6 +194,12 @@ class FakeProtectionImpl implements FakeProtection {
   }
 }
 
+/** `DataValidation` の診断関数が読む 2 メソッドだけのフェイク。 */
+export interface FakeDataValidation {
+  getCriteriaType(): string;
+  getCriteriaValues(): unknown[];
+}
+
 export class FakeSheet {
   readonly name: string;
   private readonly cells = new Map<string, unknown>();
@@ -194,6 +210,7 @@ export class FakeSheet {
   private maxCols: number;
   private readonly protections: FakeProtectionImpl[] = [];
   private readonly hiddenColumns = new Set<number>();
+  private readonly validations = new Map<string, FakeDataValidation>();
   /** `setValues` で書かれたレンジの履歴（「実際に書き込んだ範囲」の検証用）。 */
   readonly writes: { row: number; col: number; numRows: number; numCols: number }[] = [];
   /**
@@ -260,6 +277,15 @@ export class FakeSheet {
     if (col > this.maxCols) {
       this.maxCols = col;
     }
+  }
+
+  /** テスト専用: セルにデータ検証ルールを置く。 */
+  setValidationForTest(row: number, col: number, rule: FakeDataValidation): void {
+    this.validations.set(this.key(row, col), rule);
+  }
+
+  getValidation(row: number, col: number): FakeDataValidation | null {
+    return this.validations.get(this.key(row, col)) ?? null;
   }
 
   getLastRow(): number {

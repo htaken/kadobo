@@ -49,6 +49,7 @@ const entryFns = [
   { name: "mfJournalSpikeS5", args: "" },
   { name: "mfJournalizeSpikeS5b", args: "" },
   { name: "mfTransactionSpikeS4", args: "" },
+  { name: "mfDiagExpenseRow", args: "" },
 ];
 
 const wrappers = entryFns

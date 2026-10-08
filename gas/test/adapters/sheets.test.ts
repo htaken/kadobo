@@ -20,7 +20,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { handleStamp } from "../../src/app/stamp";
 import { toLoggedEvent } from "../../src/app/rawLog";
 import type { AppPorts, ExpenseLedgerRow, MonthlyBillRow } from "../../src/app/ports";
-import { SheetsAdapter, setupSpreadsheet } from "../../src/adapters/sheets";
+import { SheetsAdapter, diagnoseExpenseRow, setupSpreadsheet } from "../../src/adapters/sheets";
 import { applyCorrections } from "../../src/core/correction";
 import { isStampEvent, replay } from "../../src/core/state";
 import {
@@ -1439,5 +1439,42 @@ describe("MF明細ルール シート（setupSpreadsheet と getMfTransactionRul
 
   it("シートが無ければ例外（呼び出し側が通知して ③ を止める）", () => {
     expect(() => new SheetsAdapter(SPREADSHEET_ID).getMfTransactionRules()).toThrow(/sheet_not_found/);
+  });
+});
+
+describe("diagnoseExpenseRow（手動診断 mfDiagExpenseRow の本体。読み取り専用）", () => {
+  it("行が見つかれば、物理列 1〜getLastColumn を 1 列 1 行で出し、payment_method・ヘッダー照合・データ検証も出す", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const adapter = new SheetsAdapter(SPREADSHEET_ID);
+    adapter.appendExpense(makeExpenseRow({ receipt_id: "R-20260916-001", payment_method: "cash" }));
+    const sheet = harness.spreadsheet.getSheetByName(EXPENSE_SHEET) as FakeSheet;
+    sheet.setValidationForTest(2, 25, { getCriteriaType: () => "VALUE_IN_LIST", getCriteriaValues: () => [["cash", "card"], true] });
+    const writesBefore = sheet.writes.length;
+
+    const lines = diagnoseExpenseRow(SPREADSHEET_ID, "R-20260916-001");
+
+    const columnLines = lines.filter((l) => /^\d+ \| /.test(l));
+    expect(columnLines).toHaveLength(sheet.getLastColumn());
+    expect(columnLines[24]).toBe('25 | 支払方法 | "cash" | @ | false');
+    expect(lines.some((l) => l.includes("該当行 = 2 行目"))).toBe(true);
+    expect(lines).toContain("診断: ヘッダー行は EXPENSE_LEDGER_HEADERS と完全一致");
+    expect(lines).toContain('診断: rowToExpense の payment_method = "cash"');
+    expect(lines.some((l) => l.includes("データ検証 25 列目: type=VALUE_IN_LIST"))).toBe(true);
+    expect(sheet.writes).toHaveLength(writesBefore);
+  });
+
+  it("行が見つからなければ、その旨だけ出して終わる。ヘッダーの違いは位置つきで出す", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const sheet = harness.spreadsheet.getSheetByName(EXPENSE_SHEET) as FakeSheet;
+    sheet.setCell(1, 25, "別の見出し");
+
+    const lines = diagnoseExpenseRow(SPREADSHEET_ID, "R-NOPE");
+
+    expect(lines.some((l) => l.includes("完全一致する行は見つかりません"))).toBe(true);
+    expect(lines.some((l) => l.includes("該当行"))).toBe(false);
+
+    new SheetsAdapter(SPREADSHEET_ID).appendExpense(makeExpenseRow({ receipt_id: "R-1" }));
+    const found = diagnoseExpenseRow(SPREADSHEET_ID, "R-1");
+    expect(found.some((l) => l.includes("違う位置 1 件") && l.includes("25 列目"))).toBe(true);
   });
 });

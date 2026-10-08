@@ -863,6 +863,76 @@ const MONTHLY_COLUMN_INDEX: Record<keyof MonthlyBillRow, number> = {
   close_card_ts: 18,
 };
 
+/**
+ * 手動実行用の診断（読み取り専用）: 経費台帳で 1 列目が `receiptId` に完全一致する行を探し、シートの物理的な
+ * 列 1〜`getLastColumn()` をすべて 1 列 1 行で並べた診断行（Logger に出す文字列）を返す。
+ * 「コード上は 31 列目まで書いているのに支払方法（25 列目）が空に見える」現象の切り分け用。
+ * 書込みは一切しない。トークン類は扱わない。
+ */
+export function diagnoseExpenseRow(spreadsheetId: string, receiptId: string): string[] {
+  const sheet = SpreadsheetApp.openById(spreadsheetId).getSheetByName(SHEET_NAMES.expenseLedger);
+  if (sheet === null) {
+    return [`診断: シート「${SHEET_NAMES.expenseLedger}」が見つかりません`];
+  }
+  const lines: string[] = [];
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  lines.push(`診断: receipt_id=${receiptId} getLastRow=${lastRow} getLastColumn=${lastCol} getMaxColumns=${sheet.getMaxColumns()} EXPENSE_LEDGER_HEADERS.length=${EXPENSE_LEDGER_HEADERS.length}`);
+
+  const ids = lastRow >= 2 ? sheet.getRange(2, 1, lastRow - 1, 1).getValues() : [];
+  const idx = ids.findIndex((r) => str(r[0]) === receiptId);
+  if (idx === -1) {
+    lines.push(`診断: 1 列目が ${receiptId} に完全一致する行は見つかりません（データ行 ${ids.length} 件を走査）`);
+    return lines;
+  }
+  const rowIndex = idx + 2;
+  lines.push(`診断: 該当行 = ${rowIndex} 行目`);
+
+  const headerRow = (lastCol >= 1 ? sheet.getRange(1, 1, 1, lastCol).getValues()[0] : []) ?? [];
+  const valueRow = (lastCol >= 1 ? sheet.getRange(rowIndex, 1, 1, lastCol).getValues()[0] : []) ?? [];
+
+  lines.push("診断: 列番号 | ヘッダー | セルの値(JSON) | 表示書式 | 非表示か(isColumnHiddenByUser)");
+  for (let col = 1; col <= lastCol; col++) {
+    const cell = sheet.getRange(rowIndex, col, 1, 1);
+    lines.push(
+      `${col} | ${str(headerRow[col - 1])} | ${JSON.stringify(valueRow[col - 1] ?? null)} | ${cell.getNumberFormat()} | ${sheet.isColumnHiddenByUser(col)}`,
+    );
+  }
+
+  const mismatches: string[] = [];
+  const compareLen = Math.max(lastCol, EXPENSE_LEDGER_HEADERS.length);
+  for (let i = 0; i < compareLen; i++) {
+    const expected = EXPENSE_LEDGER_HEADERS[i] ?? "(なし)";
+    const actual = i < lastCol ? str(headerRow[i]) : "(列なし)";
+    if (expected !== actual) {
+      mismatches.push(`${i + 1} 列目: 期待=${JSON.stringify(expected)} 実際=${JSON.stringify(actual)}`);
+    }
+  }
+  lines.push(
+    mismatches.length === 0
+      ? "診断: ヘッダー行は EXPENSE_LEDGER_HEADERS と完全一致"
+      : `診断: ヘッダー行が EXPENSE_LEDGER_HEADERS と違う位置 ${mismatches.length} 件: ${mismatches.join(" / ")}`,
+  );
+
+  const padded: unknown[] = Array.from({ length: Math.max(lastCol, EXPENSE_LEDGER_HEADERS.length) }, (_, i) => valueRow[i] ?? "");
+  lines.push(`診断: rowToExpense の payment_method = ${JSON.stringify(rowToExpense(padded).payment_method)}`);
+
+  let validationCount = 0;
+  for (let col = 1; col <= lastCol; col++) {
+    const rule = sheet.getRange(rowIndex, col, 1, 1).getDataValidation();
+    if (rule !== null) {
+      validationCount++;
+      lines.push(
+        `診断: データ検証 ${col} 列目: type=${String(rule.getCriteriaType())} values=${JSON.stringify(rule.getCriteriaValues())}`,
+      );
+    }
+  }
+  if (validationCount === 0) {
+    lines.push("診断: データ検証ルールがあるセルはありません");
+  }
+  return lines;
+}
+
 export class SheetsAdapter implements SheetsPort {
   private readonly spreadsheetId: string;
   private spreadsheet: GoogleAppsScript.Spreadsheet.Spreadsheet | null = null;

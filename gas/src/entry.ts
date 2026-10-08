@@ -48,7 +48,7 @@ import { PropsAdapter } from "./adapters/props";
 import { RandomAdapter } from "./adapters/random";
 import { SchedulerAdapter } from "./adapters/scheduler";
 import { SecretStoreAdapter } from "./adapters/secretStore";
-import { SheetsAdapter, setupSpreadsheet as setupSpreadsheetImpl } from "./adapters/sheets";
+import { SheetsAdapter, diagnoseExpenseRow, setupSpreadsheet as setupSpreadsheetImpl } from "./adapters/sheets";
 import { SlackAdapter } from "./adapters/slack";
 import { SlackFilesAdapter } from "./adapters/slackFiles";
 import { installTriggers as installTriggersImpl } from "./adapters/triggers";
@@ -234,4 +234,23 @@ export function mfTransactionSpikeS4(): void {
  */
 export function mfJournalizeSpikeS5b(): void {
   runJournalizeSpikeS5b(buildPorts(), (line) => Logger.log(line));
+}
+
+/**
+ * 手動実行: 経費台帳の 1 行の診断（読み取り専用）。Script Property `MF_DIAG_RECEIPT_ID`（例 `R-20260916-001`）の行を
+ * 1 列目の完全一致で探し、シートの物理的な列 1〜`getLastColumn()` のヘッダー・セルの値・表示書式・非表示か、
+ * `getMaxColumns()`・ヘッダー照合・`rowToExpense` の `payment_method`・データ検証ルールを Logger に出す。
+ * 書込みは一切しない。**トークンは扱わない**。
+ */
+export function mfDiagExpenseRow(): void {
+  const props = new PropsAdapter();
+  const receiptId = props.get("MF_DIAG_RECEIPT_ID");
+  if (receiptId === null || receiptId === "") {
+    Logger.log("Script Property MF_DIAG_RECEIPT_ID（例 R-20260916-001）を設定してから実行してください。");
+    return;
+  }
+  const spreadsheetId = props.get("SPREADSHEET_ID") ?? "";
+  for (const line of diagnoseExpenseRow(spreadsheetId, receiptId)) {
+    Logger.log(line);
+  }
 }
