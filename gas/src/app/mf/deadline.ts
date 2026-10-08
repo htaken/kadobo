@@ -36,3 +36,16 @@ export class RunDeadlineExceededError extends Error {
     this.name = "RunDeadlineExceededError";
   }
 }
+
+/**
+ * 検索（ページ取得）が上限ページ数に達しても、まだ残りのページがある（結果が全件でない）ことを表す。
+ * 期限切れ（{@link RunDeadlineExceededError}）と同じく、**途中までの結果を返さず例外にする**
+ * （一部だけを全件と読むと、候補が複数なのに一対一と判断する・見つかるはずの仕訳を「無い」と読む等の誤判定になる。
+ * レビュー M3）。期限切れと違って次回も同じ結果になりうるので、呼び出し側は運用者に知らせる。
+ */
+export class SearchIncompleteError extends Error {
+  constructor(readonly what: string) {
+    super(`MF_SEARCH_INCOMPLETE:${what}`);
+    this.name = "SearchIncompleteError";
+  }
+}

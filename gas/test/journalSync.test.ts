@@ -19,6 +19,8 @@ import {
   buildVoidRemark,
   buildVoidTags,
   canTransition,
+  cancellationRoute,
+  journalMatchesUpdate,
   classifyTransaction,
   debitAccountNameOf,
   decideSyncTarget,
@@ -837,5 +839,105 @@ describe("planLinkedCancellation（§6.7 🔄・§6.5）", () => {
     const last = ledger("R-NEW2", { correction_of_receipt_id: "R-NEW", mf_sync_state: "" });
     expect(planLinkedCancellation(old(), [old(), mid, last], START)).toEqual({ kind: "inherit", successor: "R-NEW2" });
     expect(planLinkedCancellation(old(), [old(), mid], START)).toEqual({ kind: "wait" });
+  });
+});
+
+
+describe("cancellationRoute（取消方法は作成経路で決める。レビュー B2）", () => {
+  const r = (o: Partial<LedgerRowView>) => cancellationRoute(ledger("R-1", { mf_sync_state: "SYNCED", ...o }));
+
+  it("要約あり: 連携で作った（作成時 linked_*・明細 ID あり）行は、現在の支払方法・MF明細ID が一致すれば put", () => {
+    expect(r({ mf_sync_input: "1200|2026-10-10|消耗品費|linked_card|t1", mf_transaction_id: "t%31" }).route).toBe("put");
+    expect(r({ mf_sync_input: "1200|2026-10-10|消耗品費|linked_bank|t1", mf_transaction_id: "t1", payment_method: "linked_bank" }).route).toBe("put");
+  });
+
+  it("要約あり: 現金で作った（作成時 cash・明細 ID なし）行は、現在も cash で MF明細ID なしなら delete", () => {
+    expect(r({ mf_sync_input: "1200|2026-10-10|消耗品費|cash|", payment_method: "cash" }).route).toBe("delete");
+  });
+
+  it("矛盾は unknown: 連携で作ったのに cash に変更・MF明細ID が変わった／空、現金で作ったのに linked_* に変更・MF明細ID あり", () => {
+    expect(r({ mf_sync_input: "1|2026-10-10|消耗品費|linked_card|t1", payment_method: "cash", mf_transaction_id: "t1" }).route).toBe("unknown");
+    expect(r({ mf_sync_input: "1|2026-10-10|消耗品費|linked_card|t1", mf_transaction_id: "t2" }).route).toBe("unknown");
+    expect(r({ mf_sync_input: "1|2026-10-10|消耗品費|linked_card|t1", mf_transaction_id: null }).route).toBe("unknown");
+    expect(r({ mf_sync_input: "1|2026-10-10|消耗品費|linked_card|t1", payment_method: "linked_bank", mf_transaction_id: "t1" }).route).toBe("unknown");
+    expect(r({ mf_sync_input: "1|2026-10-10|消耗品費|cash|", payment_method: "linked_card", mf_transaction_id: null }).route).toBe("unknown");
+    expect(r({ mf_sync_input: "1|2026-10-10|消耗品費|cash|", payment_method: "cash", mf_transaction_id: "t1" }).route).toBe("unknown");
+    expect(r({ mf_sync_input: "壊れた要約" }).route).toBe("unknown");
+    const u = r({ mf_sync_input: "1|2026-10-10|消耗品費|linked_card|t1", payment_method: "cash", mf_transaction_id: "t1" });
+    expect(u.route === "unknown" && u.reason).toContain("linked_card");
+  });
+
+  it("要約が空（手で状態や MF仕訳ID を書いた行）は現在の列だけで見る: linked_* かつ MF明細ID あり → put、cash かつ MF明細ID なし → delete、それ以外は unknown", () => {
+    expect(r({ mf_sync_input: "", mf_transaction_id: "t1" }).route).toBe("put");
+    expect(r({ mf_sync_input: "", payment_method: "cash", mf_transaction_id: null }).route).toBe("delete");
+    expect(r({ mf_sync_input: "", payment_method: "cash", mf_transaction_id: "t1" }).route).toBe("unknown");
+    expect(r({ mf_sync_input: "", payment_method: "linked_card", mf_transaction_id: null }).route).toBe("unknown");
+    expect(r({ mf_sync_input: "", payment_method: "", mf_transaction_id: null }).route).toBe("unknown");
+  });
+
+  it("祖先の引継ぎ待ちは作成経路で判定する: 親の経路が unknown なら待たせない", () => {
+    const parent = ledger("R-OLD", { mf_sync_state: "SYNCED", mf_transaction_id: "t0", mf_sync_input: "1|2026-10-10|消耗品費|linked_card|t0" });
+    const child = ledger("R-NEW", { correction_of_receipt_id: "R-OLD" });
+    expect(holdsJournalAncestor(child, indexLedgerRows([parent, child]))).toBe(true);
+    const changed = { ...parent, payment_method: "cash" as const };
+    expect(holdsJournalAncestor(child, indexLedgerRows([changed, child]))).toBe(false);
+  });
+});
+
+describe("planLinkedCancellation: 引継ぎの途中で止まった新しい行（recover。レビュー B1）", () => {
+  const old = (): LedgerRowView => ledger("R-OLD", { state: "CORRECTED", mf_sync_state: "SYNCED", mf_journal_id: "j1", mf_transaction_id: "t1" });
+  const neu = (o: Partial<LedgerRowView>): LedgerRowView => ledger("R-NEW", { correction_of_receipt_id: "R-OLD", ...o });
+
+  it("同じ仕訳 ID を持つが未確定（状態が空・WAITING_TRANSACTION）の新しい行 → void にせず recover", () => {
+    for (const st of ["", "WAITING_TRANSACTION"] as const) {
+      expect(planLinkedCancellation(old(), [old(), neu({ mf_sync_state: st, mf_journal_id: "j1" })], START)).toEqual({
+        kind: "recover",
+        successor: "R-NEW",
+      });
+    }
+    // 金額・支払方法が違っていても、同じ仕訳 ID を持つ行があれば void にしない。
+    expect(planLinkedCancellation(old(), [old(), neu({ mf_sync_state: "", mf_journal_id: "j1", amount: 9 })], START).kind).toBe("recover");
+  });
+
+  it("同じ仕訳 ID を持つ行が SYNCED なら done（登録中・エラー等の他の子孫より優先）", () => {
+    expect(planLinkedCancellation(old(), [old(), neu({ mf_sync_state: "SYNCED", mf_journal_id: "j1" })], START).kind).toBe("done");
+    const err = ledger("R-ERR", { correction_of_receipt_id: "R-OLD", state: "ERROR", mf_sync_state: "" });
+    expect(planLinkedCancellation(old(), [old(), err, neu({ mf_sync_state: "SYNCED", mf_journal_id: "j1" })], START).kind).toBe("done");
+  });
+
+  it("同じ仕訳 ID を持つ行が想定外の状態（NEEDS_REVIEW 等）なら、勝手に void せず wait", () => {
+    expect(planLinkedCancellation(old(), [old(), neu({ mf_sync_state: "NEEDS_REVIEW", mf_journal_id: "j1" })], START)).toEqual({ kind: "wait" });
+  });
+});
+
+describe("journalMatchesUpdate", () => {
+  const existing = {
+    transaction_date: "2026-10-10",
+    memo: "m",
+    tags: ["R-NEW"],
+    branches: [
+      { remark: "R-NEW 店", debitor: { account_id: "d", value: 5 }, creditor: { account_id: "c", value: 5 } },
+    ],
+  };
+  const body = (o: Partial<{ remark: string; tags: string[]; memo: string | undefined; debit: string }> = {}) => {
+    const r = buildJournalUpdateBody(existing, {
+      debitAccountId: o.debit ?? "d",
+      remark: o.remark ?? "R-NEW 店",
+      tags: o.tags ?? ["R-NEW"],
+      memo: "memo" in o ? o.memo : "m",
+    });
+    if (!r.ok) {
+      throw new Error("build failed");
+    }
+    return r.body;
+  };
+
+  it("取引日・借方・貸方・摘要・タグ・メモがすべて同じなら true。どれかが違えば false", () => {
+    expect(journalMatchesUpdate(existing, body())).toBe(true);
+    expect(journalMatchesUpdate(existing, body({ remark: "別" }))).toBe(false);
+    expect(journalMatchesUpdate(existing, body({ tags: ["R-NEW", "x"] }))).toBe(false);
+    expect(journalMatchesUpdate(existing, body({ debit: "other" }))).toBe(false);
+    expect(journalMatchesUpdate(existing, body({ memo: undefined }))).toBe(false);
+    expect(journalMatchesUpdate({ ...existing, memo: "" }, body({ memo: undefined }))).toBe(true);
   });
 });

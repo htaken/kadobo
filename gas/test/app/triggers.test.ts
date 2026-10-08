@@ -964,4 +964,20 @@ describe("③ 連携明細の照合・週次報告（WP-M5。実装設計 MF連�
     expect(text).toContain("未登録の支出");
     expect(text).toContain("未登録の店");
   });
+
+  it("trigWeeklyOrphanCheck は開始時刻基準の共通期限を週次報告に渡す: 途中で 4 分を過ぎたら未完了と明記し、部分結果を出さない（レビュー M2）", () => {
+    const { ports, api } = matchPorts();
+    api.plantTransaction({ date: "2026-11-01", value: 3300, content: "未登録の店" });
+    ports.sheets.mfRules = [];
+    api.onRequest = () => {
+      ports.clock.currentMs += 5 * 60 * 1000; // 最初の MF 呼び出しで期限（4 分）を過ぎる
+    };
+
+    trigWeeklyOrphanCheck(ports);
+
+    const text = ports.slack.posted.map((p) => p.text).join("\n");
+    expect(text).toContain("週次報告が未完了です");
+    expect(text).toContain("未登録の支出の確認: 実行時間の期限");
+    expect(text).not.toContain("未登録の店");
+  });
 });

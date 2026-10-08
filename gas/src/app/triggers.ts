@@ -318,6 +318,8 @@ function formatElapsed(ms: number): string {
  * （§5.2）を更新する。
  */
 export function trigWeeklyOrphanCheck(ports: AppPorts): void {
+  // 週次報告の MF 部分に渡す、このトリガーの開始を基準にした共通の期限（実装設計 §6.8。レビュー M2）。
+  const deadline = new RunDeadline(ports.clock);
   const channelId = ports.props.get("SLACK_CHANNEL_ID");
   if (channelId === null) {
     return;
@@ -413,7 +415,7 @@ export function trigWeeklyOrphanCheck(ports: AppPorts): void {
   );
   resetIfAllCalledStepsSucceeded(ports, "invoice", [keepalive]);
   const journalReport = runMfStep(ports, calls, "journal", "trigWeeklyOrphanCheck: weeklyJournalReport", () =>
-    weeklyJournalReport(counted),
+    weeklyJournalReport(counted, deadline),
   );
   resetIfAllCalledStepsSucceeded(ports, "journal", [journalReport]);
 }

@@ -123,6 +123,14 @@ export class FakeMfAccounting {
   putBodies: { id: string; body: Record<string, unknown> }[] = [];
   putMode: PutMode = "ok";
   putModeRemaining = Infinity;
+  /** `true` にすると、仕訳済みの明細への 2 回目の `journalize` も 201 で二重に作る（実機で二重作成される場合の再現）。 */
+  allowDuplicateJournalize = false;
+  /** PUT 成功後に、保存された仕訳を書き換えるフック（実機が貸方・明細の紐付きを変える場合の再現）。 */
+  putMutate: ((j: FakeJournal) => void) | null = null;
+  /** `GET /transactions` の `metadata.total_pages` を実件数と無関係に固定する（ページ数の上限の再現）。 */
+  transactionsTotalPagesOverride: number | null = null;
+  /** `GET /journals` の `metadata.total_pages` を実件数と無関係に固定する（ページ数の上限の再現）。 */
+  journalsTotalPagesOverride: number | null = null;
   private seq = 0;
   private txSeq = 0;
 
@@ -260,7 +268,7 @@ export class FakeMfAccounting {
               j.transaction_date <= end &&
               (txIds.length === 0 || (j.transaction_id !== undefined && txIds.some((q) => sameId(q, j.transaction_id as string)))),
           );
-      const totalPages = Math.max(1, Math.ceil(all.length / perPage));
+      const totalPages = this.journalsTotalPagesOverride ?? Math.max(1, Math.ceil(all.length / perPage));
       const slice = all.slice((page - 1) * perPage, page * perPage).map((j) => this.toResponseJournal(j));
       return json(200, { journals: slice, metadata: { total_count: all.length, total_pages: totalPages } });
     }
@@ -294,7 +302,7 @@ export class FakeMfAccounting {
             (statuses.length === 0 || statuses.includes(t.journalizing_status)),
         )
         .sort((a, b) => (query.get("order") === "asc" ? (a.date < b.date ? -1 : 1) : a.date < b.date ? 1 : -1));
-      const totalPages = Math.max(1, Math.ceil(all.length / perPage));
+      const totalPages = this.transactionsTotalPagesOverride ?? Math.max(1, Math.ceil(all.length / perPage));
       const slice = all.slice((page - 1) * perPage, page * perPage).map((t) => ({
         ...t,
         memo: null,
@@ -317,7 +325,7 @@ export class FakeMfAccounting {
         return { status: 500, headers: {}, body: "" };
       }
       const tx = this.transactions.find((t) => typeof body.transaction_id === "string" && sameId(decodeURIComponent(body.transaction_id), t.id));
-      if (tx === undefined || tx.journalizing_status !== "none") {
+      if (tx === undefined || (tx.journalizing_status !== "none" && !this.allowDuplicateJournalize)) {
         return json(400, { errors: [{ code: "invalid_request_body", message: "transaction is not journalizable" }] });
       }
       if (typeof body.account_id !== "string" || !ACCOUNT_NAMES.some((n) => accountIdOf(n) === body.account_id)) {
@@ -416,6 +424,7 @@ export class FakeMfAccounting {
           memo: typeof jr.memo === "string" ? jr.memo : "",
           branches,
         };
+        this.putMutate?.(this.journals[idx] as FakeJournal);
         if (mode === "applied_but_500") {
           return { status: 500, headers: {}, body: "" };
         }

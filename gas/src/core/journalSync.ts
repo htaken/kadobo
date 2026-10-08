@@ -568,6 +568,8 @@ export interface MfTransactionRule {
   account: string;
   /** `有効` 列が TRUE か。 */
   enabled: boolean;
+  /** シート上の実際の行番号（1 始まり。ヘッダーが 1 行目）。週次報告の「n 行目」に使う。無ければ省略。 */
+  row?: number;
 }
 
 /** ルールの構造上の不備（空なら使える形）。`有効` は見ない。 */
@@ -675,6 +677,66 @@ export function usedTransactionKeys(rows: readonly LedgerRowView[], exceptReceip
 
 const MAX_CORRECTION_DEPTH = 10;
 
+export type CancelRoute = { route: "put" } | { route: "delete" } | { route: "unknown"; reason: string };
+
+/**
+ * 取消（`CORRECTED`/`VOID`）で仕訳を **PUT で書き換える**（連携明細から作った仕訳）か **DELETE する**（現金・立替）かを、
+ * **作成経路**で決める（レビュー B2）。現在の `支払方法` だけでは決めない（人が支払方法を変えると、連携仕訳を
+ * DELETE して明細が対象外になったり、現金仕訳を PUT したりするため）。
+ *
+ * 作成経路は `mf_sync_input`（`金額|日付|カテゴリ|支払方法|明細ID`。kadobo が仕訳を作る・取り込むときに保存）の
+ * 支払方法と明細 ID、現在の `MF明細ID`・`支払方法` で判定する:
+ * - 連携（`put`）: 作成時の支払方法が `linked_*`、明細 ID があり、現在の `MF明細ID`・`支払方法` と一致
+ * - 現金（`delete`）: 作成時の支払方法が `cash`、明細 ID が無く、現在も `cash` で `MF明細ID` が無い
+ * - 要約が空（手で状態や `MF仕訳ID` を書いた行）は現在の列だけで見る: `linked_*` かつ `MF明細ID` あり → `put`、
+ *   `cash` かつ `MF明細ID` なし → `delete`
+ * - それ以外（明細 ID があるのに `cash`、`cash` で作ったのに `linked_*`、`linked_*` なのに明細 ID なし 等）は
+ *   `unknown`（自動では消さず、人の確認に回す）
+ */
+export function cancellationRoute(
+  row: Pick<SyncRowView, "payment_method" | "mf_transaction_id" | "mf_sync_input">,
+): CancelRoute {
+  const curTx = hasText(row.mf_transaction_id) ? row.mf_transaction_id : null;
+  const method = row.payment_method;
+  const input = row.mf_sync_input;
+  if (input === "") {
+    if (serviceKindOf(method) !== null && curTx !== null) {
+      return { route: "put" };
+    }
+    if (method === "cash" && curTx === null) {
+      return { route: "delete" };
+    }
+    return {
+      route: "unknown",
+      reason:
+        method === "cash"
+          ? "現金・立替の支払方法ですが MF明細ID があります"
+          : "連携の支払方法ですが、MF明細ID がなく、連携明細から作った仕訳か判定できません",
+    };
+  }
+  const inputMethod = input.split("|")[3] ?? "";
+  const inputTx = inputTransactionId(input);
+  if (inputMethod === "linked_card" || inputMethod === "linked_bank") {
+    if (inputTx !== null && curTx !== null && transactionKey(inputTx) === transactionKey(curTx) && method === inputMethod) {
+      return { route: "put" };
+    }
+    return {
+      route: "unknown",
+      reason: `連携明細から作った仕訳（作成時 ${inputMethod}）ですが、現在の支払方法は ${method === "" ? "空" : method}、MF明細ID は ${curTx === null ? "空" : "作成時と異なる値"} です`,
+    };
+  }
+  if (inputMethod === "cash") {
+    if (inputTx === null && curTx === null && method === "cash") {
+      return { route: "delete" };
+    }
+    return {
+      route: "unknown",
+      reason: `現金・立替として作った仕訳ですが、現在の支払方法は ${method === "" ? "空" : method}、MF明細ID は ${curTx === null ? "空" : "あり"} です`,
+    };
+  }
+  return { route: "unknown", reason: "作成時の支払方法を判定できません（MF連携入力が想定外の形です）" };
+}
+
 /**
  * 訂正元をたどって、連携明細の仕訳を持つ（作成中・反映済み・取消中）行があるか。ある間は、訂正後の新しい行を
  * 通常の照合に出さない（旧仕訳を PUT で引き継ぐ。実装設計 §6.5 🔄）。
@@ -688,7 +750,7 @@ export function holdsJournalAncestor(row: LedgerRowView, byId: ReadonlyMap<strin
       return false;
     }
     if (
-      serviceKindOf(parent.payment_method) !== null &&
+      cancellationRoute(parent).route === "put" &&
       (parent.mf_sync_state === "JOURNALIZING" || parent.mf_sync_state === "SYNCED" || parent.mf_sync_state === "REVERSING")
     ) {
       return true;
@@ -956,6 +1018,32 @@ export function buildJournalUpdateBody(
   return { ok: true, body: { journal } };
 }
 
+/**
+ * 既存の仕訳が、`PUT` で送ろうとする本文と同じ内容か（引継ぎ復旧で、PUT が既に反映済みかを見る。レビュー B1）。
+ * 取引日・借方の科目と金額・貸方の科目と金額・摘要・タグ・メモを比べる。
+ */
+export function journalMatchesUpdate(existing: Record<string, unknown>, body: JournalUpdateBody): boolean {
+  const single = singleBranchOf(existing);
+  const want = body.journal.branches[0];
+  const branch = Array.isArray(existing.branches) ? (existing.branches[0] as Record<string, unknown> | undefined) : undefined;
+  if (single === null || want === undefined || branch === undefined) {
+    return false;
+  }
+  const tags = Array.isArray(existing.tags) ? existing.tags : [];
+  const memo = typeof existing.memo === "string" ? existing.memo : "";
+  return (
+    stringOf(existing.transaction_date) === body.journal.transaction_date &&
+    single.debitor.account_id === want.debitor.account_id &&
+    single.debitValue === want.debitor.value &&
+    single.creditor.account_id === want.creditor.account_id &&
+    single.creditValue === want.creditor.value &&
+    (typeof branch.remark === "string" ? branch.remark : "") === want.remark &&
+    tags.length === body.journal.tags.length &&
+    tags.every((t, i) => t === body.journal.tags[i]) &&
+    memo === (body.journal.memo ?? "")
+  );
+}
+
 // ---- 訂正・取消の引継ぎ計画（§6.7 🔄・§6.5） --------------------------------------
 
 export type CancelPlan =
@@ -965,8 +1053,13 @@ export type CancelPlan =
   | { kind: "void" }
   /** 新しい行 `successor` の内容で同じ仕訳を更新して引き継ぐ。 */
   | { kind: "inherit"; successor: string }
-  /** `successor` が既にこの仕訳を持っている（引継ぎ済み。旧行を `REVERSED` にするだけ）。 */
-  | { kind: "done"; successor: string };
+  /** `successor` が既にこの仕訳を持っている（引継ぎ済み。不足セルを補って旧行を `REVERSED` にする）。 */
+  | { kind: "done"; successor: string }
+  /**
+   * `successor` が同じ仕訳 ID を持つが確定していない（引継ぎの途中でセル書込みが失敗した。レビュー B1）。
+   * `void` にせず、MF の仕訳を新しい行の内容と照合して必要なら PUT をやり直し、不足セルを補って完了する。
+   */
+  | { kind: "recover"; successor: string };
 
 /** `row` を訂正元とする行（子孫まで）。深さは {@link MAX_CORRECTION_DEPTH} まで。 */
 function descendantsOf(row: LedgerRowView, rows: readonly LedgerRowView[]): LedgerRowView[] {
@@ -1008,18 +1101,22 @@ export function planLinkedCancellation(
   if (desc.length === 0) {
     return { kind: "wait" };
   }
+  // 同じ仕訳 ID を持つ子孫が最優先（引継ぎ済み、または途中で止まった引継ぎの復旧。`void` にしない）。
+  const holder = hasText(row.mf_journal_id) ? desc.find((d) => d.mf_journal_id === row.mf_journal_id) : undefined;
+  if (holder !== undefined) {
+    if (holder.mf_sync_state === "SYNCED") {
+      return { kind: "done", successor: holder.receipt_id };
+    }
+    return holder.state === "COMPLETED" && (holder.mf_sync_state === "" || holder.mf_sync_state === "WAITING_TRANSACTION")
+      ? { kind: "recover", successor: holder.receipt_id }
+      : { kind: "wait" };
+  }
   if (desc.some((d) => d.state === "RECEIVED" || d.state === "FILE_SAVED" || d.state === "ERROR")) {
     return { kind: "wait" };
   }
   // 訂正済み（CORRECTED）で、さらに訂正後の行がまだ無い行があれば、その登録を待つ。
   if (desc.some((d) => d.state === "CORRECTED" && !desc.some((c) => c.correction_of_receipt_id === d.receipt_id))) {
     return { kind: "wait" };
-  }
-  const done = desc.find(
-    (d) => hasText(row.mf_journal_id) && d.mf_journal_id === row.mf_journal_id && d.mf_sync_state === "SYNCED",
-  );
-  if (done !== undefined) {
-    return { kind: "done", successor: done.receipt_id };
   }
   const live = desc.filter((d) => d.state === "COMPLETED").sort((a, b) => b.input_at - a.input_at);
   if (live.length === 0) {

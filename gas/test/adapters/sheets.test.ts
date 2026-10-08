@@ -1425,7 +1425,10 @@ describe("MF明細ルール シート（setupSpreadsheet と getMfTransactionRul
       action: "私用として仕訳",
       account: "事業主貸",
       enabled: true,
+      row: 2,
     });
+    // シート上の実際の行番号を保持する（空行 4 行目を除いても、後ろの行の番号がずれない）。
+    expect(rules.map((r) => r.row)).toEqual([2, 3, 5, 6, 7, 8]);
     expect(rules[1]).toMatchObject({ target: "bank", amount: null, action: "無視", enabled: true });
     expect(rules[2]).toMatchObject({ content: "", enabled: true });
     expect(rules[3]).toMatchObject({ amount: 1500, enabled: false });

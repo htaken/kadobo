@@ -1151,12 +1151,13 @@ export class SheetsAdapter implements SheetsPort {
 
   getMfTransactionRules(): MfTransactionRule[] {
     const rules: MfTransactionRule[] = [];
-    for (const r of this.dataRows(SHEET_NAMES.mfRules)) {
+    this.dataRows(SHEET_NAMES.mfRules).forEach((r, i) => {
       if (r.every((c) => str(c).trim() === "")) {
-        continue;
+        return;
       }
-      rules.push(rowToMfRule(r));
-    }
+      // シート上の実際の行番号（ヘッダーが 1 行目。空行を除いてもずれない）。
+      rules.push({ ...rowToMfRule(r), row: i + 2 });
+    });
     return rules;
   }
 }

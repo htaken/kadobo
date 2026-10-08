@@ -52,6 +52,7 @@ import {
   buildVoidRemark,
   buildVoidTags,
   canTransition,
+  cancellationRoute,
   classifyTransaction,
   creationDateFromInput,
   debitAccountNameOf,
@@ -70,6 +71,7 @@ import {
   isRuleUsable,
   isWaitingForTransaction,
   journalHasTag,
+  journalMatchesUpdate,
   journalIdOf,
   matchTransactions,
   parseTransactions,
@@ -89,7 +91,7 @@ import {
   type ServiceKind,
 } from "../core/journalSync";
 import { makeMfAccountingClient, pathWithId, type MfAccountingClient, type MfQueryValue } from "./mf/accountingClient";
-import { MF_RUN_DEADLINE_MS, RunDeadline, RunDeadlineExceededError } from "./mf/deadline";
+import { MF_RUN_DEADLINE_MS, RunDeadline, RunDeadlineExceededError, SearchIncompleteError } from "./mf/deadline";
 import { MfApiError, MfOutcomeUnknownError, isMfNotFound } from "./mf/errors";
 import { isJournalEnabled, isMatchEnabled, isMfEnabled } from "./mf/flags";
 import { withLease } from "./mf/lease";
@@ -134,6 +136,8 @@ export const MF_RULE_LOOKBACK_DAYS = 45;
 const FETCH_DAYS_BEFORE_ROW = 3;
 /** 未登録の支出として報告する経過日数（実装設計 §6.6）。 */
 const UNREGISTERED_AFTER_DAYS = 7;
+/** 週次報告で連携明細を取得する日数（実行時間の上限を超えないため。レビュー M2）。 */
+const WEEKLY_FETCH_DAYS = 90;
 
 // ---------------------------------------------------------------------------
 // 共通ヘルパ
@@ -317,6 +321,7 @@ export function findJournalsByTag(
   deadline?: RunDeadline,
 ): Record<string, unknown>[] {
   const matched: Record<string, unknown>[] = [];
+  let complete = false;
   for (let page = 1; page <= SEARCH_MAX_PAGES; page++) {
     // 期限切れ: 途中までの結果を「見つからなかった」と読むと二重作成になるので、結果を返さず例外にする。
     if (deadline?.isExpired() === true) {
@@ -336,8 +341,13 @@ export function findJournalsByTag(
     }
     const totalPages = totalPagesOf(res);
     if (totalPages !== null ? page >= totalPages : list.length < SEARCH_PER_PAGE) {
+      complete = true;
       break;
     }
+  }
+  // 上限ページ数に達しても残りがある: 一部だけを見て「見つからなかった」と読まないよう、結果を返さない（レビュー M3）。
+  if (!complete) {
+    throw new SearchIncompleteError("仕訳の検索（ページ数の上限）");
   }
   return matched;
 }
@@ -510,12 +520,28 @@ function finishReversal(ctx: SyncCtx, row: ExpenseLedgerRow): void {
     });
     return;
   }
-  if (serviceKindOf(row.payment_method) !== null) {
+  // 取消方法は現在の支払方法ではなく、作成経路（作成時の支払方法・明細 ID）で決める（レビュー B2）。
+  const route = cancellationRoute(row);
+  if (route.route === "put") {
     finishReversalByPut(ctx, row);
     return;
   }
-  finishReversalByDelete(ctx, row, row.mf_journal_id);
+  if (route.route === "delete") {
+    finishReversalByDelete(ctx, row, row.mf_journal_id);
+    return;
+  }
+  const reason = `${UNKNOWN_ROUTE_PREFIX}${route.reason}`;
+  const written = writeIfCurrent(ports, row.receipt_id, (cur) => cur.mf_sync_state === "REVERSING", {
+    mf_sync_state: "ERROR",
+    mf_sync_error: truncate(reason),
+  });
+  if (written !== null) {
+    postBestEffort(ports, `⚠️ ${row.receipt_id}: ${truncate(reason)}。MF で仕訳を確認し、必要なら手で取り消してください。`);
+  }
 }
+
+/** 取消方法を判定できない行の `MF連携エラー` の先頭（取り込みで `SYNCED` に戻さないための目印にもなる）。 */
+const UNKNOWN_ROUTE_PREFIX = "取消方法を判定できません: ";
 
 /** 現金・立替の取消: `DELETE /journals/{id}`（404、または 400 `invalid_request_path_parameter` は削除済みとして成功）。 */
 function finishReversalByDelete(ctx: SyncCtx, row: ExpenseLedgerRow, id: string): void {
@@ -561,7 +587,9 @@ function numberText(n: number): string {
  * - `void`: 借方を `事業主貸` に付け替え、`remark` を `取消: {証憑ID} {取引先}`、`tags` を `[証憑ID, "kadobo-void"]` にする
  * - `inherit`: 訂正後の新しい行の金額・科目・摘要・タグで同じ仕訳を更新し、新しい行を `SYNCED`
  *   （`MF仕訳ID`・`MF明細ID` を引き継ぐ）、旧行を `REVERSED` にする
- * - `done`: 新しい行が既に引き継いでいる。旧行を `REVERSED` にするだけ
+ * - `done`: 新しい行が既に引き継いでいる（`SYNCED`）。不足セル（`MF明細ID`・`MF連携入力`）があれば補って、旧行を `REVERSED` にする
+ * - `recover`: 引継ぎの途中でセル書込みが失敗し、新しい行が同じ仕訳 ID を持つが未確定（レビュー B1）。`void` にせず、
+ *   MF の仕訳が新しい行の内容と違えば PUT をやり直し、新しい行の不足セルを補って（状態は最後）から旧行を `REVERSED` にする
  * PUT は全体の上書きなので、結果不明でやり直しても二重にならない（`REVERSING` のまま次回やり直す）。
  */
 function finishReversalByPut(ctx: SyncCtx, row: ExpenseLedgerRow): void {
@@ -594,6 +622,18 @@ function finishReversalByPut(ctx: SyncCtx, row: ExpenseLedgerRow): void {
 
   const successor = plan.kind === "void" ? null : (rows.find((r) => r.receipt_id === plan.successor) ?? null);
   if (plan.kind === "done") {
+    // 新しい行は確定済み。取り込み（`MF仕訳ID` だけの `SYNCED`）で先に確定した場合は `MF明細ID`・`MF連携入力` が足りないので補う。
+    if (successor !== null && (!hasValue(successor.mf_transaction_id) || inputTransactionId(successor.mf_sync_input) === null)) {
+      writeIfCurrent(
+        ports,
+        successor.receipt_id,
+        (cur) => cur.mf_journal_id === id && cur.mf_sync_state === "SYNCED" && !hasInputChanged(cur),
+        {
+          mf_transaction_id: row.mf_transaction_id,
+          mf_sync_input: summarizeSyncInput({ ...successor, mf_transaction_id: row.mf_transaction_id }),
+        },
+      );
+    }
     markReversed(`🔁 ${row.receipt_id}: 訂正後の ${plan.successor} が MF の仕訳を引き継ぎ済みです。`);
     return;
   }
@@ -637,14 +677,17 @@ function finishReversalByPut(ctx: SyncCtx, row: ExpenseLedgerRow): void {
     markError(built.reason);
     return;
   }
-  try {
-    client.request("put", pathWithId("/journals", id), {}, built.body);
-  } catch (e) {
-    if (e instanceof MfApiError) {
-      markError(errorText(e));
-      return;
+  // 復旧（recover）では、PUT が既に反映済みなら送り直さない。
+  if (plan.kind !== "recover" || !journalMatchesUpdate(existing, built.body)) {
+    try {
+      client.request("put", pathWithId("/journals", id), {}, built.body);
+    } catch (e) {
+      if (e instanceof MfApiError) {
+        markError(errorText(e));
+        return;
+      }
+      throw e; // 429・5xx・認証: `REVERSING` のまま次回やり直す（PUT は何度送っても同じ結果）。
     }
-    throw e; // 429・5xx・認証: `REVERSING` のまま次回やり直す（PUT は何度送っても同じ結果）。
   }
 
   if (successor === null) {
@@ -657,7 +700,7 @@ function finishReversalByPut(ctx: SyncCtx, row: ExpenseLedgerRow): void {
     successor.receipt_id,
     (cur) =>
       cur.state === "COMPLETED" &&
-      !hasValue(cur.mf_journal_id) &&
+      (!hasValue(cur.mf_journal_id) || cur.mf_journal_id === id) &&
       (cur.mf_sync_state === "" || cur.mf_sync_state === "WAITING_TRANSACTION") &&
       summarizeSyncInput(cur) === summarizeSyncInput(successor),
     {
@@ -756,6 +799,7 @@ function fetchTransactions(
   const byKey = new Map<string, MfTransaction>();
   for (const svc of services) {
     for (const range of splitDateRangeBySpan(from, to)) {
+      let complete = false;
       for (let page = 1; page <= TX_MAX_PAGES; page++) {
         if (opts.useDeadline && ctx.deadline.isExpired()) {
           throw new RunDeadlineExceededError();
@@ -785,8 +829,13 @@ function fetchTransactions(
         }
         const totalPages = totalPagesOf(res);
         if (totalPages !== null ? page >= totalPages : items.length < TX_PER_PAGE) {
+          complete = true;
           break;
         }
+      }
+      // 上限ページ数に達しても残りがある: 一部だけを全件と読まない（候補が複数なのに一対一と誤判定する。レビュー M3）。
+      if (!complete) {
+        throw new SearchIncompleteError("連携明細の取得（ページ数の上限）");
       }
     }
   }
@@ -952,6 +1001,14 @@ function isImportCandidate(row: ExpenseLedgerRow): boolean {
   if (row.mf_sync_error === importNotFoundMessage(row.mf_journal_id)) {
     return false;
   }
+  // 取消方法を判定できず確認待ちにした行は、人が直すまで取り込み直さない（`SYNCED` に戻ると取消が繰り返される）。
+  if (
+    row.mf_sync_state === "NEEDS_REVIEW" &&
+    isCancelledExpenseState(row.state) &&
+    (row.mf_sync_error ?? "").startsWith(UNKNOWN_ROUTE_PREFIX)
+  ) {
+    return false;
+  }
   return true;
 }
 
@@ -969,7 +1026,12 @@ function isMaintenanceCandidate(row: ExpenseLedgerRow, rows: readonly ExpenseLed
     return true;
   }
   if (cancelledRowHasJournal(row)) {
-    return serviceKindOf(row.payment_method) === null || planLinkedCancellation(row, rows, startDate).kind !== "wait";
+    const route = cancellationRoute(row);
+    if (route.route === "unknown") {
+      // 確認待ちにする 1 回だけ対象にする（既に確認待ちなら、人が直すまで対象にしない）。
+      return !(row.mf_sync_state === "NEEDS_REVIEW" && (row.mf_sync_error ?? "").startsWith(UNKNOWN_ROUTE_PREFIX));
+    }
+    return route.route === "delete" || planLinkedCancellation(row, rows, startDate).kind !== "wait";
   }
   return isImportCandidate(row);
 }
@@ -1038,7 +1100,23 @@ function processMaintenanceRow(ctx: SyncCtx, receiptId: string): void {
     return;
   }
   if (cancelledRowHasJournal(row)) {
-    if (serviceKindOf(row.payment_method) !== null) {
+    const route = cancellationRoute(row);
+    if (route.route === "unknown") {
+      // 作成経路が不明・矛盾している（例: 連携明細から作ったのに支払方法が cash に変えられた）。自動では消さない。
+      const reason = truncate(`${UNKNOWN_ROUTE_PREFIX}${route.reason}`);
+      const s0 = row.mf_sync_state;
+      const flagged = writeIfCurrent(
+        ports,
+        receiptId,
+        (cur) => isCancelledExpenseState(cur.state) && cur.mf_sync_state === s0 && cancellationRoute(cur).route === "unknown",
+        { mf_sync_state: "NEEDS_REVIEW", mf_sync_error: reason },
+      );
+      if (flagged !== null) {
+        postBestEffort(ports, `⚠️ ${receiptId}: ${reason}。MF の仕訳は変更していません。MF で確認して、必要なら手で取り消してください。`);
+      }
+      return;
+    }
+    if (route.route === "put") {
       const plan = planLinkedCancellation(row, snapshotRows(ports), ctx.startDate);
       if (plan.kind === "wait") {
         return; // 訂正後の新しい行の登録待ち。何もしない（予算は消費済みだが、次回以降は対象にならない）。
@@ -1501,8 +1579,12 @@ function journalizeByRule(ctx: SyncCtx, tx: MfTransaction, rule: MfTransactionRu
  * 連携明細 `tx` から仕訳を作る（実装設計 §6.5 B3）。ロック内で `MF明細ID`・`JOURNALIZING`・試行時刻・入力要約を
  * **先に**書き（明細が他の行に使われていないこと・入力が変わっていないことをその場で確かめる）、ロックの外で
  * `journalize` を送る。書けなければ（行が変わった・明細が他の行に取られた）何もしない。
+ *
+ * `autoPool` を渡したとき（自動確定の経路）は、保存直前のロック内で**最新の全行**に対して照合をやり直し、
+ * 今も「この行とこの明細だけが一対一」でなければ確定しない（照合の計算後に、同じ金額・日付幅の経費の行が増えた・
+ * 訂正元の引継ぎ待ちになった等を拾う。レビュー M1）。人が明細 ID を指定した経路（`autoPool` なし）は再評価しない。
  */
-function startJournalize(ctx: SyncCtx, row: ExpenseLedgerRow, tx: MfTransaction): void {
+function startJournalize(ctx: SyncCtx, row: ExpenseLedgerRow, tx: MfTransaction, autoPool?: readonly MfTransaction[]): void {
   const { ports } = ctx;
   const debitName = debitAccountNameOf(row.category);
   const accounts = resolveAccountIds(ctx, [debitName]);
@@ -1533,6 +1615,12 @@ function startJournalize(ctx: SyncCtx, row: ExpenseLedgerRow, tx: MfTransaction)
     }
     if (usedTransactionKeys(all, cur.receipt_id).has(txKey)) {
       return null;
+    }
+    if (autoPool !== undefined) {
+      const again = matchTransactions(all, autoPool).find((o) => o.receipt_id === cur.receipt_id);
+      if (again === undefined || again.kind !== "matched" || transactionKey(again.transaction.id) !== txKey) {
+        return null; // 最新の台帳では一対一でなくなった。確定せず、次回の実行が評価し直す。
+      }
     }
     const patch = {
       mf_transaction_id: tx.id,
@@ -1624,7 +1712,7 @@ function matchOutcomesStep(
       if (ctx.halted || !ctx.budget.tryStartRow("new")) {
         continue;
       }
-      startJournalize(ctx, row, o.transaction);
+      startJournalize(ctx, row, o.transaction, txs);
     } else if (o.kind === "review") {
       const n = o.candidates.length;
       const reason = o.reason === "contested" ? "（他の経費の行と同じ明細を取り合っています）" : "";
@@ -1775,6 +1863,17 @@ function runSync(ports: AppPorts, deadline: RunDeadline): void {
       // 期限切れで検索を打ち切った。状態は変えず、次回のトリガーが続きを処理する。
       return;
     }
+    if (e instanceof SearchIncompleteError) {
+      // 上限ページ数まで取っても全件にならない。部分結果では判断しないので、状態は変えずに止め、1 日 1 回知らせる。
+      console.error(`journalSync: ${e.message}`);
+      if (claimDailyNotice(ports, "journal_search_incomplete")) {
+        dmOperatorBestEffort(
+          ports,
+          `⚠️ 経費の仕訳連携を止めました（${e.what}）。取得件数が多すぎて全件を確認できません。MF の明細・仕訳の件数を確認してください。`,
+        );
+      }
+      return;
+    }
     if (e instanceof ConfigMissingError) {
       // 設定不備は時間では直らない。通知して止める（毎時の通知を避けるため 1 日 1 回）。
       console.error(`journalSync: config missing (${e.propertyKey})`);
@@ -1814,8 +1913,7 @@ export function syncExpenses(ports: AppPorts, deadline: RunDeadline = new RunDea
 const REPORT_LIST_MAX = 10;
 
 /** 週次報告用の最小の同期コンテキスト（予算・期限は使わない）。 */
-function weeklyCtx(ports: AppPorts, startDate: string | null): SyncCtx {
-  const deadline = new RunDeadline(ports.clock);
+function weeklyCtx(ports: AppPorts, startDate: string | null, deadline: RunDeadline): SyncCtx {
   return {
     ports,
     client: makeMfAccountingClient(ports),
@@ -1860,7 +1958,7 @@ function summarizeRuleJournals(journals: readonly Record<string, unknown>[]): { 
  *   - 無効なルール: 不備（内容が空など）・私用の勘定科目が MF で引けない行（`有効` が FALSE の行は意図して止めているので出さない）
  * 報告することが無ければ投稿しない。`MF_ENABLED` が無効なら何もしない。
  */
-export function weeklyJournalReport(ports: AppPorts): void {
+export function weeklyJournalReport(ports: AppPorts, deadline: RunDeadline = new RunDeadline(ports.clock)): void {
   if (!isMfEnabled(ports.props)) {
     return;
   }
@@ -1869,31 +1967,21 @@ export function weeklyJournalReport(ports: AppPorts): void {
 
   const duplicates: ReturnType<typeof findDuplicateReceiptTags> = [];
   let ruleJournals: ReturnType<typeof summarizeRuleJournals> = [];
+  /** 期限・取得上限で最後まで確認できなかった項目（「異常なし」として出さず、未完了と明記する。レビュー M2・M3）。 */
+  const incomplete: string[] = [];
   const startDateRaw = ports.props.get("MF_SYNC_START_DATE");
   const startDate = startDateRaw !== null && startDateRaw !== "" ? startDateRaw : null;
-  const ctx = weeklyCtx(ports, startDate);
+  const ctx = weeklyCtx(ports, startDate, deadline);
   if (startDate !== null) {
-    const client = ctx.client;
     const today = businessDateOf(ports.clock.nowMs());
-    const journals: Record<string, unknown>[] = [];
-    for (const range of splitRangeByCalendarYear(startDate, today)) {
-      for (let page = 1; page <= SEARCH_MAX_PAGES; page++) {
-        const res = client.request("get", "/journals", {
-          start_date: range.start,
-          end_date: range.end,
-          page: String(page),
-          per_page: String(SEARCH_PER_PAGE),
-        });
-        const list = extractJournalList(res);
-        journals.push(...list);
-        const totalPages = totalPagesOf(res);
-        if (totalPages !== null ? page >= totalPages : list.length < SEARCH_PER_PAGE) {
-          break;
-        }
-      }
+    try {
+      const journals = fetchJournalsSince(ctx, startDate, today);
+      duplicates.push(...findDuplicateReceiptTags(journals, receiptIds));
+      ruleJournals = summarizeRuleJournals(journals);
+    } catch (e) {
+      const reason = incompleteReason(e);
+      incomplete.push(`仕訳の取得（二重作成の確認・私用として処理した明細）: ${reason}`);
     }
-    duplicates.push(...findDuplicateReceiptTags(journals, receiptIds));
-    ruleJournals = summarizeRuleJournals(journals);
   }
 
   const needsReview = rows.filter((r) => r.mf_sync_state === "NEEDS_REVIEW").map((r) => r.receipt_id);
@@ -1917,12 +2005,62 @@ export function weeklyJournalReport(ports: AppPorts): void {
     );
   }
   if (startDate !== null && isMatchEnabled(ports.props)) {
-    sections.push(...weeklyMatchSections(ctx, rows, startDate, ruleJournals));
+    sections.push(...weeklyMatchSections(ctx, rows, startDate, ruleJournals, incomplete));
+  }
+  if (incomplete.length > 0) {
+    sections.unshift(
+      `⚠️ 週次報告が未完了です（確認できなかった項目は「異常なし」ではありません）\n${incomplete.map((t) => `・${t}`).join("\n")}\n次回の週次報告で再確認されます。`,
+    );
   }
   if (sections.length === 0) {
     return;
   }
   postBestEffort(ports, [`📋 MF 仕訳 週次報告（${businessDateOf(ports.clock.nowMs())}）`, ...sections].join("\n\n"));
+}
+
+/** 期限・取得上限のエラーを報告用の理由文にする。それ以外のエラーは投げ直す。 */
+function incompleteReason(e: unknown): string {
+  if (e instanceof RunDeadlineExceededError) {
+    return "実行時間の期限に達しました";
+  }
+  if (e instanceof SearchIncompleteError) {
+    return `取得ページ数の上限に達しました（${e.what}）`;
+  }
+  throw e;
+}
+
+/**
+ * `MF_SYNC_START_DATE` 以降の仕訳を、暦年ごと（366 日以内）に全ページ取得する（週次報告用）。ページ取得の前に絶対期限を確認し、
+ * 過ぎていたら途中までの結果を返さず {@link RunDeadlineExceededError}、上限ページ数に達しても残りがあれば
+ * {@link SearchIncompleteError}（部分結果を「異常なし」と読ませない）。
+ */
+function fetchJournalsSince(ctx: SyncCtx, startDate: string, today: string): Record<string, unknown>[] {
+  const journals: Record<string, unknown>[] = [];
+  for (const range of splitRangeByCalendarYear(startDate, today)) {
+    let complete = false;
+    for (let page = 1; page <= SEARCH_MAX_PAGES; page++) {
+      if (ctx.deadline.isExpired()) {
+        throw new RunDeadlineExceededError();
+      }
+      const res = ctx.client.request("get", "/journals", {
+        start_date: range.start,
+        end_date: range.end,
+        page: String(page),
+        per_page: String(SEARCH_PER_PAGE),
+      });
+      const list = extractJournalList(res);
+      journals.push(...list);
+      const totalPages = totalPagesOf(res);
+      if (totalPages !== null ? page >= totalPages : list.length < SEARCH_PER_PAGE) {
+        complete = true;
+        break;
+      }
+    }
+    if (!complete) {
+      throw new SearchIncompleteError("仕訳の取得（ページ数の上限）");
+    }
+  }
+  return journals;
 }
 
 /** ③ の週次報告の節（未登録の支出・私用として処理した明細・無効なルール）。 */
@@ -1931,6 +2069,7 @@ function weeklyMatchSections(
   rows: readonly ExpenseLedgerRow[],
   startDate: string,
   ruleJournals: ReturnType<typeof summarizeRuleJournals>,
+  incomplete: string[],
 ): string[] {
   const { ports } = ctx;
   const sections: string[] = [];
@@ -1946,18 +2085,20 @@ function weeklyMatchSections(
   if (rules !== null && services.length > 0) {
     const today = businessDateOf(ports.clock.nowMs());
     const until = shiftDate(today, -UNREGISTERED_AFTER_DAYS);
+    // 取得は直近 90 日に限る（古い未登録は、過去の週次報告で出ている。実行時間の上限を超えないため。レビュー M2）。
+    const from = shiftDate(today, -WEEKLY_FETCH_DAYS) > startDate ? shiftDate(today, -WEEKLY_FETCH_DAYS) : startDate;
     try {
       const used = usedTransactionKeys(rows);
-      const list = fetchTransactions(ctx, services, startDate, until, {
+      const list = fetchTransactions(ctx, services, from, until, {
         unjournalizedExpense: true,
         startDate,
-        useDeadline: false,
+        useDeadline: true,
       })
         .filter((t) => t.date <= until && !used.has(transactionKey(t.id)) && classifyTransaction(t, rules, t.service) === null)
         .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : a.id < b.id ? -1 : 1));
       if (list.length > 0) {
         sections.push(
-          `⚠️ 未登録の支出（${UNREGISTERED_AFTER_DAYS} 日以上前の未仕訳・${list.length} 件）\n` +
+          `⚠️ 未登録の支出（直近 ${WEEKLY_FETCH_DAYS} 日のうち ${UNREGISTERED_AFTER_DAYS} 日以上前の未仕訳・${list.length} 件）\n` +
             list
               .slice(0, REPORT_LIST_MAX)
               .map((t) => `・${txLabel(t)}（${KIND_LABEL[t.service]}）`)
@@ -1967,6 +2108,10 @@ function weeklyMatchSections(
         );
       }
     } catch (e) {
+      if (e instanceof RunDeadlineExceededError || e instanceof SearchIncompleteError) {
+        incomplete.push(`未登録の支出の確認: ${incompleteReason(e)}`);
+        return sections;
+      }
       if (!(e instanceof MfApiError)) {
         throw e;
       }
@@ -1990,19 +2135,25 @@ function weeklyMatchSections(
   // 無効なルール。
   if (rules !== null) {
     const lines: string[] = [];
+    // シート上の実際の行番号（空行を挟んでもずれない）。取れなければ上から数えた番号（ヘッダーが 1 行目）。
+    const rowLabel = (rule: MfTransactionRule, i: number): string => `${rule.row ?? i + 2} 行目`;
     rules.forEach((rule, i) => {
       // `有効` が FALSE の行は意図して止めているので報告しない（不備だけを出す）。
       const defects = ruleDefects(rule);
       if (defects.length > 0) {
-        lines.push(`・${i + 2} 行目「${rule.name === "" ? "(名前なし)" : rule.name}」: ${defects.join("、")}`);
+        lines.push(`・${rowLabel(rule, i)}「${rule.name === "" ? "(名前なし)" : rule.name}」: ${defects.join("、")}`);
       }
     });
-    const privateRules = rules.filter((r) => isRuleUsable(r) && r.action === RULE_ACTION_PRIVATE);
+    const privateRules = rules.map((r, i) => ({ r, i })).filter(({ r }) => isRuleUsable(r) && r.action === RULE_ACTION_PRIVATE);
     if (privateRules.length > 0) {
-      const accounts = loadAccountMap(ctx, [...new Set(privateRules.map((r) => r.account.trim()))]);
-      for (const rule of privateRules) {
-        if (accounts[rule.account.trim()] === undefined) {
-          lines.push(`・「${rule.name}」: 勘定科目「${rule.account}」が MF で名前完全一致の 1 件に決まりません`);
+      if (ctx.deadline.isExpired()) {
+        incomplete.push("ルールの勘定科目の確認: 実行時間の期限に達しました");
+      } else {
+        const accounts = loadAccountMap(ctx, [...new Set(privateRules.map(({ r }) => r.account.trim()))]);
+        for (const { r, i } of privateRules) {
+          if (accounts[r.account.trim()] === undefined) {
+            lines.push(`・${rowLabel(r, i)}「${r.name}」: 勘定科目「${r.account}」が MF で名前完全一致の 1 件に決まりません`);
+          }
         }
       }
     }

@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest";
 import { syncExpenses, weeklyJournalReport } from "../../src/app/journalSync";
 import { RunDeadline } from "../../src/app/mf/deadline";
-import type { ExpenseLedgerRow } from "../../src/app/ports";
+import { orderedColumnKeys, type ExpenseLedgerRow } from "../../src/app/ports";
 import type { MfTransactionRule } from "../../src/core/journalSync";
 import { makeFakePorts, type FakePorts } from "./fakes";
 import {
@@ -1363,5 +1363,401 @@ describe("週次報告（§6.6）", () => {
     const text = posted(ports).join("\n");
     expect(text).toContain("MF明細ルール シートを読めない");
     expect(text).not.toContain("未登録の店");
+  });
+});
+
+// ===========================================================================
+// Codex レビュー（WP-M5）の反映
+// ===========================================================================
+
+describe("B1: 引継ぎのセル書込みが途中で失敗しても、次回に事業主貸へ付け替えない（引継ぎ復旧）", () => {
+  function arrange() {
+    const e = setup();
+    const { tx, journal } = plantLinkedJournal(e.api, { receiptId: "R-OLD" });
+    add(e.ports, "R-OLD", { state: "CORRECTED", mf_sync_state: "SYNCED", mf_journal_id: journal.id, mf_transaction_id: tx.id });
+    add(e.ports, "R-NEW", { correction_of_receipt_id: "R-OLD", category: "通信費", partner: "新店", drive_link: "https://drive.example.test/new" });
+    return { ...e, tx, journal };
+  }
+
+  function expectInherited(e: ReturnType<typeof arrange>) {
+    expect(get(e.ports, "R-NEW")).toMatchObject({
+      mf_sync_state: "SYNCED",
+      mf_journal_id: e.journal.id,
+      mf_transaction_id: e.tx.id,
+      mf_sync_input: `1200|2026-10-10|通信費|linked_card|${e.tx.id}`,
+      mf_sync_error: null,
+    });
+    expect(get(e.ports, "R-OLD").mf_sync_state).toBe("REVERSED");
+    const j = e.api.journals.find((x) => x.id === e.journal.id)!;
+    expect((j.branches[0] as { debitor: { account_id: string } }).debitor.account_id).toBe(accountIdOf("通信費"));
+    expect(j.tags).toEqual(["R-NEW"]);
+    // 事業主貸への付け替え（void）は一度も送られていない。
+    expect(e.api.putBodies.every((b) => !JSON.stringify(b.body).includes("kadobo-void"))).toBe(true);
+    expect(e.api.putBodies.every((b) => !JSON.stringify(b.body).includes(accountIdOf("事業主貸")))).toBe(true);
+    expect(e.ports.http.calls.some((c) => c.method === "delete")).toBe(false);
+    expect(e.api.journals).toHaveLength(1);
+  }
+
+  for (const k of [1, 2, 3, 4, 5, 6]) {
+    it(`新しい行の ${k} 番目のセルを保存した直後に失敗 → 次回以降に void を選ばず、引継ぎを完了する`, () => {
+      const e = arrange();
+      const orig = e.ports.sheets.updateExpenseColumns.bind(e.ports.sheets);
+      let failed = false;
+      e.ports.sheets.updateExpenseColumns = (id, patch, order) => {
+        if (!failed && id === "R-NEW" && patch.mf_journal_id !== undefined) {
+          failed = true;
+          const keys = orderedColumnKeys(patch, order).slice(0, k);
+          const part: Record<string, unknown> = {};
+          for (const key of keys) {
+            part[key] = patch[key];
+          }
+          orig(id, part as Partial<ExpenseLedgerRow>, order);
+          throw new Error(`CELL_WRITE_FAILED_AFTER_${k}`);
+        }
+        orig(id, patch, order);
+      };
+
+      expect(() => syncExpenses(e.ports)).toThrow(`CELL_WRITE_FAILED_AFTER_${k}`);
+      expect(get(e.ports, "R-NEW").mf_journal_id).toBe(e.journal.id);
+      expect(get(e.ports, "R-OLD").mf_sync_state).toBe("REVERSING");
+      expect(e.api.putBodies).toHaveLength(1); // 最初の PUT は新しい行の内容
+
+      syncExpenses(e.ports);
+      syncExpenses(e.ports);
+
+      expectInherited(e);
+      expect(e.api.putBodies).toHaveLength(1); // 反映済みなので PUT をやり直さない
+    });
+  }
+
+  it("復旧（旧行を先に処理）: MF の仕訳が既に新しい行の内容なら PUT せず、新しい行の不足セルを補って旧行を REVERSED にする", () => {
+    const e = arrange();
+    // 前回の PUT は反映済み、新しい行は仕訳 ID だけ保存した状態（状態は空）。
+    const j = e.api.journals.find((x) => x.id === e.journal.id)!;
+    (j.branches[0] as { debitor: { account_id: string }; remark: string }).debitor.account_id = accountIdOf("通信費");
+    (j.branches[0] as { remark: string }).remark = "R-NEW 新店";
+    j.tags = ["R-NEW"];
+    j.memo = "https://drive.example.test/new";
+    e.ports.sheets.updateExpense("R-NEW", { mf_journal_id: e.journal.id, mf_sync_state: "" });
+    // 旧行は REVERSING（前回、新しい行の書込みで落ちた）。
+    e.ports.sheets.updateExpense("R-OLD", { mf_sync_state: "REVERSING" });
+
+    syncExpenses(e.ports);
+
+    expectInherited(e);
+    expect(e.api.putBodies).toHaveLength(0);
+  });
+
+  it("復旧: MF の仕訳がまだ旧内容なら PUT をやり直す（新しい行の内容で）", () => {
+    const e = arrange();
+    e.ports.sheets.updateExpense("R-NEW", { mf_journal_id: e.journal.id, mf_sync_state: "WAITING_TRANSACTION" });
+    e.ports.sheets.updateExpense("R-OLD", { mf_sync_state: "REVERSING" });
+
+    syncExpenses(e.ports);
+
+    expect(e.api.putBodies).toHaveLength(1);
+    expectInherited(e);
+  });
+});
+
+describe("B2: 取消方法（PUT／DELETE）は作成経路で決める。来歴が不明・矛盾なら自動では消さない", () => {
+  it("連携明細から作った仕訳の行を、支払方法 cash に変えて VOID にしても DELETE しない。NEEDS_REVIEW にして理由を書き、通知する", () => {
+    const { ports, api } = setup({ match: false });
+    const { tx, journal } = plantLinkedJournal(api, { receiptId: "R-1" });
+    add(ports, "R-1", {
+      payment_method: "cash", // 人が linked_card から cash に変えた
+      state: "VOID",
+      mf_sync_state: "SYNCED",
+      mf_journal_id: journal.id,
+      mf_transaction_id: tx.id,
+      mf_sync_input: `1200|2026-10-10|消耗品費|linked_card|${tx.id}`,
+    });
+
+    syncExpenses(ports);
+    syncExpenses(ports);
+
+    expect(ports.http.calls.some((c) => c.method === "delete")).toBe(false);
+    expect(api.putBodies).toHaveLength(0);
+    expect(api.journals).toHaveLength(1);
+    expect(tx.journalizing_status).toBe("registered");
+    const row = get(ports, "R-1");
+    expect(row.mf_sync_state).toBe("NEEDS_REVIEW");
+    expect(row.mf_sync_error).toContain("取消方法を判定できません");
+    expect(row.mf_sync_error).toContain("linked_card");
+    expect(posted(ports)).toHaveLength(1); // 通知は 1 回（SYNCED に戻って繰り返さない）
+    expect(posted(ports)[0]).toContain("MF の仕訳は変更していません");
+  });
+
+  it("現金・立替として作った仕訳の行を、支払方法 linked_card に変えて VOID にしても PUT しない（DELETE もしない）", () => {
+    const { ports, api } = setup({ match: false });
+    const j = api.plantJournal({ transaction_date: "2026-10-10", tags: ["R-2"] });
+    add(ports, "R-2", {
+      payment_method: "linked_card", // 人が cash から変えた
+      state: "VOID",
+      mf_sync_state: "SYNCED",
+      mf_journal_id: j.id,
+      mf_sync_input: "1200|2026-10-10|消耗品費|cash|",
+    });
+
+    syncExpenses(ports);
+
+    expect(api.putBodies).toHaveLength(0);
+    expect(ports.http.calls.some((c) => c.method === "delete" || c.method === "put")).toBe(false);
+    expect(api.journals).toHaveLength(1);
+    expect(get(ports, "R-2").mf_sync_state).toBe("NEEDS_REVIEW");
+    expect(get(ports, "R-2").mf_sync_error).toContain("現金・立替として作った仕訳");
+  });
+
+  it("明細 ID があるのに cash（要約が空の行）も、連携なのに明細 ID が無い行も、自動では消さない", () => {
+    const e = setup({ match: false });
+    const j1 = e.api.plantJournal({ transaction_date: "2026-10-10", tags: ["R-3"] });
+    const j2 = e.api.plantJournal({ transaction_date: "2026-10-10", tags: ["R-4"] });
+    add(e.ports, "R-3", { payment_method: "cash", state: "VOID", mf_sync_state: "SYNCED", mf_journal_id: j1.id, mf_transaction_id: "t%3D" });
+    add(e.ports, "R-4", { payment_method: "linked_card", state: "VOID", mf_sync_state: "SYNCED", mf_journal_id: j2.id, mf_transaction_id: null });
+
+    syncExpenses(e.ports);
+
+    expect(e.ports.http.calls).toHaveLength(0);
+    expect(get(e.ports, "R-3").mf_sync_state).toBe("NEEDS_REVIEW");
+    expect(get(e.ports, "R-4").mf_sync_state).toBe("NEEDS_REVIEW");
+  });
+
+  it("確認待ちにした行は、人が支払方法を元に戻して MF連携状態 を空にすれば、元の経路（PUT）で取消される", () => {
+    const { ports, api } = setup({ match: false });
+    const { tx, journal } = plantLinkedJournal(api, { receiptId: "R-1" });
+    add(ports, "R-1", {
+      payment_method: "cash",
+      state: "VOID",
+      mf_sync_state: "SYNCED",
+      mf_journal_id: journal.id,
+      mf_transaction_id: tx.id,
+      mf_sync_input: `1200|2026-10-10|消耗品費|linked_card|${tx.id}`,
+    });
+    syncExpenses(ports);
+    expect(get(ports, "R-1").mf_sync_state).toBe("NEEDS_REVIEW");
+
+    ports.sheets.updateExpense("R-1", { payment_method: "linked_card", mf_sync_state: "" });
+    syncExpenses(ports);
+
+    expect(api.putBodies).toHaveLength(1);
+    expect(get(ports, "R-1").mf_sync_state).toBe("REVERSED");
+    expect(ports.http.calls.some((c) => c.method === "delete")).toBe(false);
+  });
+
+  it("祖先の引継ぎ待ち判定も作成経路で揃える: 親の経路が矛盾（連携で作ったのに cash）なら、親は連携仕訳を持つと見なさず、新しい行は通常の照合に進む", () => {
+    const { ports, api } = setup();
+    const a = plantLinkedJournal(api, { receiptId: "R-OLD" });
+    const other = txOf(api, { date: "2026-10-11" });
+    add(ports, "R-OLD", {
+      payment_method: "cash",
+      mf_sync_state: "SYNCED",
+      mf_journal_id: a.journal.id,
+      mf_transaction_id: a.tx.id,
+      mf_sync_input: `1200|2026-10-10|消耗品費|linked_card|${a.tx.id}`,
+    });
+    add(ports, "R-NEW", { correction_of_receipt_id: "R-OLD" });
+    syncExpenses(ports);
+    expect(get(ports, "R-OLD").mf_sync_state).toBe("NEEDS_REVIEW"); // 変更検出が確認待ちにする（MF の仕訳は人が確認する）
+    expect(get(ports, "R-NEW")).toMatchObject({ mf_sync_state: "SYNCED", mf_transaction_id: other.id });
+  });
+});
+
+describe("M1: 自動確定は保存直前のロック内で、最新の全行に対して一対一を再評価する", () => {
+  it("照合の計算後に同じ金額・日付幅の経費の行が増えたら、確定しない。次回は取り合いとして両方 NEEDS_REVIEW", () => {
+    const { ports, api } = setup();
+    const tx = txOf(api);
+    add(ports, "R-1");
+    let inserted = false;
+    const prev = api.onRequest;
+    api.onRequest = (req) => {
+      prev?.(req);
+      // 科目の解決（照合の計算の後・保存の前）の時点で、競合する /keihi の行が登録される。
+      if (!inserted && req.url.includes("/accounts")) {
+        inserted = true;
+        add(ports, "R-2", { date: "2026-10-11" });
+      }
+    };
+
+    syncExpenses(ports);
+
+    expect(inserted).toBe(true);
+    expect(journalizeCount(ports)).toBe(0);
+    expect(get(ports, "R-1").mf_sync_state).toBe("WAITING_TRANSACTION");
+    expect(get(ports, "R-1").mf_transaction_id).toBeNull();
+    expect(tx.journalizing_status).toBe("none");
+
+    syncExpenses(ports);
+
+    expect(get(ports, "R-1").mf_sync_state).toBe("NEEDS_REVIEW");
+    expect(get(ports, "R-2").mf_sync_state).toBe("NEEDS_REVIEW");
+    expect(journalizeCount(ports)).toBe(0);
+  });
+
+  it("再評価の対象は自動確定だけ。人が明細 ID を指定した経路（NEEDS_REVIEW からの検証）は、他の行が候補にしていても通る", () => {
+    const { ports, api } = setup();
+    const tx = txOf(api);
+    add(ports, "R-1", { mf_sync_state: "NEEDS_REVIEW", mf_transaction_id: tx.id });
+    add(ports, "R-2", { date: "2026-10-11" }); // 同じ金額・日付幅の別の待ち行
+    syncExpenses(ports);
+    expect(get(ports, "R-1")).toMatchObject({ mf_sync_state: "SYNCED", mf_transaction_id: tx.id });
+  });
+
+  it("照合の計算後に、訂正元が仕訳を持つ引継ぎ待ちになった行は確定しない", () => {
+    const { ports, api } = setup();
+    txOf(api);
+    const a = plantLinkedJournal(api, { receiptId: "R-OLD" });
+    add(ports, "R-1");
+    add(ports, "R-OLD", { mf_sync_state: "SYNCED", mf_journal_id: a.journal.id, mf_transaction_id: a.tx.id, date: "2026-10-01", state: "COMPLETED" });
+    let changed = false;
+    const prev = api.onRequest;
+    api.onRequest = (req) => {
+      prev?.(req);
+      if (!changed && req.url.includes("/accounts")) {
+        changed = true;
+        ports.sheets.updateExpense("R-1", { correction_of_receipt_id: "R-OLD" });
+      }
+    };
+    syncExpenses(ports);
+    expect(changed).toBe(true);
+    expect(journalizeCount(ports)).toBe(0);
+    expect(get(ports, "R-1").mf_sync_state).toBe("WAITING_TRANSACTION");
+  });
+});
+
+describe("M3: ページ数の上限に達して残りがあれば、部分結果で判断せず「検索未完了」にする", () => {
+  it("連携明細の取得: 上限（50 ページ）でも残りがあれば、照合・ルール適用をせず、状態を変えない。DM は 1 日 1 回", () => {
+    const { ports, api } = setup();
+    ports.sheets.mfRules = [nisaRule({ amount: null, content: "積立" })];
+    txOf(api, { content: "積立" });
+    txOf(api);
+    api.transactionsTotalPagesOverride = 80;
+    add(ports, "R-1");
+
+    expect(() => syncExpenses(ports)).not.toThrow();
+    syncExpenses(ports);
+
+    expect(journalizeCount(ports)).toBe(0);
+    expect(get(ports, "R-1").mf_sync_state).toBe("WAITING_TRANSACTION");
+    expect(urls(ports, "/transactions?").length).toBe(100); // 1 回につきカードの 50 ページで打ち切る
+    expect(ports.slack.dms).toHaveLength(1);
+    expect(ports.slack.dms[0]!.text).toContain("ページ数の上限");
+  });
+
+  it("仕訳の検索（tags）: 上限に達しても残りがあれば「見つからない」と読んで POST しない", () => {
+    const { ports, api } = setup({ journal: true, match: false });
+    api.journalsTotalPagesOverride = 80;
+    add(ports, "R-1", { payment_method: "cash", mf_sync_state: "PENDING" });
+
+    syncExpenses(ports);
+
+    expect(postCountOf(ports)).toBe(0);
+    expect(get(ports, "R-1").mf_sync_state).toBe("PENDING");
+    expect(ports.slack.dms).toHaveLength(1);
+  });
+
+  it("JOURNALIZING の回収で明細の一覧が上限に達したら、「明細が無い」と読まず NEEDS_REVIEW にしない", () => {
+    const { ports, api } = setup({ match: false });
+    const tx = txOf(api);
+    api.transactionsTotalPagesOverride = 80;
+    add(ports, "R-1", { mf_sync_state: "JOURNALIZING", mf_transaction_id: tx.id, mf_sync_input: `1200|2026-10-10|消耗品費|linked_card|${tx.id}` });
+    syncExpenses(ports);
+    expect(get(ports, "R-1").mf_sync_state).toBe("JOURNALIZING");
+    expect(journalizeCount(ports)).toBe(0);
+  });
+
+  it("週次報告: 仕訳・明細の取得が上限に達したら、その項目を「未完了」と明記する（異常なしとして出さない）", () => {
+    const { ports, api } = setup();
+    ports.sheets.mfRules = [];
+    txOf(api, { date: "2026-10-05", value: 3300, content: "未登録の店" });
+    api.journalsTotalPagesOverride = 80;
+    api.transactionsTotalPagesOverride = 80;
+
+    weeklyJournalReport(ports);
+
+    const text = posted(ports).join("\n");
+    expect(text).toContain("週次報告が未完了です");
+    expect(text).toContain("仕訳の取得");
+    expect(text).toContain("未登録の支出の確認");
+    expect(text).toContain("取得ページ数の上限");
+    expect(text).not.toContain("未登録の店");
+  });
+});
+
+function postCountOf(ports: FakePorts): number {
+  return accountingCallsOf(ports).filter((c) => c === "POST /journals").length;
+}
+
+describe("M2: 週次報告は共通の期限で打ち切り、未完了を明記する", () => {
+  it("期限が過ぎていれば MF を呼ばず、未完了と明記する（NEEDS_REVIEW の件数など台帳だけで分かる報告は出す）", () => {
+    const { ports } = setup();
+    ports.sheets.mfRules = [nisaRule()];
+    add(ports, "R-1", { mf_sync_state: "NEEDS_REVIEW" });
+    const deadline = new RunDeadline(ports.clock, 1, ports.clock.nowMs() - 10_000);
+
+    weeklyJournalReport(ports, deadline);
+
+    expect(ports.http.calls).toHaveLength(0);
+    const text = posted(ports).join("\n");
+    expect(text).toContain("週次報告が未完了です");
+    expect(text).toContain("実行時間の期限");
+    expect(text).toContain("NEEDS_REVIEW 1 件");
+    expect(text).not.toContain("📋 私用として処理した明細");
+  });
+
+  it("明細の取得の途中で期限が過ぎたら、部分結果を未登録の支出として出さない。先に確認できた項目（二重作成）は出す", () => {
+    const { ports, api } = setup();
+    ports.sheets.mfRules = [];
+    add(ports, "R-D", { mf_sync_state: "SYNCED" });
+    api.plantJournal({ transaction_date: "2026-10-05", tags: ["R-D"] });
+    api.plantJournal({ transaction_date: "2026-10-06", tags: ["R-D"] });
+    for (let i = 0; i < 3; i++) {
+      txOf(api, { date: "2026-10-05", value: 3300 + i, content: `未登録の店${i}` });
+    }
+    api.transactionsTotalPagesOverride = 5;
+    const prev = api.onRequest;
+    api.onRequest = (req) => {
+      prev?.(req);
+      if (req.url.includes("/transactions?")) {
+        ports.clock.currentMs += 3 * 60 * 1000; // 1 ページごとに 3 分かかる想定
+      }
+    };
+
+    weeklyJournalReport(ports);
+
+    const text = posted(ports).join("\n");
+    expect(text).toContain("二重作成の疑い");
+    expect(text).toContain("週次報告が未完了です");
+    expect(text).toContain("未登録の支出の確認: 実行時間の期限");
+    expect(text).not.toContain("未登録の店0");
+  });
+
+  it("連携明細の取得は直近 90 日に限る（それより古い未登録は取らない）", () => {
+    const { ports } = setup();
+    ports.sheets.mfRules = [];
+    ports.clock.currentMs = Date.parse("2027-03-10T09:00:00+09:00");
+
+    weeklyJournalReport(ports);
+
+    const starts = urls(ports, "/transactions?").map((u) => /start_date=([^&]*)/.exec(u)?.[1]);
+    expect(starts.length).toBeGreaterThan(0);
+    expect(new Set(starts)).toEqual(new Set(["2026-12-10"])); // 2027-03-10 の 90 日前
+  });
+});
+
+describe("無効なルールの報告は、シート上の実際の行番号を出す（Minor）", () => {
+  it("rule.row があればその番号（空行を挟んでもずれない）。無ければ上から数えた番号", () => {
+    const { ports } = setup();
+    ports.sheets.mfRules = [
+      nisaRule({ name: "空ルール", content: "", row: 5 }),
+      nisaRule({ name: "科目なし", account: "存在しない科目", row: 9 }),
+      nisaRule({ name: "行番号なし", content: "" }), // 3 番目 → 4 行目
+    ];
+
+    weeklyJournalReport(ports);
+
+    const text = posted(ports).join("\n");
+    expect(text).toContain("5 行目「空ルール」");
+    expect(text).toContain("9 行目「科目なし」");
+    expect(text).toContain("4 行目「行番号なし」");
   });
 });

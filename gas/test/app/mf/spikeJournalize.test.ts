@@ -90,15 +90,15 @@ describe("runJournalizeSpikeS5b: 成功", () => {
     runJournalizeSpikeS5b(ports, log);
 
     // journalize の本文: 事業主貸・remark・tags・transaction_date は明細の日付・tax_id なし。
-    expect(api.journalizeBodies).toEqual([
-      {
-        transaction_id: tx.id,
-        transaction_date: "2026-10-05",
-        account_id: accountIdOf("事業主貸"),
-        remark: "私用: S-M5b",
-        tags: ["kadobo-spike-s5b"],
-      },
-    ]);
+    // 2 回目は同じ明細への再送の確認（拒否されて二重作成されない）。
+    const expectedBody = {
+      transaction_id: tx.id,
+      transaction_date: "2026-10-05",
+      account_id: accountIdOf("事業主貸"),
+      remark: "私用: S-M5b",
+      tags: ["kadobo-spike-s5b"],
+    };
+    expect(api.journalizeBodies).toEqual([expectedBody, expectedBody]);
     expect(SPIKE_S5B_REMARK).toBe("私用: S-M5b");
     expect(SPIKE_S5B_TAG).toBe("kadobo-spike-s5b");
     const payload = ports.http.calls.find((c) => c.url.includes("/transactions/journalize"))?.payload ?? "";
@@ -134,6 +134,9 @@ describe("runJournalizeSpikeS5b: 成功", () => {
     expect(text).toContain("今回作った仕訳が見つかった");
     expect(text).toContain("remark が「私用: S-M5b（PUT 確認）」になっていた");
     expect(text).toContain("削除せず残しています");
+    expect(text).toContain("2 回目の journalize: 拒否された（status=400");
+    expect(text).toContain("二重作成されない");
+    expect(text).toContain("変わらなかった");
     expect(text).not.toContain("mf_api_prd_SECRET");
     expect(text).not.toContain("JWT_FAKE");
   });
@@ -155,5 +158,80 @@ describe("runJournalizeSpikeS5b: 成功", () => {
     runJournalizeSpikeS5b(ports, log);
     expect(() => runJournalizeSpikeS5b(ports, log)).toThrow(/SPIKE_TRANSACTION_NOT_UNJOURNALIZED/);
     expect(api.journals).toHaveLength(1);
+  });
+});
+
+describe("runJournalizeSpikeS5b: 前提が崩れていれば失敗にする（レビュー M4）", () => {
+  function ready(amount = 1234) {
+    const e = setup();
+    const tx = e.api.plantTransaction({ date: "2026-10-05", value: amount, content: "テスト店" });
+    e.ports.props.set("MF_SPIKE_TRANSACTION_ID", tx.id);
+    return { ...e, tx };
+  }
+
+  it("transaction_ids の検索で作った仕訳が見つからなければ失敗（最後まで確認したうえで投げる）", () => {
+    const { ports, api, lines, log } = ready();
+    api.hideFromList = true; // GET /journals（一覧・検索）が何も返さない
+
+    expect(() => runJournalizeSpikeS5b(ports, log)).toThrow(/SPIKE_NOT_FOUND_BY_TRANSACTION_IDS/);
+
+    const text = lines.join("\n");
+    expect(text).toContain("見つからなかった");
+    expect(text).toContain("S-M5b 失敗");
+    expect(api.putBodies).toHaveLength(1); // PUT・再送の確認までは行う
+  });
+
+  it("PUT の後に貸方の科目・金額が変わっていれば失敗。変わった内容をログに出す", () => {
+    const { ports, api, lines, log } = ready();
+    api.putMutate = (j) => {
+      (j.branches[0] as { creditor: Record<string, unknown> }).creditor = { account_id: accountIdOf("事業主借"), value: 1234 };
+    };
+
+    expect(() => runJournalizeSpikeS5b(ports, log)).toThrow(/SPIKE_PUT_CHANGED_UNEXPECTED/);
+
+    expect(lines.join("\n")).toContain("貸方の科目が変わった");
+  });
+
+  it("PUT の後に transaction_id（明細との紐付き）が外れていれば失敗", () => {
+    const { ports, api, lines, log } = ready();
+    api.putMutate = (j) => {
+      delete j.transaction_id;
+    };
+
+    expect(() => runJournalizeSpikeS5b(ports, log)).toThrow(/SPIKE_PUT_CHANGED_UNEXPECTED/);
+
+    expect(lines.join("\n")).toContain("明細との紐付き（transaction_id）が外れた");
+  });
+
+  it("同じ明細への 2 回目の journalize が 201（二重作成）なら失敗。仕訳 ID を出して、人が削除する案内を出す", () => {
+    const { ports, api, lines, log } = ready();
+    api.allowDuplicateJournalize = true;
+
+    expect(() => runJournalizeSpikeS5b(ports, log)).toThrow(/SPIKE_DUPLICATE_JOURNALIZE_CREATED/);
+
+    expect(api.journals).toHaveLength(2);
+    const text = lines.join("\n");
+    expect(text).toContain("201 が返った。二重作成された");
+    expect(text).toContain(`仕訳 id=${api.journals[1]!.id}`);
+    expect(text).toContain("MF 画面で不要な方の仕訳を削除してください");
+  });
+
+  it("2 回目の journalize が結果不明（500）なら、確認を促して失敗にする", () => {
+    const { ports, api, lines, log } = ready();
+    api.postMode = "not_created_500";
+    api.postModeRemaining = Infinity;
+    // 1 回目は通すため、1 回目の POST の後から 500 にする。
+    let n = 0;
+    const prev = api.onRequest;
+    api.onRequest = (req) => {
+      prev?.(req);
+      if (req.url.includes("/transactions/journalize")) {
+        n++;
+        api.postMode = n === 1 ? "ok" : "not_created_500";
+      }
+    };
+
+    expect(() => runJournalizeSpikeS5b(ports, log)).toThrow(/SPIKE_DUPLICATE_JOURNALIZE_UNKNOWN/);
+    expect(lines.join("\n")).toContain("結果不明");
   });
 });
