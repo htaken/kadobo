@@ -151,7 +151,8 @@
 - `POST /journals`・`POST /transactions/journalize` の 201 応答は `{ journal: { id, transaction_id, tags, ... } }`
 - 🔄 `GET /transactions` は **`start_date` と `end_date` の差が 366 日以内**。長く照合できない行が残ったときのため、期間を分割して呼ぶ（§6.5）
 - 🔄 `journalize` の `transaction_date` は省略すると**明細の日付**になる。kadobo は**必ず経費台帳の `日付`（証憑の取引年月日）を指定する**（§6.5）
-- 🔬 **会計 API は ID（`account_id`・`tax_id`・仕訳 ID 等）をパーセントエンコード済みの文字列で返す**（2026-10-08 実測。OpenAPI の例示値も `…%3D%3D`）。本文にはそのまま入れ、**パスに入れるときに `encodeURIComponent` を重ねない**
+- 🔬 **会計 API は ID（`account_id`・`tax_id`・仕訳 ID 等）を `%` を含む文字列で返す**（2026-10-08 実測。OpenAPI の例示値も `…%3D%3D`）。本文・クエリにはそのまま入れる（クエリはクライアントが 1 回エンコードする）。**パスに置くときは `encodeURIComponent` を 1 回かける**（`pathWithId`。S-M5 で (a) 1 回エンコード＝200、素の base64＝400 を確認。v2 の「重ねない」は誤りで訂正）
+- 🔬 **存在しない ID への `GET/DELETE /journals/{id}` は 404 ではなく 400 `invalid_request_path_parameter`** を返す（S-M5 実測）。「存在しない」の判定は 404 と、この 400＋code の両方（`isMfNotFound`）
 - 🔄 **免税事業者に設定した事業者では、仕訳に税区分を登録できない**（[MF 公式](https://biz.moneyforward.com/support/account/guide/office02/of02.html)「「免税事業者」では、「消費税」機能が利用不可となり、仕訳に税区分を登録できません」）。
   kadobo は `tax_id`・`invoice_kind` を**送らない**。送った場合の挙動は S-M5 で確認する
 
@@ -675,7 +676,7 @@ JOURNALIZING（回収。毎回の実行の最初に行う）:
 §6.3 の手順 2 で、**仕訳がある行**（`SYNCED`、または回収で仕訳が見つかった `CREATING`/`JOURNALIZING`）を見つけたら:
 
 1. ロック内で `REVERSING` にする
-2. `DELETE /journals/{MF仕訳ID}` を呼ぶ（404 は削除済みとして成功扱い）
+2. `DELETE /journals/{MF仕訳ID}` を呼ぶ（404、または 400 `invalid_request_path_parameter` は削除済みとして成功扱い。§3.2）
 3. `REVERSED` にし、Slack に 1 行通知する。**この時点で明細を手放す**（§6.5 の使用中の判定から外れる）
 4. 訂正後の新しい行は通常どおり同期される。⚠️ **明細から作った仕訳を消すと、OpenAPI の `DELETE /journals/{id}` の説明では明細の仕訳化ステータスが「対象外（`excluded`）」になる**（2026-10-08 に WP-M4 の実装中に判明。v2 の「未仕訳に戻る見込み」は誤り）。`excluded` の明細は `journalizing_statuses=none` の照合に出てこない。**③ の訂正では「削除して作り直す」のではなく `PUT /journals/{id}` で仕訳を更新する**か、`excluded` の明細を `journalize` し直せるかを **S-M5（WP-M5 側）で確認**してから §6.5 を確定する。現金・立替（②）の削除には影響しない
 
@@ -825,7 +826,7 @@ shared を変えるので**両側**をデプロイする（runbook 02）。**GAS
 | **S-M2** | `GET /billings?document_number=` が完全一致か部分一致か。作成直後に検索して**すぐ見つかるか** | S-M1 の請求書 | ✅ **2026-10-08 完了**。完全一致、作成直後に 1 件返る（未決事項 §6.8） |
 | **S-M3** | API キーの発行 → `/auth/exchange` → `GET /accessible_offices`（`office_code`）→ `GET /accounts`（§6.4 の 8 科目が名前完全一致で引けるか） | なし（すぐできる） | ✅ **2026-10-08 完了**（`mfAccountingPing` で実施。未決事項 §6.14 の実測表）。8 科目とも 1 件ずつ引ける。既定 `tax_id` は `available: false`（免税設定）なので送らない方針で確定 |
 | **S-M4** | カードと口座を MF に連携 → `GET /connected_accounts` → `GET /transactions`。**カード明細の `date` が利用日か計上日か**、`content` の表記（店名・**NISA のクレカ積立と口座積立**・カード引落し） | 利用者による連携 | `MATCH_DAYS_*`、明細ルールの文字列と金額、`MF_CARD_ACCOUNT_IDS`/`MF_BANK_ACCOUNT_IDS` |
-| **S-M5** | テスト仕訳を `POST /journals` で作る（**`tax_id` なしで作れるか、免税事業者の設定で金額が税込のまま入るか**、tags・remark・memo が保存されるか）→ 作成直後に `GET /journals` で見つかるか → `DELETE`。連携明細 1 件を `journalize` → `DELETE` して**明細が未仕訳に戻るか** | S-M3・S-M4 | §6.4・§6.7 の前提 |
+| **S-M5** | テスト仕訳を `POST /journals` で作る（**`tax_id` なしで作れるか、免税事業者の設定で金額が税込のまま入るか**、tags・remark・memo が保存されるか）→ 作成直後に `GET /journals` で見つかるか → `DELETE`。連携明細 1 件を `journalize` → `DELETE` して**明細が未仕訳に戻るか** | S-M3・S-M4 | 🔄 **`POST /journals` 部分は 2026-10-8 完了**（未決事項 §6.14 の実測表。`tax_id` なしで `INVOICE_KIND_NOT_TARGET`・税額 0、タグ検索可、パス ID は 1 回エンコード、存在しない ID は 400）。**`journalize` と削除後の明細（`excluded`）の扱いは未実施**（カード・口座の連携後、WP-M5 で） |
 | **S-M6** 🔄 | GAS で、ユーザーロックを持ったまま別の実行がスクリプトロックを取れるか（2 つのロックが干渉しないか） | なし | §4.1 の `AuthLockPort` |
 
 - S-M1・S-M5 で作ったものは**必ず削除する**（S-M5 は会計帳簿に残ると決算に影響する）
