@@ -12,7 +12,16 @@
 import { handlePostBody } from "./app/dispatch";
 import { makeMfAccountingClient } from "./app/mf/accountingClient";
 import { makeMfInvoiceClient } from "./app/mf/invoiceClient";
-import { extractAccountCount, extractOfficeCodes, extractOfficeName } from "./app/mf/pingFormat";
+import {
+  collectTaxIds,
+  extractOfficeName,
+  extractOffices,
+  formatAccountCounts,
+  formatAccountLookup,
+  formatOffice,
+  formatTaxLine,
+  lookupAccountsByName,
+} from "./app/mf/pingFormat";
 import type { AppPorts } from "./app/ports";
 import {
   trigEveningCheck as runEveningCheck,
@@ -139,22 +148,42 @@ export function mfInvoicePing(): void {
 }
 
 /**
- * 手動実行: 会計 API（API キー）の疎通確認（実装設計 MF連携 §7 最後の箇条書き）。
- * `GET /accessible_offices` の事業者番号一覧と、`MF_OFFICE_CODE` があれば `GET /accounts` の
- * 件数を Logger に出す。**API キーは出力しない**。
+ * 手動実行: 会計 API（API キー）の疎通確認と、スパイク S-M3（実装設計 MF連携 §11.1）。
+ * `GET /accessible_offices` の事業者（名称・番号・区分）を出し、`MF_OFFICE_CODE` があれば続けて
+ * `GET /accounts?available=true`・`GET /accounts`（件数）・`GET /taxes` を呼ぶ。§6.4 の 8 科目が
+ * 名前完全一致で 1 件だけ引けるか、その `tax_id` の税区分が何かを Logger に出す
+ * （呼び出しは合計 4 回）。**API キー・トークンは出力しない**（整形は `pingFormat.ts` の純関数）。
  */
 export function mfAccountingPing(): void {
   const ports = buildPorts();
   const client = makeMfAccountingClient(ports);
 
-  const offices = client.request("get", "/accessible_offices");
-  const codes = extractOfficeCodes(offices);
-  Logger.log(`MF accounting GET /accessible_offices: ${codes.length > 0 ? codes.join(", ") : "(0 件)"}`);
+  const offices = extractOffices(client.request("get", "/accessible_offices"));
+  Logger.log(
+    `MF accounting GET /accessible_offices: ${offices.length > 0 ? offices.map(formatOffice).join(", ") : "(0 件)"}`,
+  );
 
   const officeCode = ports.props.get("MF_OFFICE_CODE");
   if (officeCode === null || officeCode === "") {
+    Logger.log("MF_OFFICE_CODE が未設定のため、/accounts と /taxes は呼びません。");
     return;
   }
-  const accounts = client.request("get", "/accounts");
-  Logger.log(`MF accounting GET /accounts: ${extractAccountCount(accounts)} 件`);
+
+  const availableAccounts = client.request("get", "/accounts", { available: "true" });
+  const allAccounts = client.request("get", "/accounts");
+  Logger.log(formatAccountCounts(availableAccounts, allAccounts));
+
+  const lookups = lookupAccountsByName(availableAccounts);
+  for (const l of lookups) {
+    Logger.log(formatAccountLookup(l));
+  }
+
+  const taxes = client.request("get", "/taxes");
+  const taxIds = collectTaxIds(lookups);
+  if (taxIds.length === 0) {
+    Logger.log("S-M3 税区分: 見つかった科目に tax_id がありません");
+  }
+  for (const id of taxIds) {
+    Logger.log(formatTaxLine(id, taxes));
+  }
 }
