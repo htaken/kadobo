@@ -14,6 +14,7 @@ import { makeMfAccountingClient } from "./app/mf/accountingClient";
 import { makeMfInvoiceClient } from "./app/mf/invoiceClient";
 import { runInvoiceSpikeS1 } from "./app/mf/spikeInvoice";
 import { runJournalSpikeS5 } from "./app/mf/spikeJournal";
+import { runTransactionSpikeS4 } from "./app/mf/spikeTransactions";
 import {
   collectTaxIds,
   extractOfficeName,
@@ -208,4 +209,16 @@ export function mfInvoiceSpikeS1(): void {
  */
 export function mfJournalSpikeS5(): void {
   runJournalSpikeS5(buildPorts(), (line) => Logger.log(line));
+}
+
+/**
+ * 手動実行: スパイク S-M4（実装設計 MF連携 §11.1）。連携サービス・口座の一覧（科目名つき）、
+ * `connected_account_id` のクエリ表記の探査、絞り込みなしで取った直近 90 日の明細（最大 3 ページ）を
+ * 連携サービスごとに分けた出力（先頭 40 件・口座名・`date` の範囲・`journalizing_status` の集計・
+ * NISA・積立・カード・引落しを含む `content`）を Logger に出す。
+ * **読み取り専用**（GET だけ）。シートには書かず、`MF_*_ENABLED` フラグも見ない。
+ * **API キー・トークンは出力しない**。
+ */
+export function mfTransactionSpikeS4(): void {
+  runTransactionSpikeS4(buildPorts(), (line) => Logger.log(line));
 }

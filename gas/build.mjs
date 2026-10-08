@@ -47,6 +47,7 @@ const entryFns = [
   { name: "mfAccountingPing", args: "" },
   { name: "mfInvoiceSpikeS1", args: "" },
   { name: "mfJournalSpikeS5", args: "" },
+  { name: "mfTransactionSpikeS4", args: "" },
 ];
 
 const wrappers = entryFns

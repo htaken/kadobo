@@ -84,15 +84,31 @@ function parseJwtResponse(body: string): string {
   return t.access_token;
 }
 
-function buildUrl(path: string, query: Record<string, string | string[]>, officeCode: string | null): string {
+/**
+ * クエリ値。文字列は `encodeURIComponent` を 1 回かけて置く。`{ raw }` は**エンコードせずそのまま**
+ * `key=value` に置く（配列も可）。
+ *
+ * MF が返す ID（連携サービス ID 等）は `%2B`・`%3D` を含む**パーセントエンコード済みの文字列**で、
+ * パスに置くときは 1 回エンコードする形が 200 だった（{@link pathWithId}）。一方クエリ値では、1 回エンコード
+ * （`%2B` → `%252B`）した形が 400 `invalid_query_parameter_value` になった（実機の S-M4、
+ * `GET /transactions?connected_account_id=…`）。クエリの ID の表記は実機の結果に従うこと
+ * （返された文字列そのまま `{ raw: id }`、または `{ raw: decodeURIComponent(id) }` を試す）。
+ */
+export type MfQueryValue = string | string[] | { raw: string } | { raw: string }[];
+
+function queryValueParts(value: MfQueryValue): string[] {
+  const values: (string | { raw: string })[] = Array.isArray(value) ? value : [value];
+  return values.map((v) => (typeof v === "string" ? encodeURIComponent(v) : v.raw));
+}
+
+function buildUrl(path: string, query: Record<string, MfQueryValue>, officeCode: string | null): string {
   const params: string[] = [];
   if (officeCode !== null) {
     params.push(`office_code=${encodeURIComponent(officeCode)}`);
   }
   for (const [key, value] of Object.entries(query)) {
-    const values = Array.isArray(value) ? value : [value];
-    for (const v of values) {
-      params.push(`${encodeURIComponent(key)}=${encodeURIComponent(v)}`);
+    for (const v of queryValueParts(value)) {
+      params.push(`${encodeURIComponent(key)}=${v}`);
     }
   }
   const qs = params.join("&");
@@ -112,7 +128,7 @@ export class MfAccountingClient {
   request(
     method: HttpMethod,
     path: string,
-    query: Record<string, string | string[]> = {},
+    query: Record<string, MfQueryValue> = {},
     body?: unknown,
     opts: { create?: boolean } = {},
   ): unknown {

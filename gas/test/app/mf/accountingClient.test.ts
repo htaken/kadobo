@@ -101,6 +101,25 @@ describe("MfAccountingClient.request", () => {
     expect(url).not.toContain("[]");
   });
 
+  it("query の文字列は 1 回エンコードし、{ raw } はエンコードせずそのまま置く（配列も可）", () => {
+    const ports = makeFakePorts();
+    setup(ports);
+    ports.ttlCache.put(MF_ACCOUNTING_JWT_CACHE_KEY, "JWT1", 3000);
+    ports.http.queueResponse({ status: 200, body: "{}" });
+    ports.http.queueResponse({ status: 200, body: "{}" });
+    const id = "ab%2Bc%3D%3D";
+
+    makeClient(ports).request("get", "/transactions", { once: id, rawId: { raw: id }, decoded: { raw: decodeURIComponent(id) } });
+    makeClient(ports).request("get", "/transactions", { ids: [{ raw: id }, { raw: "x%2By" }] });
+
+    const url = ports.http.calls[0]!.url;
+    expect(url).toContain("once=ab%252Bc%253D%253D");
+    expect(url).toContain("rawId=ab%2Bc%3D%3D");
+    expect(url).toContain("decoded=ab+c==");
+    const url2 = ports.http.calls[1]!.url;
+    expect(url2).toContain("ids=ab%2Bc%3D%3D&ids=x%2By");
+  });
+
   it("401 → JWT キャッシュを消して再交換し、1 回だけ再試行する", () => {
     const ports = makeFakePorts();
     setup(ports);
