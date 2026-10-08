@@ -9,7 +9,7 @@
 import type { ExpenseCategory, ExpenseState, PaymentMethod, ReceiptType } from "@kadobo/shared/expense";
 import { businessDateOf, formatJst } from "@kadobo/shared/time";
 import type { RecentDay } from "../core/businessDate";
-import type { JournalSyncState } from "../core/journalSync";
+import type { JournalSyncState, MfTransactionRule } from "../core/journalSync";
 import type { LoggedEvent, LogEventType } from "../core/state";
 import type { DailyStatus, Rounding, TaxCategory, UnitPriceRow, Withholding } from "../core/aggregate";
 import {
@@ -30,6 +30,7 @@ const SHEET_NAMES = {
   expenseLedger: "経費台帳",
   internal: "内部",
   correctionRequest: "訂正削除申請",
+  mfRules: "MF明細ルール",
 } as const;
 
 const RAW_LOG_HEADERS = [
@@ -194,6 +195,12 @@ const CORRECTION_REQUEST_HEADERS = [
   "処理担当者名",
 ] as const;
 
+/**
+ * MF明細ルール（実装設計 MF連携 §6.6）。人が編集するシート（GAS は読むだけ）。NISA の積立やカード代金の
+ * 引落しのような、証憑を伴わない連携明細の扱いを上から順に書く。
+ */
+const MF_RULE_HEADERS = ["ルール名", "対象", "内容に含む文字列", "金額", "処理", "勘定科目", "有効"] as const;
+
 const SHEET_HEADERS: Record<string, readonly string[]> = {
   [SHEET_NAMES.rawLog]: RAW_LOG_HEADERS,
   [SHEET_NAMES.dailySummary]: DAILY_SUMMARY_HEADERS,
@@ -202,6 +209,7 @@ const SHEET_HEADERS: Record<string, readonly string[]> = {
   [SHEET_NAMES.expenseLedger]: EXPENSE_LEDGER_HEADERS,
   [SHEET_NAMES.internal]: INTERNAL_HEADERS,
   [SHEET_NAMES.correctionRequest]: CORRECTION_REQUEST_HEADERS,
+  [SHEET_NAMES.mfRules]: MF_RULE_HEADERS,
 };
 
 /** 警告付き保護をかけるシート（実装設計 §7.1）。 */
@@ -242,6 +250,9 @@ const NON_TEXT_COLUMNS: Partial<Record<string, readonly number[]>> = {
   // 読めなくなる（`business_date` と同じ理由）。このシートは人手で記入するが、
   // `単価マスタ` と同じく GAS が書込ポートを持たない列でも先回りで text 化しておく。
   [SHEET_NAMES.correctionRequest]: [],
+  // MF明細ルール: 金額（4）は数値、有効（7）は真偽値のまま。他の列（ルール名・対象・内容・処理・勘定科目）は text 化する
+  // （「内容に含む文字列」が数字だけでも数値化されない）。
+  [SHEET_NAMES.mfRules]: [4, 7],
 };
 
 /** シートの text 化すべき列（1-based）を返す。`NON_TEXT_COLUMNS` に無いシートは対象外（`[]`）。 */
@@ -551,6 +562,31 @@ function strDateTimeOrNull(v: unknown): string | null {
 /** `Date` 化された年月セル（月次請求の `month`＝"YYYY-MM"）を復元する。 */
 function strMonth(v: unknown): string {
   return v instanceof Date ? businessDateOf(v.getTime()).slice(0, 7) : str(v);
+}
+
+/** `MF明細ルール` の金額セルを数値にする。空は `null`、数値に読めなければ `NaN`（`ruleDefects` が不備として報告する）。 */
+function parseRuleAmount(v: unknown): number | null {
+  if (typeof v === "number") {
+    return v;
+  }
+  const s = str(v).normalize("NFKC").replace(/[,\s]/g, "");
+  if (s === "") {
+    return null;
+  }
+  return /^-?\d+(\.\d+)?$/.test(s) ? Number(s) : Number.NaN;
+}
+
+function rowToMfRule(row: unknown[]): MfTransactionRule {
+  const enabledCell = row[6];
+  return {
+    name: str(row[0]).trim(),
+    target: str(row[1]).trim().toLowerCase(),
+    content: str(row[2]).trim(),
+    amount: parseRuleAmount(row[3]),
+    action: str(row[4]).trim(),
+    account: str(row[5]).trim(),
+    enabled: enabledCell === true || str(enabledCell).trim().toLowerCase() === "true",
+  };
 }
 
 function rowToRawLog(row: unknown[]): RawLogRow {
@@ -1107,5 +1143,20 @@ export class SheetsAdapter implements SheetsPort {
 
   getAllExpenses(): ExpenseLedgerRow[] {
     return this.dataRows(SHEET_NAMES.expenseLedger).map(rowToExpense);
+  }
+
+  // ---------------------------------------------------------------------------
+  // MF明細ルール（実装設計 MF連携 §6.6）
+  // ---------------------------------------------------------------------------
+
+  getMfTransactionRules(): MfTransactionRule[] {
+    const rules: MfTransactionRule[] = [];
+    for (const r of this.dataRows(SHEET_NAMES.mfRules)) {
+      if (r.every((c) => str(c).trim() === "")) {
+        continue;
+      }
+      rules.push(rowToMfRule(r));
+    }
+    return rules;
   }
 }

@@ -250,7 +250,12 @@ describe("対象判定と状態の進み方（§6.2, §6.3）", () => {
     expect(ports.http.calls).toHaveLength(0);
   });
 
-  it("JOURNALIZING の行には触れない（WP-M5）", () => {
+  it("JOURNALIZING の行は WP-M5 の回収の対象（MF_ENABLED が無効なら HTTP 0 件）。連携サービスの設定が無く明細を確かめられなければ状態を変えない", () => {
+    const off = setup({ mf: false });
+    add(off.ports, "R-J", { payment_method: "linked_card", mf_sync_state: "JOURNALIZING", mf_transaction_id: "tx%3D" });
+    syncExpenses(off.ports);
+    expect(off.ports.http.calls).toHaveLength(0);
+
     const { ports } = setup();
     add(ports, "R-J", { payment_method: "linked_card", mf_sync_state: "JOURNALIZING", mf_transaction_id: "tx%3D" });
     const before = get(ports, "R-J");
@@ -258,7 +263,7 @@ describe("対象判定と状態の進み方（§6.2, §6.3）", () => {
     syncExpenses(ports);
 
     expect(get(ports, "R-J")).toEqual(before);
-    expect(ports.http.calls).toHaveLength(0);
+    expect(accountingCallsOf(ports).filter((c) => c.startsWith("POST") || c.startsWith("PUT") || c.startsWith("DELETE"))).toEqual([]);
   });
 });
 

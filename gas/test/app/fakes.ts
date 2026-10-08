@@ -5,6 +5,7 @@
 import { createHash, createHmac } from "node:crypto";
 import { shiftBusinessDate } from "../../src/app/dateUtil";
 import { MfTransientError } from "../../src/app/mf/errors";
+import type { MfTransactionRule } from "../../src/core/journalSync";
 import { LockTimeoutError, orderedColumnKeys } from "../../src/app/ports";
 import type {
   AppPorts,
@@ -211,6 +212,18 @@ export class FakeSheets implements SheetsPort {
 
   getAllExpenses(): ExpenseLedgerRow[] {
     return [...this.expenses];
+  }
+
+  /** `MF明細ルール` シートの中身（上から順）。 */
+  mfRules: MfTransactionRule[] = [];
+  /** 設定すると `getMfTransactionRules` がこれを投げる（シートが無い場合の再現）。 */
+  mfRulesError: Error | null = null;
+
+  getMfTransactionRules(): MfTransactionRule[] {
+    if (this.mfRulesError !== null) {
+      throw this.mfRulesError;
+    }
+    return [...this.mfRules];
   }
 }
 

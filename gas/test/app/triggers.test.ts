@@ -16,7 +16,7 @@ import {
   type RawLogRow,
 } from "../../src/app/ports";
 import { makeFakePorts } from "./fakes";
-import { accountingCallsOf, installFakeMfAccounting } from "./mf/fakeMfAccounting";
+import { CARD_SERVICE_ID, accountingCallsOf, installFakeMfAccounting } from "./mf/fakeMfAccounting";
 
 function seedInvoiceTokens(ports: ReturnType<typeof makeFakePorts>): void {
   ports.secrets.set(
@@ -909,5 +909,59 @@ describe("trigWeeklyOrphanCheck — 週次報告の仕訳部分（実装設計 M
 
     expect(() => trigWeeklyOrphanCheck(ports)).not.toThrow();
     expect(ports.sheets.getInternalValue("mf_fail", "journal")).toBe("1");
+  });
+});
+
+describe("③ 連携明細の照合・週次報告（WP-M5。実装設計 MF連携 §6.5, §6.6, §7）", () => {
+  function matchPorts() {
+    const ports = makeFakePorts(Date.parse("2026-11-15T06:00:00+09:00"));
+    setupChannel(ports);
+    const api = installFakeMfAccounting(ports);
+    ports.props.set("MF_ENABLED", "true");
+    ports.props.set("MF_MATCH_ENABLED", "true");
+    ports.props.set("MF_SYNC_START_DATE", "2026-10-01");
+    ports.props.set("MF_CARD_ACCOUNT_IDS", CARD_SERVICE_ID);
+    return { ports, api };
+  }
+
+  it("trigMfSync（⑤ の経費同期）が、連携カードの行を未仕訳の明細と照合して明細から仕訳を作る", () => {
+    const { ports, api } = matchPorts();
+    const tx = api.plantTransaction({ date: "2026-11-10", value: 800 });
+    ports.sheets.appendExpense(
+      journalReadyRow("R-1", { payment_method: "linked_card", mf_sync_state: "WAITING_TRANSACTION" }),
+    );
+
+    trigMfSync(ports);
+
+    expect(ports.sheets.getExpenseByReceiptId("R-1")).toMatchObject({
+      mf_sync_state: "SYNCED",
+      mf_transaction_id: tx.id,
+    });
+    expect(accountingCallsOf(ports)).toContain("POST /transactions/journalize");
+    expect(ports.sheets.getInternalValue("mf_fail", "journal")).toBeNull();
+  });
+
+  it("trigMfSync は MF_MATCH_ENABLED が無ければ連携明細を取得しない（HTTP 0 件）", () => {
+    const { ports, api } = matchPorts();
+    ports.props.set("MF_MATCH_ENABLED", "false");
+    api.plantTransaction({ date: "2026-11-10", value: 800 });
+    ports.sheets.appendExpense(
+      journalReadyRow("R-1", { payment_method: "linked_card", mf_sync_state: "WAITING_TRANSACTION" }),
+    );
+
+    trigMfSync(ports);
+
+    expect(ports.http.calls).toHaveLength(0);
+  });
+
+  it("trigWeeklyOrphanCheck が、未登録の支出を週次報告に出す", () => {
+    const { ports, api } = matchPorts();
+    api.plantTransaction({ date: "2026-11-01", value: 3300, content: "未登録の店" });
+
+    trigWeeklyOrphanCheck(ports);
+
+    const text = ports.slack.posted.map((p) => p.text).join("\n");
+    expect(text).toContain("未登録の支出");
+    expect(text).toContain("未登録の店");
   });
 });

@@ -11,7 +11,7 @@
 import type { ExpenseCategory, ExpenseState, PaymentMethod, ReceiptType } from "@kadobo/shared/expense";
 import type { DailyStatus, UnitPriceRow } from "../core/aggregate";
 import type { RecentDay } from "../core/businessDate";
-import type { JournalSyncState } from "../core/journalSync";
+import type { JournalSyncState, MfTransactionRule } from "../core/journalSync";
 import type { InvoiceState } from "../core/monthClose";
 import type { LogEventType } from "../core/state";
 
@@ -277,6 +277,13 @@ export interface SheetsPort {
   ): void;
   /** 全行を返す（週次照合用。月数十件規模なので全件で足りる）。 */
   getAllExpenses(): ExpenseLedgerRow[];
+
+  /**
+   * 🔄 `MF明細ルール` シートを上から順に返す（実装設計 MF連携 §6.6, §8）。`有効` が TRUE でない行・
+   * `内容に含む文字列` が空の行も除かずに返す（検証は `core/journalSync.ts` の `ruleDefects`・`ruleProblems`。
+   * 週次報告に出すため）。全セルが空の行は除く。シートが無ければ例外を投げる（呼び出し側が通知する）。
+   */
+  getMfTransactionRules(): MfTransactionRule[];
 }
 
 // ---------------------------------------------------------------------------

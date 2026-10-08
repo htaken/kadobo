@@ -14,6 +14,7 @@ import { makeMfAccountingClient } from "./app/mf/accountingClient";
 import { makeMfInvoiceClient } from "./app/mf/invoiceClient";
 import { runInvoiceSpikeS1 } from "./app/mf/spikeInvoice";
 import { runJournalSpikeS5 } from "./app/mf/spikeJournal";
+import { runJournalizeSpikeS5b } from "./app/mf/spikeJournalize";
 import { runTransactionSpikeS4 } from "./app/mf/spikeTransactions";
 import {
   collectTaxIds,
@@ -221,4 +222,16 @@ export function mfJournalSpikeS5(): void {
  */
 export function mfTransactionSpikeS4(): void {
   runTransactionSpikeS4(buildPorts(), (line) => Logger.log(line));
+}
+
+/**
+ * 手動実行: スパイク S-M5 の後半（実装設計 MF連携 §11.1）。Script Property `MF_SPIKE_TRANSACTION_ID`（MF が返した
+ * 文字列そのまま）で指定した**開業日以降の未仕訳の支出明細 1 件**を、事業主貸で `journalize`（remark `私用: S-M5b`、
+ * tags `kadobo-spike-s5b`）→ `GET /journals?transaction_ids=` で引けるか確認 → `PUT /journals/{id}` で remark を
+ * `私用: S-M5b（PUT 確認）` に書き換え → 読み直して反映を確認し、Logger に出す。
+ * **仕訳は削除しない**（本番の仕訳として残る）。明細の `date` が `MF_SYNC_START_DATE` より前なら実行を拒否する。
+ * シートには書かず、`MF_*_ENABLED` フラグも見ない。**API キー・トークンは出力しない**。
+ */
+export function mfJournalizeSpikeS5b(): void {
+  runJournalizeSpikeS5b(buildPorts(), (line) => Logger.log(line));
 }

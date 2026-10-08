@@ -12,19 +12,47 @@ import {
   buildMemo,
   buildRemark,
   buildTags,
+  buildJournalUpdateBody,
+  buildJournalizeBody,
+  buildRuleJournalizeBody,
+  buildRuleRemark,
+  buildVoidRemark,
+  buildVoidTags,
   canTransition,
+  classifyTransaction,
   debitAccountNameOf,
   decideSyncTarget,
   findDuplicateReceiptTags,
   hasInputChanged,
+  holdsJournalAncestor,
+  indexLedgerRows,
   initialStateFor,
+  inputTransactionId,
   isCancelledExpenseState,
+  isCandidateFor,
   isJournalSyncState,
+  isNoCandidateNoticeDue,
+  isRuleUsable,
+  isWaitingForTransaction,
   journalHasTag,
   journalIdOf,
+  matchTransactions,
+  parseTransactions,
+  planLinkedCancellation,
+  ruleDefects,
+  ruleProblems,
+  serviceKindOf,
+  shiftDate,
+  singleBranchOf,
+  splitDateRangeBySpan,
   splitRangeByCalendarYear,
   summarizeSyncInput,
+  transactionKey,
   unescapeSheetFormula,
+  usedTransactionKeys,
+  type LedgerRowView,
+  type MfTransaction,
+  type MfTransactionRule,
   type SyncRowView,
 } from "../src/core/journalSync";
 import { EXPENSE_CATEGORIES } from "@kadobo/shared/expense";
@@ -319,5 +347,495 @@ describe("splitRangeByCalendarYear（週次報告の取得範囲。各区間は 
 
   it("start > end なら空", () => {
     expect(splitRangeByCalendarYear("2026-10-02", "2026-10-01")).toEqual([]);
+  });
+});
+
+
+// ===========================================================================
+// WP-M5: ③ 連携明細との照合（実装設計 §6.5・§6.6・§6.7）
+// ===========================================================================
+
+function ledger(id: string, o: Partial<LedgerRowView> = {}): LedgerRowView {
+  return {
+    receipt_id: id,
+    date: "2026-10-10",
+    amount: 1200,
+    partner: "○○商店",
+    category: "消耗品費",
+    drive_link: "https://drive.example.test/x",
+    state: "COMPLETED",
+    business_use_ratio: 100,
+    payment_method: "linked_card",
+    mf_journal_id: null,
+    mf_transaction_id: null,
+    mf_sync_input: "",
+    mf_sync_state: "WAITING_TRANSACTION",
+    correction_of_receipt_id: null,
+    input_at: 1,
+    ...o,
+  };
+}
+
+function tx(id: string, o: Partial<MfTransaction> = {}): MfTransaction {
+  return {
+    id,
+    date: "2026-10-10",
+    value: 1200,
+    side: "EXPENSE",
+    content: "コンビニ",
+    status: "none",
+    connected_account_id: "card%2Bsvc%3D",
+    service: "card",
+    ...o,
+  };
+}
+
+function rule(o: Partial<MfTransactionRule> = {}): MfTransactionRule {
+  return {
+    name: "NISA クレカ積立",
+    target: "card",
+    content: "SBI証券投信積立",
+    amount: 10000,
+    action: "私用として仕訳",
+    account: "事業主貸",
+    enabled: true,
+    ...o,
+  };
+}
+
+describe("serviceKindOf・shiftDate・splitDateRangeBySpan（§6.5）", () => {
+  it("linked_card → card、linked_bank → bank、cash・空 → null", () => {
+    expect(serviceKindOf("linked_card")).toBe("card");
+    expect(serviceKindOf("linked_bank")).toBe("bank");
+    expect(serviceKindOf("cash")).toBeNull();
+    expect(serviceKindOf("")).toBeNull();
+  });
+
+  it("shiftDate は暦日で移動する（月・年またぎ）", () => {
+    expect(shiftDate("2026-10-01", -3)).toBe("2026-09-28");
+    expect(shiftDate("2026-12-30", 5)).toBe("2027-01-04");
+  });
+
+  it("366 日以内は 1 区間、差がちょうど 366 日でも 1 区間、367 日を超えれば分割する（各区間の差は 366 日以内）", () => {
+    expect(splitDateRangeBySpan("2026-10-01", "2026-10-20")).toEqual([{ start: "2026-10-01", end: "2026-10-20" }]);
+    expect(splitDateRangeBySpan("2026-10-01", shiftDate("2026-10-01", 366))).toHaveLength(1);
+    const two = splitDateRangeBySpan("2026-10-01", shiftDate("2026-10-01", 367));
+    expect(two).toEqual([
+      { start: "2026-10-01", end: shiftDate("2026-10-01", 366) },
+      { start: shiftDate("2026-10-01", 367), end: shiftDate("2026-10-01", 367) },
+    ]);
+    const long = splitDateRangeBySpan("2026-10-01", "2028-12-31");
+    expect(long.length).toBe(3);
+    for (const r of long) {
+      expect((Date.parse(r.end) - Date.parse(r.start)) / 86_400_000).toBeLessThanOrEqual(366);
+    }
+    // 連続していて、抜け・重なりが無い。
+    expect(long[0]!.start).toBe("2026-10-01");
+    expect(long[long.length - 1]!.end).toBe("2028-12-31");
+    for (let i = 1; i < long.length; i++) {
+      expect(long[i]!.start).toBe(shiftDate(long[i - 1]!.end, 1));
+    }
+  });
+
+  it("start > end なら空", () => {
+    expect(splitDateRangeBySpan("2026-10-02", "2026-10-01")).toEqual([]);
+  });
+});
+
+describe("parseTransactions（GET /transactions の応答）", () => {
+  it("ID はそのまま。id・date・value が読めない要素は除く。連携サービスの種別を付ける", () => {
+    const res = {
+      transactions: [
+        { id: "a%2B1%3D", date: "2026-10-05", value: 1200, side: "EXPENSE", content: "店", journalizing_status: "none", connected_account_id: "c%3D" },
+        { id: "", date: "2026-10-05", value: 1 },
+        { id: "b", date: "bad", value: 1 },
+        { id: "c", date: "2026-10-05", value: "x" },
+        { id: "d", date: "2026-10-06", value: "300" },
+      ],
+    };
+    const out = parseTransactions(res, "bank");
+    expect(out.map((t) => t.id)).toEqual(["a%2B1%3D", "d"]);
+    expect(out[0]).toMatchObject({ value: 1200, side: "EXPENSE", content: "店", status: "none", service: "bank", connected_account_id: "c%3D" });
+    expect(out[1]!.value).toBe(300);
+    expect(parseTransactions({}, "card")).toEqual([]);
+  });
+
+  it("transactionKey はエンコードの有無を吸収する", () => {
+    expect(transactionKey("a%2Bb%3D")).toBe("a+b=");
+    expect(transactionKey("a+b=")).toBe("a+b=");
+  });
+});
+
+describe("明細ルールの検証（§6.6）", () => {
+  it("正常なルールは不備なし・使える", () => {
+    expect(ruleDefects(rule())).toEqual([]);
+    expect(ruleProblems(rule())).toEqual([]);
+    expect(isRuleUsable(rule())).toBe(true);
+    expect(isRuleUsable(rule({ action: "無視", account: "", amount: null }))).toBe(true);
+  });
+
+  it("内容に含む文字列が空（空白だけも）は無効。有効が TRUE でないルールは使わず、理由に出る", () => {
+    expect(ruleDefects(rule({ content: "" }))[0]).toContain("内容に含む文字列が空");
+    expect(isRuleUsable(rule({ content: "   " }))).toBe(false);
+    expect(isRuleUsable(rule({ enabled: false }))).toBe(false);
+    expect(ruleProblems(rule({ enabled: false })).join()).toContain("有効が TRUE ではありません");
+    expect(ruleDefects(rule({ enabled: false }))).toEqual([]);
+  });
+
+  it("対象・処理の不正、金額が数値でない、私用なのに勘定科目が空、ルール名が空は不備", () => {
+    expect(ruleDefects(rule({ target: "all" })).join()).toContain("対象");
+    expect(ruleDefects(rule({ action: "削除" })).join()).toContain("処理");
+    expect(ruleDefects(rule({ amount: Number.NaN })).join()).toContain("金額");
+    expect(ruleDefects(rule({ account: "" })).join()).toContain("勘定科目が空");
+    expect(ruleDefects(rule({ action: "無視", account: "" }))).toEqual([]);
+    expect(ruleDefects(rule({ name: "" })).join()).toContain("ルール名");
+  });
+});
+
+describe("classifyTransaction（§6.6。上から順に最初の一致）", () => {
+  const nisa = "SBI証券投信積立サ-ビス(翌月買付分)";
+
+  it("対象 card／bank は取得元と一致するときだけ、any はどちらでも当たる", () => {
+    const rs = [rule({ target: "card", amount: null })];
+    expect(classifyTransaction({ content: nisa, value: 10000 }, rs, "card")?.index).toBe(0);
+    expect(classifyTransaction({ content: nisa, value: 10000 }, rs, "bank")).toBeNull();
+    const bank = [rule({ target: "bank", amount: null })];
+    expect(classifyTransaction({ content: nisa, value: 10000 }, bank, "bank")?.index).toBe(0);
+    expect(classifyTransaction({ content: nisa, value: 10000 }, bank, "card")).toBeNull();
+    const any = [rule({ target: "any", amount: null })];
+    expect(classifyTransaction({ content: nisa, value: 1 }, any, "card")?.index).toBe(0);
+    expect(classifyTransaction({ content: nisa, value: 1 }, any, "bank")?.index).toBe(0);
+  });
+
+  it("内容は部分一致。金額があれば一致を要求する（空なら金額を問わない）", () => {
+    const withAmount = [rule({ amount: 10000 })];
+    expect(classifyTransaction({ content: nisa, value: 10000 }, withAmount, "card")).not.toBeNull();
+    expect(classifyTransaction({ content: nisa, value: 10001 }, withAmount, "card")).toBeNull();
+    expect(classifyTransaction({ content: "別の店", value: 10000 }, withAmount, "card")).toBeNull();
+    const noAmount = [rule({ amount: null })];
+    expect(classifyTransaction({ content: nisa, value: 99 }, noAmount, "card")).not.toBeNull();
+  });
+
+  it("上から順に見て最初に当たったルールを使う（後ろのルールは見ない）", () => {
+    const rs = [
+      rule({ name: "先", action: "無視", account: "", amount: null }),
+      rule({ name: "後", action: "私用として仕訳", amount: null }),
+    ];
+    const hit = classifyTransaction({ content: nisa, value: 10000 }, rs, "card");
+    expect(hit?.rule.name).toBe("先");
+    expect(hit?.index).toBe(0);
+  });
+
+  it("内容が空のルール・有効でないルールは無視して、次のルールを見る", () => {
+    const rs = [
+      rule({ name: "空", content: "", amount: null }),
+      rule({ name: "停止", enabled: false, amount: null }),
+      rule({ name: "有効", amount: null }),
+    ];
+    const hit = classifyTransaction({ content: nisa, value: 1 }, rs, "card");
+    expect(hit?.rule.name).toBe("有効");
+    expect(hit?.index).toBe(2);
+    expect(classifyTransaction({ content: "何でも", value: 1 }, [rule({ content: "" })], "card")).toBeNull();
+  });
+
+  it("全角半角・大文字小文字の違いを吸収して一致する（NFKC）", () => {
+    const rs = [rule({ content: "ﾐﾂｲｽﾐﾄﾓｶ", target: "bank", action: "無視", account: "", amount: null })];
+    expect(classifyTransaction({ content: "ミツイスミトモカ-ド (カ", value: 80000 }, rs, "bank")).not.toBeNull();
+    expect(classifyTransaction({ content: "ｓｂｉ証券", value: 1 }, [rule({ content: "SBI", amount: null })], "card")).not.toBeNull();
+  });
+});
+
+describe("inputTransactionId（mf_sync_input の 5 番目の項目）", () => {
+  it("kadobo が押さえた明細 ID を取り出す。要約が空・明細 ID が無ければ null", () => {
+    expect(inputTransactionId("1200|2026-10-10|消耗品費|linked_card|t%2B1%3D")).toBe("t%2B1%3D");
+    expect(inputTransactionId("1200|2026-10-10|消耗品費|cash|")).toBeNull();
+    expect(inputTransactionId("")).toBeNull();
+  });
+});
+
+describe("usedTransactionKeys・isCandidateFor（§6.5）", () => {
+  it("使用中の状態は JOURNALIZING・SYNCED・REVERSING・NEEDS_REVIEW。REVERSED・ERROR・WAITING・空は手放している", () => {
+    const rows = [
+      ledger("a", { mf_sync_state: "JOURNALIZING", mf_transaction_id: "t1%3D" }),
+      ledger("b", { mf_sync_state: "SYNCED", mf_transaction_id: "t2%3D" }),
+      ledger("c", { mf_sync_state: "REVERSING", mf_transaction_id: "t3%3D" }),
+      ledger("d", { mf_sync_state: "NEEDS_REVIEW", mf_transaction_id: "t4%3D" }),
+      ledger("e", { mf_sync_state: "REVERSED", mf_transaction_id: "t5%3D" }),
+      ledger("f", { mf_sync_state: "ERROR", mf_transaction_id: "t6%3D" }),
+      ledger("g", { mf_sync_state: "WAITING_TRANSACTION", mf_transaction_id: "t7%3D" }),
+      ledger("h", { mf_sync_state: "SYNCED", mf_transaction_id: null }),
+    ];
+    expect([...usedTransactionKeys(rows)].sort()).toEqual(["t1=", "t2=", "t3=", "t4="]);
+    expect([...usedTransactionKeys(rows, "a")].sort()).toEqual(["t2=", "t3=", "t4="]);
+  });
+
+  it("候補の条件: 連携サービス・金額・日付 [日付 − 2, 日付 + 5]（両端を含む）", () => {
+    const row = { payment_method: "linked_card" as const, amount: 1200, date: "2026-10-10" };
+    expect(isCandidateFor(row, tx("t", { date: "2026-10-07" }))).toBe(false);
+    expect(isCandidateFor(row, tx("t", { date: "2026-10-08" }))).toBe(true);
+    expect(isCandidateFor(row, tx("t", { date: "2026-10-15" }))).toBe(true);
+    expect(isCandidateFor(row, tx("t", { date: "2026-10-16" }))).toBe(false);
+    expect(isCandidateFor(row, tx("t", { value: 1201 }))).toBe(false);
+    expect(isCandidateFor(row, tx("t", { service: "bank" }))).toBe(false);
+    expect(isCandidateFor({ ...row, payment_method: "cash" }, tx("t"))).toBe(false);
+  });
+});
+
+describe("matchTransactions（§6.5 の表駆動。一対一のときだけ確定）", () => {
+  it("候補 0 件 → none。候補 1 件で他の待ち行と取り合わない → matched", () => {
+    const rows = [ledger("R-1")];
+    expect(matchTransactions(rows, [])).toEqual([{ kind: "none", receipt_id: "R-1" }]);
+    expect(matchTransactions(rows, [tx("t1", { value: 999 })])).toEqual([{ kind: "none", receipt_id: "R-1" }]);
+    const out = matchTransactions(rows, [tx("t1")]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ kind: "matched", receipt_id: "R-1" });
+    expect((out[0] as { transaction: MfTransaction }).transaction.id).toBe("t1");
+  });
+
+  it("候補が複数 → review（multiple。日付・ID の順に並べる）。日付が近いものを優先して決めない", () => {
+    const rows = [ledger("R-1")];
+    const out = matchTransactions(rows, [tx("t2", { date: "2026-10-12" }), tx("t1", { date: "2026-10-10" })]);
+    expect(out[0]).toMatchObject({ kind: "review", reason: "multiple" });
+    expect((out[0] as { candidates: MfTransaction[] }).candidates.map((t) => t.id)).toEqual(["t1", "t2"]);
+  });
+
+  it("支払方法と連携サービスの対応: linked_card はカードの明細だけ、linked_bank は口座の明細だけ", () => {
+    const card = ledger("R-C", { payment_method: "linked_card" });
+    const bank = ledger("R-B", { payment_method: "linked_bank", amount: 1200 });
+    const out = matchTransactions([card, bank], [tx("tb", { service: "bank" })]);
+    expect(out.find((o) => o.receipt_id === "R-C")?.kind).toBe("none");
+    expect(out.find((o) => o.receipt_id === "R-B")?.kind).toBe("matched");
+  });
+
+  it("取り合い: 2 行が同じ 1 件を候補にしていれば、両方 review（contested）で確定しない", () => {
+    const rows = [ledger("R-1"), ledger("R-2", { date: "2026-10-11" })];
+    const out = matchTransactions(rows, [tx("t1")]);
+    expect(out.map((o) => o.kind)).toEqual(["review", "review"]);
+    expect(out.every((o) => o.kind === "review" && o.reason === "contested")).toBe(true);
+  });
+
+  it("バッチ（20 行）の外にある行との取り合いも見る（待ち行すべてで照合する）", () => {
+    const rows: LedgerRowView[] = [];
+    const txs: MfTransaction[] = [];
+    for (let i = 1; i <= 24; i++) {
+      rows.push(ledger(`R-${String(i).padStart(2, "0")}`, { amount: 1000 + i }));
+      txs.push(tx(`t${i}`, { value: 1000 + i }));
+    }
+    // 25 行目は 1 行目と同じ金額・日付 → 1 件の明細を取り合う。
+    rows.push(ledger("R-25", { amount: 1001 }));
+    const out = matchTransactions(rows, txs);
+    expect(out).toHaveLength(25);
+    expect(out.find((o) => o.receipt_id === "R-01")).toMatchObject({ kind: "review", reason: "contested" });
+    expect(out.find((o) => o.receipt_id === "R-25")).toMatchObject({ kind: "review", reason: "contested" });
+    expect(out.filter((o) => o.kind === "matched")).toHaveLength(23);
+  });
+
+  it("使用中の明細（JOURNALIZING・SYNCED・REVERSING・NEEDS_REVIEW の行の MF明細ID）は候補にしない。手放した明細（REVERSED・ERROR）は候補になる", () => {
+    for (const st of ["JOURNALIZING", "SYNCED", "REVERSING", "NEEDS_REVIEW"] as const) {
+      const rows = [ledger("R-1"), ledger("R-0", { mf_sync_state: st, mf_transaction_id: "t1", amount: 5, date: "2026-09-01" })];
+      expect(matchTransactions(rows, [tx("t1")])[0]).toMatchObject({ kind: "none" });
+    }
+    for (const st of ["REVERSED", "ERROR"] as const) {
+      const rows = [ledger("R-1"), ledger("R-0", { mf_sync_state: st, mf_transaction_id: "t1" })];
+      expect(matchTransactions(rows, [tx("t1")])[0]).toMatchObject({ kind: "matched" });
+    }
+  });
+
+  it("日付幅: 日付 − 3 日・日付 + 6 日の明細は候補にしない（−2〜+5 は候補）", () => {
+    const rows = [ledger("R-1")];
+    expect(matchTransactions(rows, [tx("t", { date: "2026-10-07" })])[0]!.kind).toBe("none");
+    expect(matchTransactions(rows, [tx("t", { date: "2026-10-08" })])[0]!.kind).toBe("matched");
+    expect(matchTransactions(rows, [tx("t", { date: "2026-10-15" })])[0]!.kind).toBe("matched");
+    expect(matchTransactions(rows, [tx("t", { date: "2026-10-16" })])[0]!.kind).toBe("none");
+  });
+
+  it("待ち行でない行（WAITING_TRANSACTION 以外・登録未完了・仕訳あり・cash）は対象にしない", () => {
+    const rows = [
+      ledger("R-a", { mf_sync_state: "" }),
+      ledger("R-b", { state: "FILE_SAVED" }),
+      ledger("R-c", { mf_journal_id: "j1" }),
+      ledger("R-d", { payment_method: "cash" }),
+    ];
+    expect(matchTransactions(rows, [tx("t")])).toEqual([]);
+  });
+
+  it("訂正元が仕訳を持つ（SYNCED 等）間、訂正後の新しい行は照合に出さない。訂正元が REVERSED なら通常どおり照合する", () => {
+    const old = ledger("R-OLD", { mf_sync_state: "SYNCED", mf_transaction_id: "t0", state: "CORRECTED", mf_journal_id: "j0" });
+    const neu = ledger("R-NEW", { correction_of_receipt_id: "R-OLD" });
+    expect(matchTransactions([old, neu], [tx("t1")])).toEqual([]);
+    expect(isWaitingForTransaction(neu, indexLedgerRows([old, neu]))).toBe(false);
+    expect(holdsJournalAncestor(neu, indexLedgerRows([old, neu]))).toBe(true);
+    const released = { ...old, mf_sync_state: "REVERSED" as const };
+    expect(matchTransactions([released, neu], [tx("t1")])[0]).toMatchObject({ kind: "matched", receipt_id: "R-NEW" });
+    // 訂正の連鎖（孫）でも祖先をたどる。
+    const grand = ledger("R-NEW2", { correction_of_receipt_id: "R-NEW" });
+    expect(holdsJournalAncestor(grand, indexLedgerRows([old, neu, grand]))).toBe(true);
+  });
+
+  it("isNoCandidateNoticeDue: 日付から 14 日たった日から（当日を含む）", () => {
+    expect(isNoCandidateNoticeDue("2026-10-05", "2026-10-18")).toBe(false);
+    expect(isNoCandidateNoticeDue("2026-10-05", "2026-10-19")).toBe(true);
+    expect(isNoCandidateNoticeDue("2026-10-05", "2026-11-30")).toBe(true);
+  });
+});
+
+describe("journalize 本文（§6.5・§6.6）", () => {
+  it("経費の journalize: transaction_date は経費台帳の日付（明細の日付ではない）、remark・memo・tags は §2.2 と同じ、tax_id なし", () => {
+    const body = buildJournalizeBody(ledger("R-1", { date: "2026-10-10" }), "t%2B1%3D", "acc%2B1%3D");
+    expect(body).toEqual({
+      transaction_id: "t%2B1%3D",
+      transaction_date: "2026-10-10",
+      account_id: "acc%2B1%3D",
+      remark: "R-1 ○○商店",
+      memo: "https://drive.example.test/x",
+      tags: ["R-1"],
+    });
+    const json = JSON.stringify(body);
+    expect(json).not.toContain("tax_id");
+    expect(json).not.toContain("invoice_kind");
+    expect("memo" in buildJournalizeBody(ledger("R-1", { drive_link: "" }), "t", "a")).toBe(false);
+  });
+
+  it("ルールの journalize: remark `私用: {ルール名}`、tags [kadobo-rule]、transaction_date は明細の日付", () => {
+    expect(buildRuleRemark("NISA クレカ積立")).toBe("私用: NISA クレカ積立");
+    expect(buildRuleJournalizeBody(tx("t1", { date: "2026-10-13" }), "NISA クレカ積立", "acc%3D")).toEqual({
+      transaction_id: "t1",
+      transaction_date: "2026-10-13",
+      account_id: "acc%3D",
+      remark: "私用: NISA クレカ積立",
+      tags: ["kadobo-rule"],
+    });
+  });
+
+  it("取消の remark・tags", () => {
+    expect(buildVoidRemark("R-1", "'=商店")).toBe("取消: R-1 =商店");
+    expect(buildVoidTags("R-1")).toEqual(["R-1", "kadobo-void"]);
+  });
+});
+
+describe("PUT /journals/{id} 本文（§6.7 🔄）", () => {
+  const existing = {
+    id: "j%2B1%3D",
+    transaction_date: "2026-10-10",
+    journal_type: "journal_entry",
+    memo: "https://drive.example.test/old",
+    tags: ["R-OLD"],
+    transaction_id: "t1",
+    branches: [
+      {
+        remark: "R-OLD 旧店",
+        debitor: { account_id: "exp%2B1%3D", value: 1200, account_name: "消耗品費", tax_name: "対象外", tax_id: "TAX", sub_account_id: "oldsub", department_id: "dep1" },
+        creditor: { account_id: "card%2B9%3D", value: 1200, account_name: "未払金", sub_account_id: "cardsub", tax_id: "TAX2", invoice_kind: "INVOICE_KIND_NOT_TARGET" },
+      },
+    ],
+  };
+
+  it("借方の account_id・value、remark、tags、memo を差し替え、貸方の科目・金額は変えない。tax_id・invoice_kind は送らない", () => {
+    const r = buildJournalUpdateBody(existing, {
+      debitAccountId: "priv%3D",
+      remark: "取消: R-OLD 旧店",
+      tags: ["R-OLD", "kadobo-void"],
+      memo: "https://drive.example.test/old",
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) {
+      return;
+    }
+    expect(r.body).toEqual({
+      journal: {
+        transaction_date: "2026-10-10",
+        journal_type: "journal_entry",
+        branches: [
+          {
+            debitor: { account_id: "priv%3D", value: 1200, department_id: "dep1" },
+            creditor: { account_id: "card%2B9%3D", value: 1200, sub_account_id: "cardsub" },
+            remark: "取消: R-OLD 旧店",
+          },
+        ],
+        memo: "https://drive.example.test/old",
+        tags: ["R-OLD", "kadobo-void"],
+      },
+    });
+    const json = JSON.stringify(r.body);
+    expect(json).not.toContain("tax_id");
+    expect(json).not.toContain("invoice_kind");
+    expect(json).not.toContain("oldsub");
+  });
+
+  it("memo を渡さなければ memo キーを付けない。取引日・借方金額は指定すれば差し替える", () => {
+    const r = buildJournalUpdateBody(existing, {
+      debitAccountId: "x",
+      debitValue: 1200,
+      remark: "r",
+      tags: [],
+      transactionDate: "2026-10-12",
+    });
+    expect(r.ok && "memo" in r.body.journal).toBe(false);
+    expect(r.ok && r.body.journal.transaction_date).toBe("2026-10-12");
+  });
+
+  it("貸方と金額が合わなくなる更新・1 行でない仕訳は ok: false（送らずに人の確認に回す）", () => {
+    expect(buildJournalUpdateBody(existing, { debitAccountId: "x", debitValue: 1500, remark: "r", tags: [] })).toMatchObject({ ok: false });
+    expect(buildJournalUpdateBody({ ...existing, branches: [existing.branches[0], existing.branches[0]] }, { debitAccountId: "x", remark: "r", tags: [] })).toMatchObject({ ok: false });
+    expect(buildJournalUpdateBody({ ...existing, branches: [] }, { debitAccountId: "x", remark: "r", tags: [] })).toMatchObject({ ok: false });
+    expect(singleBranchOf({ branches: [{ debitor: { account_id: "a" }, creditor: { account_id: "b", value: 1 } }] })).toBeNull();
+  });
+});
+
+describe("planLinkedCancellation（§6.7 🔄・§6.5）", () => {
+  const old = (o: Partial<LedgerRowView> = {}): LedgerRowView =>
+    ledger("R-OLD", { state: "CORRECTED", mf_sync_state: "SYNCED", mf_journal_id: "j1", mf_transaction_id: "t1", ...o });
+  const neu = (o: Partial<LedgerRowView> = {}): LedgerRowView =>
+    ledger("R-NEW", { correction_of_receipt_id: "R-OLD", mf_sync_state: "", ...o });
+
+  it("VOID は void", () => {
+    expect(planLinkedCancellation(old({ state: "VOID" }), [old({ state: "VOID" })], START)).toEqual({ kind: "void" });
+  });
+
+  it("CORRECTED で訂正後の新しい行が無い・登録中・エラーなら wait", () => {
+    expect(planLinkedCancellation(old(), [old()], START)).toEqual({ kind: "wait" });
+    expect(planLinkedCancellation(old(), [old(), neu({ state: "FILE_SAVED" })], START)).toEqual({ kind: "wait" });
+    expect(planLinkedCancellation(old(), [old(), neu({ state: "ERROR" })], START)).toEqual({ kind: "wait" });
+  });
+
+  it("新しい行が同じ支払方法・同じ金額・自動仕訳の対象・仕訳なしなら inherit（状態は空でも WAITING_TRANSACTION でも）", () => {
+    expect(planLinkedCancellation(old(), [old(), neu()], START)).toEqual({ kind: "inherit", successor: "R-NEW" });
+    expect(planLinkedCancellation(old(), [old(), neu({ mf_sync_state: "WAITING_TRANSACTION" })], START)).toEqual({
+      kind: "inherit",
+      successor: "R-NEW",
+    });
+  });
+
+  it("金額・支払方法が違う、割合 100 未満、開業前、他の仕訳を持つ新しい行は void（旧仕訳は事業主貸にして、新しい行は通常の照合へ）", () => {
+    for (const o of [
+      { amount: 1500 },
+      { payment_method: "linked_bank" as const },
+      { payment_method: "cash" as const },
+      { business_use_ratio: 50 },
+      { date: "2026-09-30" },
+      { mf_sync_state: "JOURNALIZING" as const },
+      { mf_journal_id: "jX" },
+    ]) {
+      expect(planLinkedCancellation(old(), [old(), neu(o)], START)).toEqual({ kind: "void" });
+    }
+  });
+
+  it("新しい行がすべて VOID なら void。開業日が未設定なら wait", () => {
+    expect(planLinkedCancellation(old(), [old(), neu({ state: "VOID" })], START)).toEqual({ kind: "void" });
+    expect(planLinkedCancellation(old(), [old(), neu()], null)).toEqual({ kind: "wait" });
+  });
+
+  it("新しい行が既にこの仕訳を持っていれば done", () => {
+    expect(planLinkedCancellation(old(), [old(), neu({ mf_sync_state: "SYNCED", mf_journal_id: "j1" })], START)).toEqual({
+      kind: "done",
+      successor: "R-NEW",
+    });
+  });
+
+  it("訂正の連鎖: 中間の CORRECTED を飛ばして最後の COMPLETED の行に引き継ぐ。最後の行が未登録なら wait", () => {
+    const mid = neu({ state: "CORRECTED" });
+    const last = ledger("R-NEW2", { correction_of_receipt_id: "R-NEW", mf_sync_state: "" });
+    expect(planLinkedCancellation(old(), [old(), mid, last], START)).toEqual({ kind: "inherit", successor: "R-NEW2" });
+    expect(planLinkedCancellation(old(), [old(), mid], START)).toEqual({ kind: "wait" });
   });
 });

@@ -7,6 +7,9 @@
  * - §2.2 の `remark`・`memo`・`tags`
  * - §6.1 の `MF連携入力`（`mf_sync_input`）の要約と変更検出
  * - `GET /journals` の応答の読み取り（タグ検索・重複検出）
+ * - WP-M5 の ③ 連携明細: 照合（{@link matchTransactions}）、明細ルールの判定（{@link classifyTransaction}）、
+ *   `journalize` と `PUT /journals/{id}` の本文、訂正・取消の引継ぎ計画（{@link planLinkedCancellation}）、
+ *   `GET /transactions` の期間分割（{@link splitDateRangeBySpan}）
  *
  * 引数の行は {@link SyncRowView}（`ExpenseLedgerRow` が構造的に満たす最小の形）にしてあり、
  * `app/ports.ts` には依存しない（`ports.ts` がこのファイルの {@link JournalSyncState} を参照する）。
@@ -55,7 +58,7 @@ export const IMPORTABLE_STATES: readonly JournalSyncState[] = [...NO_JOURNAL_STA
 /**
  * kadobo が行う遷移の表（実装設計 §6.3, §6.4, §6.7）。人がシートで状態を書き換える操作（空に戻す等）は
  * ここを通らない。`from → to` が表に無ければ {@link canTransition} は `false`。同じ状態への書き込み
- * （列だけ更新する）は常に許す。`JOURNALIZING` 関連は WP-M5 の範囲だが、状態機械として今回定義する。
+ * （列だけ更新する）は常に許す。`JOURNALIZING` 関連（③。WP-M5）もこの表で定義する。
  */
 const TRANSITIONS: Record<JournalSyncState, readonly JournalSyncState[]> = {
   // `REVERSING` は取消された行に人が `MF仕訳ID` を記入していた場合（仕訳がある。§6.7）。
@@ -256,6 +259,15 @@ export function summarizeSyncInput(row: SyncRowView): string {
 }
 
 /**
+ * `mf_sync_input` の 5 番目の項目（kadobo が仕訳を作るときに押さえた明細 ID）。要約が空・明細 ID が無ければ `null`。
+ * 人が記入した `MF明細ID`（要約の明細 ID と違う、または要約が空）と、kadobo が押さえた明細 ID を見分けるのに使う。
+ */
+export function inputTransactionId(input: string): string | null {
+  const t = input.split("|")[4];
+  return t !== undefined && t !== "" ? t : null;
+}
+
+/**
  * `mf_sync_input` に保存した**作成時の日付**（2 番目の項目）。仕訳を作った時点の `日付` で、作成後に台帳の
  * `日付` を直されても変わらない回収キー（`GET /journals?start_date&end_date` の検索日）として使う。
  * 要約が空・形式が違えば `null`。
@@ -411,4 +423,617 @@ export function splitRangeByCalendarYear(start: string, end: string): { start: s
     out.push({ start: start > yearStart ? start : yearStart, end: end < yearEnd ? end : yearEnd });
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// §6.5 ③ 連携明細との照合（純関数）
+// ---------------------------------------------------------------------------
+
+/** 連携サービスの種別。`linked_card` → `card`（`MF_CARD_ACCOUNT_IDS`）、`linked_bank` → `bank`（`MF_BANK_ACCOUNT_IDS`）。 */
+export type ServiceKind = "card" | "bank";
+
+/** 支払方法に対応する連携サービスの種別（実装設計 §6.5）。`cash`・空・不正は `null`。 */
+export function serviceKindOf(method: PaymentMethod | ""): ServiceKind | null {
+  if (method === "linked_card") {
+    return "card";
+  }
+  if (method === "linked_bank") {
+    return "bank";
+  }
+  return null;
+}
+
+/** 照合の日付幅: 経費の `日付` の前 2 日〜後 5 日（S-M4 でカード明細の `date` が利用日と確認。実装設計 §6.5）。 */
+export const MATCH_DAYS_BEFORE = 2;
+export const MATCH_DAYS_AFTER = 5;
+/** 候補 0 件のまま日付からこの日数たった行は 1 回だけ通知する（実装設計 §6.5）。 */
+export const NO_CANDIDATE_NOTICE_DAYS = 14;
+/** `GET /transactions` の `start_date`〜`end_date` の差の上限（日。実装設計 §3.2）。 */
+export const TRANSACTION_QUERY_MAX_SPAN_DAYS = 366;
+/** 明細ルールで仕訳した仕訳の `tags`（実装設計 §6.6）。 */
+export const RULE_TAG = "kadobo-rule";
+/** 取消で付け替えた仕訳の `tags`（実装設計 §6.7）。 */
+export const VOID_TAG = "kadobo-void";
+/** 私用の相手科目・取消の付け替え先（実装設計 §2.3, §6.6, §6.7）。 */
+export const PRIVATE_ACCOUNT_NAME = "事業主貸";
+
+/** `YYYY-MM-DD` を暦日単位で移動する（UTC の暦計算。`app/dateUtil.ts` と同じ計算の core 版）。 */
+export function shiftDate(date: string, deltaDays: number): string {
+  const [y, m, d] = date.split("-").map(Number) as [number, number, number];
+  const t = new Date(Date.UTC(y, m - 1, d + deltaDays));
+  return `${String(t.getUTCFullYear()).padStart(4, "0")}-${String(t.getUTCMonth() + 1).padStart(2, "0")}-${String(t.getUTCDate()).padStart(2, "0")}`;
+}
+
+/**
+ * `start`〜`end`（両端含む）を、各区間の `end − start` が `maxSpanDays` 以内になるよう分割する
+ * （`GET /transactions` は差が 366 日以内。実装設計 §3.2, §6.5）。`start > end` なら空。
+ */
+export function splitDateRangeBySpan(
+  start: string,
+  end: string,
+  maxSpanDays: number = TRANSACTION_QUERY_MAX_SPAN_DAYS,
+): { start: string; end: string }[] {
+  const out: { start: string; end: string }[] = [];
+  let cur = start;
+  while (cur <= end) {
+    const limit = shiftDate(cur, maxSpanDays);
+    const e = limit < end ? limit : end;
+    out.push({ start: cur, end: e });
+    cur = shiftDate(e, 1);
+  }
+  return out;
+}
+
+/** 連携明細 1 件（`GET /transactions` の応答から取り出した必要な項目）。 */
+export interface MfTransaction {
+  /** 明細 ID。MF が返したパーセントエンコード済みの文字列（そのまま持つ）。 */
+  id: string;
+  date: string;
+  value: number;
+  /** `INCOME` / `EXPENSE`。 */
+  side: string;
+  content: string;
+  /** `none`・`registered`・`excluded` など。 */
+  status: string;
+  connected_account_id: string;
+  /** どの設定（`MF_CARD_ACCOUNT_IDS`／`MF_BANK_ACCOUNT_IDS`）の連携サービスから取ったか。 */
+  service: ServiceKind;
+}
+
+function asRec(v: unknown): Record<string, unknown> {
+  return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : {};
+}
+
+function safeDecode(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+/** 明細 ID の突き合わせ用キー（人が貼ったエンコード有無の違いを吸収する）。 */
+export function transactionKey(id: string): string {
+  return safeDecode(id.trim());
+}
+
+/** `GET /transactions` の応答（`{ transactions: [...] }`）から明細を取り出す。`id`・`date`・`value` が読めない要素は除く。 */
+export function parseTransactions(res: unknown, service: ServiceKind): MfTransaction[] {
+  const raw = asRec(res).transactions;
+  const out: MfTransaction[] = [];
+  for (const o of Array.isArray(raw) ? (raw as unknown[]) : []) {
+    const r = asRec(o);
+    const id = typeof r.id === "string" ? r.id : "";
+    const date = typeof r.date === "string" ? r.date : "";
+    const value = typeof r.value === "number" ? r.value : typeof r.value === "string" ? Number(r.value) : NaN;
+    if (id === "" || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(value)) {
+      continue;
+    }
+    out.push({
+      id,
+      date,
+      value,
+      side: typeof r.side === "string" ? r.side : "",
+      content: typeof r.content === "string" ? r.content : "",
+      status: typeof r.journalizing_status === "string" ? r.journalizing_status : "",
+      connected_account_id: typeof r.connected_account_id === "string" ? r.connected_account_id : "",
+      service,
+    });
+  }
+  return out;
+}
+
+// ---- 明細ルール（§6.6） ----------------------------------------------------
+
+export const RULE_TARGETS = ["card", "bank", "any"] as const;
+export const RULE_ACTION_PRIVATE = "私用として仕訳";
+export const RULE_ACTION_IGNORE = "無視";
+
+/**
+ * `MF明細ルール` シートの 1 行（実装設計 §6.6）。シートの値をほぼそのまま持ち、検証は {@link ruleDefects} で行う
+ * （無効な行も一覧に残し、週次で報告するため）。
+ */
+export interface MfTransactionRule {
+  /** ルール名（通知・摘要に使う）。 */
+  name: string;
+  /** `card` / `bank` / `any`（検証前の生の値）。 */
+  target: string;
+  /** 内容に含む文字列（明細の `content` の部分一致。必須）。 */
+  content: string;
+  /** 金額。空なら `null`（金額を問わない）。数値に読めない値は `NaN`。 */
+  amount: number | null;
+  /** `私用として仕訳` / `無視`（検証前の生の値）。 */
+  action: string;
+  /** 「私用として仕訳」のときの相手科目名。 */
+  account: string;
+  /** `有効` 列が TRUE か。 */
+  enabled: boolean;
+}
+
+/** ルールの構造上の不備（空なら使える形）。`有効` は見ない。 */
+export function ruleDefects(rule: MfTransactionRule): string[] {
+  const out: string[] = [];
+  if (rule.name.trim() === "") {
+    out.push("ルール名が空です");
+  }
+  if (rule.content.trim() === "") {
+    out.push("内容に含む文字列が空です");
+  }
+  if (!(RULE_TARGETS as readonly string[]).includes(rule.target)) {
+    out.push(`対象が card・bank・any のどれでもありません（${rule.target === "" ? "空" : rule.target}）`);
+  }
+  if (rule.action !== RULE_ACTION_PRIVATE && rule.action !== RULE_ACTION_IGNORE) {
+    out.push(`処理が「${RULE_ACTION_PRIVATE}」「${RULE_ACTION_IGNORE}」のどちらでもありません（${rule.action === "" ? "空" : rule.action}）`);
+  }
+  if (rule.amount !== null && !Number.isFinite(rule.amount)) {
+    out.push("金額が数値ではありません");
+  }
+  if (rule.action === RULE_ACTION_PRIVATE && rule.account.trim() === "") {
+    out.push("勘定科目が空です");
+  }
+  return out;
+}
+
+/** 週次報告に出す「無効」の理由（不備と、`有効` が TRUE でないこと）。空なら有効なルール。 */
+export function ruleProblems(rule: MfTransactionRule): string[] {
+  const out = ruleDefects(rule);
+  if (!rule.enabled) {
+    out.push("有効が TRUE ではありません（使っていません）");
+  }
+  return out;
+}
+
+/** 照合で使えるルールか（`有効` が TRUE で、不備が無い）。 */
+export function isRuleUsable(rule: MfTransactionRule): boolean {
+  return rule.enabled && ruleDefects(rule).length === 0;
+}
+
+/** 部分一致の比較用に正規化する（全角半角・大文字小文字の違いを吸収。NFKC）。 */
+export function normalizeForMatch(s: string): string {
+  return s.normalize("NFKC").toLowerCase();
+}
+
+/**
+ * 明細に当たるルールを返す（実装設計 §6.6 `classifyTransaction`）。有効なルールをシートの上から順に見て、
+ * 最初に当たったものを使う。`対象` は `card`/`bank` が明細の取得元と一致するか `any`。`内容に含む文字列` は
+ * 部分一致、`金額` があれば一致を要求する。当たらなければ `null`（経費の照合に進む明細）。
+ */
+export function classifyTransaction(
+  tx: { content: string; value: number },
+  rules: readonly MfTransactionRule[],
+  side: ServiceKind,
+): { rule: MfTransactionRule; index: number } | null {
+  const content = normalizeForMatch(tx.content);
+  for (let index = 0; index < rules.length; index++) {
+    const rule = rules[index]!;
+    if (!isRuleUsable(rule)) {
+      continue;
+    }
+    if (rule.target !== "any" && rule.target !== side) {
+      continue;
+    }
+    if (!content.includes(normalizeForMatch(rule.content.trim()))) {
+      continue;
+    }
+    if (rule.amount !== null && rule.amount !== tx.value) {
+      continue;
+    }
+    return { rule, index };
+  }
+  return null;
+}
+
+// ---- 照合（§6.5） -----------------------------------------------------------
+
+/** 照合・訂正の判定が読む台帳行の項目（`ExpenseLedgerRow` が構造的に満たす）。 */
+export interface LedgerRowView extends SyncRowView {
+  mf_sync_state: JournalSyncState;
+  correction_of_receipt_id: string | null;
+  input_at: number;
+}
+
+/** 明細を使っている行の状態（実装設計 §6.5。`REVERSED`・`ERROR` の行は明細を手放している）。 */
+export const USED_TRANSACTION_STATES: readonly JournalSyncState[] = ["JOURNALIZING", "SYNCED", "REVERSING", "NEEDS_REVIEW"];
+
+function hasText(v: string | null): v is string {
+  return v !== null && v !== "";
+}
+
+/**
+ * 使用中の明細（`transactionKey`）の集合。{@link USED_TRANSACTION_STATES} の行の `MF明細ID`。
+ * `exceptReceiptId` の行は数えない（その行自身が明細を確認するとき）。
+ */
+export function usedTransactionKeys(rows: readonly LedgerRowView[], exceptReceiptId?: string): Set<string> {
+  const used = new Set<string>();
+  for (const r of rows) {
+    if (r.receipt_id !== exceptReceiptId && USED_TRANSACTION_STATES.includes(r.mf_sync_state) && hasText(r.mf_transaction_id)) {
+      used.add(transactionKey(r.mf_transaction_id));
+    }
+  }
+  return used;
+}
+
+const MAX_CORRECTION_DEPTH = 10;
+
+/**
+ * 訂正元をたどって、連携明細の仕訳を持つ（作成中・反映済み・取消中）行があるか。ある間は、訂正後の新しい行を
+ * 通常の照合に出さない（旧仕訳を PUT で引き継ぐ。実装設計 §6.5 🔄）。
+ */
+export function holdsJournalAncestor(row: LedgerRowView, byId: ReadonlyMap<string, LedgerRowView>): boolean {
+  let cur: LedgerRowView = row;
+  for (let i = 0; i < MAX_CORRECTION_DEPTH; i++) {
+    const parentId = cur.correction_of_receipt_id;
+    const parent = hasText(parentId) ? byId.get(parentId) : undefined;
+    if (parent === undefined) {
+      return false;
+    }
+    if (
+      serviceKindOf(parent.payment_method) !== null &&
+      (parent.mf_sync_state === "JOURNALIZING" || parent.mf_sync_state === "SYNCED" || parent.mf_sync_state === "REVERSING")
+    ) {
+      return true;
+    }
+    cur = parent;
+  }
+  return false;
+}
+
+export function indexLedgerRows<T extends LedgerRowView>(rows: readonly T[]): Map<string, T> {
+  return new Map(rows.map((r) => [r.receipt_id, r]));
+}
+
+/** 連携明細の取込み待ちか（`WAITING_TRANSACTION`・連携の支払方法・登録完了・仕訳なし・訂正元の仕訳の引継ぎ待ちでない）。 */
+export function isWaitingForTransaction(row: LedgerRowView, byId: ReadonlyMap<string, LedgerRowView>): boolean {
+  return (
+    row.mf_sync_state === "WAITING_TRANSACTION" &&
+    serviceKindOf(row.payment_method) !== null &&
+    row.state === "COMPLETED" &&
+    !hasText(row.mf_journal_id) &&
+    !holdsJournalAncestor(row, byId)
+  );
+}
+
+/** 明細 `tx` が行 `row` の候補になる条件（連携サービス・金額・日付幅）。使用中かどうかは見ない。 */
+export function isCandidateFor(row: { payment_method: PaymentMethod | ""; amount: number; date: string }, tx: MfTransaction): boolean {
+  return (
+    serviceKindOf(row.payment_method) === tx.service &&
+    tx.value === row.amount &&
+    tx.date >= shiftDate(row.date, -MATCH_DAYS_BEFORE) &&
+    tx.date <= shiftDate(row.date, MATCH_DAYS_AFTER)
+  );
+}
+
+export type MatchOutcome =
+  | { kind: "matched"; receipt_id: string; transaction: MfTransaction }
+  | { kind: "none"; receipt_id: string }
+  | { kind: "review"; receipt_id: string; candidates: MfTransaction[]; reason: "multiple" | "contested" };
+
+function compareTx(a: MfTransaction, b: MfTransaction): number {
+  return a.date < b.date ? -1 : a.date > b.date ? 1 : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+/**
+ * 実装設計 §6.5 の照合。`rows` は台帳の全行、`txs` は取得した未仕訳の明細（明細ルールに当たったものは呼び出し側が
+ * 除く）。対象は {@link isWaitingForTransaction} の行すべて（バッチに限らない）。
+ *
+ * 行 r の候補 = 支払方法に対応する連携サービスの明細で、`value === 金額` かつ
+ * `date ∈ [日付 − 2, 日付 + 5]` かつ使用中でない明細。**自動で確定するのは一対一のときだけ**:
+ * r の候補がちょうど t の 1 件で、t を候補にしている待ち行が r だけのとき。候補が複数、または明細の取り合いは
+ * `review`（候補の一覧つき）、候補 0 件は `none`。日付が近いものを優先する規則は無い（取り合いを許さない）。
+ */
+export function matchTransactions(rows: readonly LedgerRowView[], txs: readonly MfTransaction[]): MatchOutcome[] {
+  const byId = indexLedgerRows(rows);
+  const used = usedTransactionKeys(rows);
+  const free = txs.filter((t) => !used.has(transactionKey(t.id)));
+  const waiting = rows.filter((r) => isWaitingForTransaction(r, byId));
+
+  const candidatesOf = new Map<string, MfTransaction[]>();
+  const contenders = new Map<string, Set<string>>();
+  for (const r of waiting) {
+    const cands = free.filter((t) => isCandidateFor(r, t)).sort(compareTx);
+    candidatesOf.set(r.receipt_id, cands);
+    for (const t of cands) {
+      const key = transactionKey(t.id);
+      const set = contenders.get(key) ?? new Set<string>();
+      set.add(r.receipt_id);
+      contenders.set(key, set);
+    }
+  }
+
+  return waiting.map((r): MatchOutcome => {
+    const cands = candidatesOf.get(r.receipt_id) ?? [];
+    if (cands.length === 0) {
+      return { kind: "none", receipt_id: r.receipt_id };
+    }
+    if (cands.length > 1) {
+      return { kind: "review", receipt_id: r.receipt_id, candidates: cands, reason: "multiple" };
+    }
+    const only = cands[0]!;
+    if ((contenders.get(transactionKey(only.id))?.size ?? 0) > 1) {
+      return { kind: "review", receipt_id: r.receipt_id, candidates: cands, reason: "contested" };
+    }
+    return { kind: "matched", receipt_id: r.receipt_id, transaction: only };
+  });
+}
+
+/** 候補 0 件のまま日付から {@link NO_CANDIDATE_NOTICE_DAYS} 日たったか（`today` は `YYYY-MM-DD`）。 */
+export function isNoCandidateNoticeDue(rowDate: string, today: string): boolean {
+  return shiftDate(rowDate, NO_CANDIDATE_NOTICE_DAYS) <= today;
+}
+
+// ---- journalize・PUT の本文 ---------------------------------------------------
+
+export interface JournalizeRequestBody {
+  transaction_id: string;
+  transaction_date: string;
+  account_id: string;
+  remark: string;
+  memo?: string;
+  tags: string[];
+}
+
+/**
+ * ③ `POST /transactions/journalize` の本文（実装設計 §6.5）。`transaction_date` は**経費台帳の `日付`**
+ * （省略すると明細の日付になるため、必ず指定する。§3.2）。`remark`・`memo`・`tags` は §2.2 と同じ。
+ * `tax_id`・`invoice_kind` は送らない。
+ */
+export function buildJournalizeBody(row: SyncRowView, transactionId: string, accountId: string): JournalizeRequestBody {
+  const body: JournalizeRequestBody = {
+    transaction_id: transactionId,
+    transaction_date: row.date,
+    account_id: accountId,
+    remark: buildRemark(row.receipt_id, row.partner),
+    tags: buildTags(row.receipt_id),
+  };
+  const memo = buildMemo(row.drive_link);
+  if (memo !== undefined) {
+    body.memo = memo;
+  }
+  return body;
+}
+
+/** 明細ルール（私用として仕訳）の `remark`: `私用: {ルール名}`。 */
+export function buildRuleRemark(ruleName: string): string {
+  return truncateCodePoints(`私用: ${ruleName}`, MF_TEXT_MAX_LENGTH);
+}
+
+/** 明細ルールの `POST /transactions/journalize` 本文（実装設計 §6.6）。`transaction_date` は明細の日付。 */
+export function buildRuleJournalizeBody(tx: MfTransaction, ruleName: string, accountId: string): JournalizeRequestBody {
+  return {
+    transaction_id: tx.id,
+    transaction_date: tx.date,
+    account_id: accountId,
+    remark: buildRuleRemark(ruleName),
+    tags: [RULE_TAG],
+  };
+}
+
+/** 取消した仕訳の `remark`: `取消: {証憑ID} {取引先}`（実装設計 §6.7）。 */
+export function buildVoidRemark(receiptId: string, partner: string): string {
+  return truncateCodePoints(`取消: ${receiptId} ${unescapeSheetFormula(partner)}`, MF_TEXT_MAX_LENGTH);
+}
+
+/** 取消した仕訳の `tags`: `[証憑ID, "kadobo-void"]`（実装設計 §6.7）。 */
+export function buildVoidTags(receiptId: string): string[] {
+  return [receiptId, VOID_TAG];
+}
+
+function numberOf(v: unknown): number | null {
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+
+function stringOf(v: unknown): string | null {
+  return typeof v === "string" && v !== "" ? v : null;
+}
+
+/** 既存の仕訳の借方・貸方（1 行の仕訳。複数行・片側欠けは `null`）。 */
+export function singleBranchOf(
+  journal: Record<string, unknown>,
+): { debitor: Record<string, unknown>; creditor: Record<string, unknown>; debitValue: number; creditValue: number } | null {
+  const branches = journal.branches;
+  if (!Array.isArray(branches) || branches.length !== 1) {
+    return null;
+  }
+  const b = asRec(branches[0]);
+  const debitor = asRec(b.debitor);
+  const creditor = asRec(b.creditor);
+  const debitValue = numberOf(debitor.value);
+  const creditValue = numberOf(creditor.value);
+  if (stringOf(debitor.account_id) === null || stringOf(creditor.account_id) === null || debitValue === null || creditValue === null) {
+    return null;
+  }
+  return { debitor, creditor, debitValue, creditValue };
+}
+
+export interface JournalUpdateBody {
+  journal: {
+    transaction_date: string;
+    journal_type: string;
+    branches: {
+      debitor: Record<string, unknown>;
+      creditor: Record<string, unknown>;
+      remark: string;
+    }[];
+    memo?: string;
+    tags: string[];
+  };
+}
+
+export interface JournalUpdatePatch {
+  /** 新しい借方科目の ID。 */
+  debitAccountId: string;
+  /** 新しい借方金額。省略すると既存のまま。 */
+  debitValue?: number;
+  remark: string;
+  tags: string[];
+  /** 省略（`undefined`）なら `memo` キーを付けない（PUT は省略した項目を上書きするので、残したいときは既存の値を渡す）。 */
+  memo?: string;
+  /** 新しい取引日。省略すると既存のまま。 */
+  transactionDate?: string;
+}
+
+/**
+ * ③ の訂正・取消の `PUT /journals/{id}` 本文（実装設計 §6.7 🔄）。`GET /journals/{id}` で読んだ既存の仕訳
+ * （`extractJournalItem` の結果）を元に、**借方の `account_id`・`value`、`remark`、`tags`、`memo`** を差し替える。
+ * 貸方（連携明細の側）の科目・金額は変えない。借方の補助科目は旧科目のものなので引き継がず、部門・取引先コードと
+ * 貸方の補助科目は引き継ぐ。`tax_id`・`invoice_kind` は送らない（§3.2）。
+ *
+ * 1 行の仕訳でない、または借方・貸方が読めないときは `{ ok: false }`（自動では直さない）。借方金額を変えて貸方と
+ * 一致しなくなる場合も `{ ok: false }`（MF が貸借不一致で拒否するため。送らずに人の確認に回す）。
+ */
+export function buildJournalUpdateBody(
+  existing: Record<string, unknown>,
+  patch: JournalUpdatePatch,
+): { ok: true; body: JournalUpdateBody } | { ok: false; reason: string } {
+  const single = singleBranchOf(existing);
+  if (single === null) {
+    return { ok: false, reason: "仕訳が 1 行の借方・貸方の形ではないため、自動では更新できません" };
+  }
+  const debitValue = patch.debitValue ?? single.debitValue;
+  if (debitValue !== single.creditValue) {
+    return {
+      ok: false,
+      reason: `借方金額 ${debitValue} 円が貸方（連携明細の側）${single.creditValue} 円と一致しないため、自動では更新できません`,
+    };
+  }
+  const carry = (side: Record<string, unknown>, keys: readonly string[]): Record<string, unknown> => {
+    const out: Record<string, unknown> = {};
+    for (const k of keys) {
+      const s = stringOf(side[k]);
+      if (s !== null) {
+        out[k] = s;
+      }
+    }
+    return out;
+  };
+  const journal: JournalUpdateBody["journal"] = {
+    transaction_date: patch.transactionDate ?? stringOf(existing.transaction_date) ?? "",
+    journal_type: stringOf(existing.journal_type) ?? "journal_entry",
+    branches: [
+      {
+        debitor: {
+          account_id: patch.debitAccountId,
+          value: debitValue,
+          ...carry(single.debitor, ["department_id", "trade_partner_code"]),
+        },
+        creditor: {
+          account_id: stringOf(single.creditor.account_id) as string,
+          value: single.creditValue,
+          ...carry(single.creditor, ["sub_account_id", "department_id", "trade_partner_code"]),
+        },
+        remark: patch.remark,
+      },
+    ],
+    tags: patch.tags,
+  };
+  if (journal.transaction_date === "") {
+    return { ok: false, reason: "既存の仕訳に取引日がないため、自動では更新できません" };
+  }
+  if (patch.memo !== undefined) {
+    journal.memo = patch.memo;
+  }
+  return { ok: true, body: { journal } };
+}
+
+// ---- 訂正・取消の引継ぎ計画（§6.7 🔄・§6.5） --------------------------------------
+
+export type CancelPlan =
+  /** まだ動かない（訂正後の新しい行が未登録・登録中・エラー、または開業日が未設定）。 */
+  | { kind: "wait" }
+  /** 借方を `事業主貸` に付け替える（`VOID`、または引き継げる新しい行が無い）。 */
+  | { kind: "void" }
+  /** 新しい行 `successor` の内容で同じ仕訳を更新して引き継ぐ。 */
+  | { kind: "inherit"; successor: string }
+  /** `successor` が既にこの仕訳を持っている（引継ぎ済み。旧行を `REVERSED` にするだけ）。 */
+  | { kind: "done"; successor: string };
+
+/** `row` を訂正元とする行（子孫まで）。深さは {@link MAX_CORRECTION_DEPTH} まで。 */
+function descendantsOf(row: LedgerRowView, rows: readonly LedgerRowView[]): LedgerRowView[] {
+  const out: LedgerRowView[] = [];
+  const seen = new Set<string>([row.receipt_id]);
+  let frontier = [row.receipt_id];
+  for (let depth = 0; depth < MAX_CORRECTION_DEPTH && frontier.length > 0; depth++) {
+    const next: string[] = [];
+    for (const r of rows) {
+      if (hasText(r.correction_of_receipt_id) && frontier.includes(r.correction_of_receipt_id) && !seen.has(r.receipt_id)) {
+        seen.add(r.receipt_id);
+        out.push(r);
+        next.push(r.receipt_id);
+      }
+    }
+    frontier = next;
+  }
+  return out;
+}
+
+/**
+ * 連携明細から作った仕訳を持つ行 `row`（`CORRECTED`/`VOID`）の取消の進め方（実装設計 §6.7 🔄・§6.5）。
+ * 削除ではなく `PUT /journals/{id}` で書き換える。
+ * - `VOID` → `void`
+ * - `CORRECTED` → 訂正後の新しい行（`訂正元証憑ID` が `row`。訂正の連鎖は子孫まで見る）の `COMPLETED` の行で
+ *   引き継ぐ。新しい行が無い・登録中・エラー・さらに訂正待ちなら `wait`。引継ぎの条件は、新しい行が仕訳なし・
+ *   同じ支払方法・同じ金額・自動仕訳の対象（`decideSyncTarget` が ready）。満たさなければ `void`
+ *   （旧仕訳は事業主貸にして、新しい行は通常の照合に回る）
+ */
+export function planLinkedCancellation(
+  row: LedgerRowView,
+  rows: readonly LedgerRowView[],
+  startDate: string | null,
+): CancelPlan {
+  if (row.state === "VOID") {
+    return { kind: "void" };
+  }
+  const desc = descendantsOf(row, rows);
+  if (desc.length === 0) {
+    return { kind: "wait" };
+  }
+  if (desc.some((d) => d.state === "RECEIVED" || d.state === "FILE_SAVED" || d.state === "ERROR")) {
+    return { kind: "wait" };
+  }
+  // 訂正済み（CORRECTED）で、さらに訂正後の行がまだ無い行があれば、その登録を待つ。
+  if (desc.some((d) => d.state === "CORRECTED" && !desc.some((c) => c.correction_of_receipt_id === d.receipt_id))) {
+    return { kind: "wait" };
+  }
+  const done = desc.find(
+    (d) => hasText(row.mf_journal_id) && d.mf_journal_id === row.mf_journal_id && d.mf_sync_state === "SYNCED",
+  );
+  if (done !== undefined) {
+    return { kind: "done", successor: done.receipt_id };
+  }
+  const live = desc.filter((d) => d.state === "COMPLETED").sort((a, b) => b.input_at - a.input_at);
+  if (live.length === 0) {
+    return { kind: "void" };
+  }
+  if (startDate === null || startDate === "") {
+    return { kind: "wait" };
+  }
+  const pick = live[0]!;
+  const inheritable =
+    (pick.mf_sync_state === "" || pick.mf_sync_state === "WAITING_TRANSACTION") &&
+    !hasText(pick.mf_journal_id) &&
+    pick.payment_method === row.payment_method &&
+    pick.amount === row.amount &&
+    decideSyncTarget(pick, startDate).kind === "ready";
+  return inheritable ? { kind: "inherit", successor: pick.receipt_id } : { kind: "void" };
 }

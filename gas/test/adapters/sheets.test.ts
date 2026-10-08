@@ -1367,3 +1367,74 @@ describe("SheetsAdapter.updateExpenseColumns（実装設計 MF連携 §0, §6.1,
     expect(() => adapter.updateExpenseColumns("R-NONE", { mf_sync_state: "ERROR" })).toThrow(/expense_not_found/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// MF明細ルール（実装設計 MF連携 §6.6、WP-M5）
+// ---------------------------------------------------------------------------
+
+const MF_RULE_SHEET = "MF明細ルール";
+const MF_RULE_HEADERS = ["ルール名", "対象", "内容に含む文字列", "金額", "処理", "勘定科目", "有効"] as const;
+
+describe("MF明細ルール シート（setupSpreadsheet と getMfTransactionRules）", () => {
+  it("setupSpreadsheet がシートと 7 列のヘッダーを作る（冪等）。保護しない（人が編集するシート）", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    setupSpreadsheet(SPREADSHEET_ID);
+    const sheet = harness.spreadsheet.getSheetByName(MF_RULE_SHEET);
+    expect(sheet).not.toBeNull();
+    expect(MF_RULE_HEADERS.map((_, i) => sheet?.getCell(1, i + 1))).toEqual([...MF_RULE_HEADERS]);
+    expect(sheet?.getLastRow()).toBe(1);
+    expect(sheet?.getProtections("SHEET")).toHaveLength(0);
+  });
+
+  it("金額（4）と有効（7）は text 化しない。ルール名・対象・内容・処理・勘定科目は text 化する", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const sheet = harness.spreadsheet.getSheetByName(MF_RULE_SHEET);
+    for (const col of [1, 2, 3, 5, 6]) {
+      expect(sheet?.getFormat(2, col)).toBe(TEXT_FORMAT);
+    }
+    for (const col of [4, 7]) {
+      expect(sheet?.getFormat(2, col)).not.toBe(TEXT_FORMAT);
+    }
+  });
+
+  it("getMfTransactionRules: 上から順に返す。有効が TRUE でない行・内容が空の行も除かない。全セルが空の行は除く", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const sheet = harness.spreadsheet.getSheetByName(MF_RULE_SHEET);
+    if (sheet === null) {
+      throw new Error("mf rule sheet missing");
+    }
+    const rows: unknown[][] = [
+      ["NISA クレカ積立", "card", "SBI証券投信積立", 10000, "私用として仕訳", "事業主貸", true],
+      ["カード代金引落し", " Bank ", "ミツイスミトモカ", "", "無視", "", "TRUE"],
+      ["", "", "", "", "", "", ""],
+      ["内容が空", "any", "", "", "私用として仕訳", "事業主貸", "TRUE"],
+      ["停止中", "card", "X", "1,500", "無視", "", false],
+      ["金額が不正", "card", "Y", "abc", "無視", "", "true"],
+      ["全角の金額", "card", "Z", "２，０００", "無視", "", "FALSE"],
+    ];
+    sheet.getRange(2, 1, rows.length, 7).setValues(rows);
+
+    const rules = new SheetsAdapter(SPREADSHEET_ID).getMfTransactionRules();
+
+    expect(rules.map((r) => r.name)).toEqual(["NISA クレカ積立", "カード代金引落し", "内容が空", "停止中", "金額が不正", "全角の金額"]);
+    expect(rules[0]).toEqual({
+      name: "NISA クレカ積立",
+      target: "card",
+      content: "SBI証券投信積立",
+      amount: 10000,
+      action: "私用として仕訳",
+      account: "事業主貸",
+      enabled: true,
+    });
+    expect(rules[1]).toMatchObject({ target: "bank", amount: null, action: "無視", enabled: true });
+    expect(rules[2]).toMatchObject({ content: "", enabled: true });
+    expect(rules[3]).toMatchObject({ amount: 1500, enabled: false });
+    expect(Number.isNaN(rules[4]!.amount)).toBe(true);
+    expect(rules[4]!.enabled).toBe(true);
+    expect(rules[5]).toMatchObject({ amount: 2000, enabled: false });
+  });
+
+  it("シートが無ければ例外（呼び出し側が通知して ③ を止める）", () => {
+    expect(() => new SheetsAdapter(SPREADSHEET_ID).getMfTransactionRules()).toThrow(/sheet_not_found/);
+  });
+});
