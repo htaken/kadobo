@@ -45,6 +45,8 @@ const entryFns = [
   { name: "trigMfSyncSoon", args: "" },
   { name: "mfInvoicePing", args: "" },
   { name: "mfAccountingPing", args: "" },
+  { name: "mfInvoiceSpikeS1", args: "" },
+  { name: "mfJournalSpikeS5", args: "" },
 ];
 
 const wrappers = entryFns

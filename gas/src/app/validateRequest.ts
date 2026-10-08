@@ -9,7 +9,7 @@
  * 返っていた。`file` オブジェクトも Cron 再送で壊れたペイロードが来る経路があるため、
  * 各フィールドの型まで検証する。
  */
-import { isExpenseCategory, isReceiptType } from "@kadobo/shared/expense";
+import { isExpenseCategory, isPaymentMethod, isReceiptType } from "@kadobo/shared/expense";
 import type {
   CommandText,
   ExpenseSubmitFile,
@@ -114,6 +114,9 @@ export function isGasRequest(x: unknown): x is GasRequest {
         isStr(o.view_id) &&
         isStr(o.channel_id) &&
         isReceiptType(o.receipt_type) &&
+        // 実装設計 MF連携 §10.2: 任意項目（旧 Worker からの pending 再送を受け付ける）。
+        // あるなら値が有効でなければ拒否する。
+        (o.payment_method === undefined || isPaymentMethod(o.payment_method)) &&
         isStr(o.date) &&
         isFiniteNum(o.amount) &&
         isExpenseCategory(o.category) &&

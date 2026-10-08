@@ -87,7 +87,7 @@ function strField(r: Record<string, unknown>, key: string): string | undefined {
 }
 
 /** `id` フィールドを文字列として取り出す（数値で返る場合も文字列化する）。 */
-function extractId(obj: unknown): string | null {
+export function extractId(obj: unknown): string | null {
   const r = asRecord(obj);
   const direct = r.id;
   if (typeof direct === "string" && direct !== "") {
@@ -111,7 +111,7 @@ function extractId(obj: unknown): string | null {
  * `{ data: Billing[], pagination: {...} }`（MF の OpenAPI 定義で確認済み。`data` キー）。
  * トップレベル配列・`billings` キーも念のためフォールバックとして受け止める。
  */
-function extractBillingsArray(res: unknown): Record<string, unknown>[] {
+export function extractBillingsArray(res: unknown): Record<string, unknown>[] {
   const r = asRecord(res);
   if (Array.isArray(r.data)) {
     return r.data as Record<string, unknown>[];
@@ -126,7 +126,7 @@ function extractBillingsArray(res: unknown): Record<string, unknown>[] {
 }
 
 /** `Billing` の請求書番号フィールドは `billing_number`（MF の OpenAPI 定義で確認済み）。 */
-function documentNumberOf(row: Record<string, unknown>): string | null {
+export function documentNumberOf(row: Record<string, unknown>): string | null {
   const v = row.billing_number;
   return typeof v === "string" ? v : null;
 }
@@ -136,7 +136,7 @@ function documentNumberOf(row: Record<string, unknown>): string | null {
  * をそのまま返す（`{billing: {...}}` のようなラップは無い。MF の OpenAPI 定義で確認済み）。
  * 念のため `billing` キーでラップされていた場合のフォールバックも残す。
  */
-function extractBillingDetail(res: unknown): Record<string, unknown> {
+export function extractBillingDetail(res: unknown): Record<string, unknown> {
   const r = asRecord(res);
   const nested = r.billing;
   if (typeof nested === "object" && nested !== null) {
@@ -188,7 +188,7 @@ function writeInvoiceColumnsIfLocked(
   });
 }
 
-function requireDepartmentId(ports: AppPorts): string {
+export function requireDepartmentId(ports: Pick<AppPorts, "props">): string {
   const v = ports.props.get("MF_DEPARTMENT_ID");
   if (v === null || v === "") {
     throw new ConfigMissingError(
@@ -243,7 +243,7 @@ function extractPagination(res: unknown): { total_pages: number; current_page: n
   return null;
 }
 
-function searchBillingsByDocumentNumber(client: MfInvoiceClient, billingNumber: string): Record<string, unknown>[] {
+export function searchBillingsByDocumentNumber(client: MfInvoiceClient, billingNumber: string): Record<string, unknown>[] {
   const matched: Record<string, unknown>[] = [];
   let page = 1;
   while (page <= SEARCH_MAX_PAGES) {

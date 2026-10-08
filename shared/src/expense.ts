@@ -28,6 +28,27 @@ export const RECEIPT_TYPES = ["paper", "e_doc"] as const;
 
 export type ReceiptType = (typeof RECEIPT_TYPES)[number];
 
+/**
+ * 支払方法（実装設計 MF連携 §2.3, §10.2）。`/keihi` のモーダルで選び、経費台帳の `支払方法` 列に書く。
+ * `cash` だけが `POST /journals` で kadobo が直接仕訳を作る対象（② 現金・立替）。
+ * `linked_card`・`linked_bank` は連携明細との照合（③ WP-M5）で扱う。
+ */
+export const PAYMENT_METHODS = ["linked_card", "linked_bank", "cash"] as const;
+
+export type PaymentMethod = (typeof PAYMENT_METHODS)[number];
+
+/** 支払方法の表示名（モーダルの選択肢・通知文）。 */
+export const PAYMENT_METHOD_LABELS: Record<PaymentMethod, string> = {
+  linked_card: "連携カード",
+  linked_bank: "連携口座から直接（振込・引落）",
+  cash: "現金・その他（立替）",
+};
+
+/** {@link PAYMENT_METHODS} に含まれるか。 */
+export function isPaymentMethod(v: unknown): v is PaymentMethod {
+  return typeof v === "string" && (PAYMENT_METHODS as readonly string[]).includes(v);
+}
+
 /** 証憑ファイルの許可拡張子（すべて小文字。比較前に入力を小文字化すること）。 */
 export const EXPENSE_ALLOWED_EXTENSIONS = ["jpg", "jpeg", "png", "heic", "pdf"] as const;
 

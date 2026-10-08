@@ -157,6 +157,14 @@ function phase1(req: ExpenseSubmitRequest, ports: AppPorts): Phase1Outcome {
       business_use_ratio: 100,
       correction_of_receipt_id: null,
       correction_reason: null,
+      // 実装設計 MF連携 §10.2: 欠けていれば空（旧 Worker からの再送。後から人が記入すれば同期の対象になる）。
+      payment_method: req.payment_method ?? "",
+      mf_transaction_id: null,
+      mf_sync_state: "",
+      mf_sync_error: null,
+      mf_sync_updated_at: null,
+      mf_sync_attempted_at: null,
+      mf_sync_input: "",
     };
     ports.sheets.appendExpense(row);
     return { kind: "resume", receiptId, needsDownload: true };

@@ -539,6 +539,13 @@ function makeExpenseRow(overrides: Partial<ExpenseLedgerRow> = {}): ExpenseLedge
     business_use_ratio: 100,
     correction_of_receipt_id: null,
     correction_reason: null,
+    payment_method: "",
+    mf_transaction_id: null,
+    mf_sync_state: "",
+    mf_sync_error: null,
+    mf_sync_updated_at: null,
+    mf_sync_attempted_at: null,
+    mf_sync_input: "",
     ...overrides,
   };
 }
@@ -690,9 +697,10 @@ describe("経費台帳のシステム列の保護・既定非表示（実装設�
       throw new Error("expense ledger sheet missing");
     }
 
+    // MF連携フェーズ（§6.1）で、27〜31 列目のシステム列の保護が増えて 2 範囲になった（旧: 1 範囲）。
     const protections = sheet.getProtections("RANGE");
-    expect(protections).toHaveLength(1);
-    expect(protections[0]?.getDescription()).toContain("システム列");
+    expect(protections).toHaveLength(2);
+    expect(protections.every((p) => p.getDescription().includes("システム列"))).toBe(true);
   });
 
   it("14→24 列への移行後もシステム列が非表示・保護される", () => {
@@ -704,7 +712,8 @@ describe("経費台帳のシステム列の保護・既定非表示（実装設�
     }
 
     expect(sheet.isColumnHiddenByUser(EXPENSE_COL.idempotency_key)).toBe(true);
-    expect(sheet.getProtections("RANGE")).toHaveLength(1);
+    // 旧: 1 範囲。MF連携フェーズ（§6.1）で 27〜31 列目の保護が増えて 2 範囲。
+    expect(sheet.getProtections("RANGE")).toHaveLength(2);
   });
 });
 
@@ -1080,5 +1089,199 @@ describe("SheetsAdapter.getInternalRows（実装設計 MF連携 §8, §5.8 遅�
       { key: "EVENT1", value: "2026-09-01" },
       { key: "EVENT2", value: "2026-09-02" },
     ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 経費台帳 V3（実装設計 MF連携 §6.1, §11.2 WP-M4 受入条件）
+// ---------------------------------------------------------------------------
+
+/** 移行後（実装設計 MF連携 §6.1）の経費台帳ヘッダー 31 列。 */
+const EXPENSE_HEADERS_V3 = [
+  ...EXPENSE_HEADERS_V2,
+  "支払方法",
+  "MF明細ID",
+  "MF連携状態",
+  "MF連携エラー",
+  "MF連携更新日時",
+  "MF連携試行日時",
+  "MF連携入力",
+] as const;
+
+const EXPENSE_COL_V3 = {
+  payment_method: 25,
+  mf_transaction_id: 26,
+  mf_sync_state: 27,
+  mf_sync_error: 28,
+  mf_sync_updated_at: 29,
+  mf_sync_attempted_at: 30,
+  mf_sync_input: 31,
+} as const;
+
+function expenseHeaderOf(sheet: FakeSheet, n: number): unknown[] {
+  return Array.from({ length: n }, (_, i) => sheet.getCell(1, i + 1));
+}
+
+describe("経費台帳 V3（31 列）への移行（実装設計 MF連携 §6.1）", () => {
+  it("新規シートは最初から 31 列ヘッダーで作成される", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const sheet = harness.spreadsheet.getSheetByName(EXPENSE_SHEET) as FakeSheet;
+    expect(expenseHeaderOf(sheet, 31)).toEqual([...EXPENSE_HEADERS_V3]);
+  });
+
+  it("V2（24 列）から 31 列へ移行し、既存 24 列の値（ヘッダー・データ）は一切動かない", () => {
+    const sheet = plantMigratedExpenseLedgerSheet(harness.spreadsheet);
+    const dataRow = [
+      "R-20260901-001", "paper", "2026-09-01", 1200, "○○商店", "消耗品費", "メモ", "https://d/x", "hash",
+      "image/jpeg", 123, 1788000000000, "COMPLETED", "MF-1", "K1", "F1", "D1", "r.jpg", "", 1788000000001,
+      "課税", 100, "", "",
+    ];
+    dataRow.forEach((v, i) => sheet.setCell(2, i + 1, v));
+    const before = Array.from({ length: 24 }, (_, i) => sheet.getCell(2, i + 1));
+
+    setupSpreadsheet(SPREADSHEET_ID);
+
+    expect(expenseHeaderOf(sheet, 31)).toEqual([...EXPENSE_HEADERS_V3]);
+    expect(Array.from({ length: 24 }, (_, i) => sheet.getCell(2, i + 1))).toEqual(before);
+    for (let col = 25; col <= 31; col++) {
+      expect(sheet.getCell(2, col)).toBe("");
+    }
+  });
+
+  it("V1（14 列）からでも 31 列へ移行できる（既存 14 列のデータは動かない）", () => {
+    const sheet = plantLegacyExpenseLedgerSheet(harness.spreadsheet, ["R-1", "paper", "2026-08-01", 500]);
+
+    setupSpreadsheet(SPREADSHEET_ID);
+
+    expect(expenseHeaderOf(sheet, 31)).toEqual([...EXPENSE_HEADERS_V3]);
+    expect(sheet.getCell(2, 1)).toBe("R-1");
+    expect(sheet.getCell(2, 4)).toBe(500);
+  });
+
+  it("2 回実行しても壊れない（冪等）。移行後に書き込んだ MF 列の内容も保持される", () => {
+    plantMigratedExpenseLedgerSheet(harness.spreadsheet);
+    setupSpreadsheet(SPREADSHEET_ID);
+    const adapter = new SheetsAdapter(SPREADSHEET_ID);
+    const row = makeExpenseRow({
+      payment_method: "cash",
+      mf_sync_state: "SYNCED",
+      mf_journal_id: "jrnl%2B1%3D%3D",
+      mf_sync_updated_at: 1788000000123,
+      mf_sync_attempted_at: 1788000000100,
+      mf_sync_input: "1200|2026-09-01|消耗品費|cash|",
+    });
+    adapter.appendExpense(row);
+
+    expect(() => setupSpreadsheet(SPREADSHEET_ID)).not.toThrow();
+
+    expect(adapter.getExpenseByReceiptId(row.receipt_id)).toEqual(row);
+  });
+
+  it("25 列目以降に想定外の値がある V2 は中断する（部分的に壊れたシート）", () => {
+    const sheet = plantMigratedExpenseLedgerSheet(harness.spreadsheet);
+    sheet.setCell(1, 25, "何か別の列");
+
+    expect(() => setupSpreadsheet(SPREADSHEET_ID)).toThrow(/経費台帳のヘッダーが想定と一致しません/);
+    expect(sheet.getCell(1, 26)).toBe("");
+  });
+
+  it("MF 連携の列（25〜31）は非表示にしない（人が読み、MF連携状態を空に戻すため）。27〜31 は警告付き保護。既存の 15〜20 は非表示のまま", () => {
+    plantMigratedExpenseLedgerSheet(harness.spreadsheet);
+    setupSpreadsheet(SPREADSHEET_ID);
+    setupSpreadsheet(SPREADSHEET_ID);
+    const sheet = harness.spreadsheet.getSheetByName(EXPENSE_SHEET) as FakeSheet;
+
+    for (let col = 25; col <= 31; col++) {
+      expect(sheet.isColumnHiddenByUser(col)).toBe(false);
+    }
+    for (let col = 15; col <= 20; col++) {
+      expect(sheet.isColumnHiddenByUser(col)).toBe(true);
+    }
+    // 2 回実行しても保護は増えない（15〜20 列の保護 1 ＋ 27〜31 列の保護 1）。
+    expect(sheet.getProtections("RANGE")).toHaveLength(2);
+  });
+
+  it("ユーザーが再表示した 27〜31 列は、setupSpreadsheet を再実行しても隠されない", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const sheet = harness.spreadsheet.getSheetByName(EXPENSE_SHEET) as FakeSheet;
+    sheet.hideColumns(27, 5); // 利用者が一度隠した状態を再現
+    sheet.showColumns(27, 5); // 再表示
+
+    setupSpreadsheet(SPREADSHEET_ID);
+
+    for (let col = 27; col <= 31; col++) {
+      expect(sheet.isColumnHiddenByUser(col)).toBe(false);
+    }
+  });
+
+  it("MF連携更新日時・MF連携試行日時（29・30）は数値のまま、他の MF 列は text 書式", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const sheet = harness.spreadsheet.getSheetByName(EXPENSE_SHEET) as FakeSheet;
+
+    expect(sheet.getFormat(2, EXPENSE_COL_V3.mf_sync_updated_at)).not.toBe(TEXT_FORMAT);
+    expect(sheet.getFormat(2, EXPENSE_COL_V3.mf_sync_attempted_at)).not.toBe(TEXT_FORMAT);
+    expect(sheet.getFormat(2, EXPENSE_COL_V3.payment_method)).toBe(TEXT_FORMAT);
+    expect(sheet.getFormat(2, EXPENSE_COL_V3.mf_transaction_id)).toBe(TEXT_FORMAT);
+    expect(sheet.getFormat(2, EXPENSE_COL_V3.mf_sync_state)).toBe(TEXT_FORMAT);
+    expect(sheet.getFormat(2, EXPENSE_COL_V3.mf_sync_input)).toBe(TEXT_FORMAT);
+  });
+});
+
+describe("SheetsAdapter.updateExpenseColumns（実装設計 MF連携 §0, §6.1, §8）", () => {
+  it("指定した列のセルだけを書く。人が同時に編集した業務列（読み込み後に変わった値）を上書きしない", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const adapter = new SheetsAdapter(SPREADSHEET_ID);
+    adapter.appendExpense(makeExpenseRow({ receipt_id: "R-1", amount: 1000 }));
+    adapter.appendExpense(makeExpenseRow({ receipt_id: "R-2", partner: "△△商事" }));
+    const sheet = harness.spreadsheet.getSheetByName(EXPENSE_SHEET) as FakeSheet;
+
+    // 行全体を書き戻す実装なら、この「人の編集」は古い値で潰される（updateExpense は読んでから書く間に起きた編集を守れない）。
+    // 列指定の更新なら、patch に無い列には触れない。
+    sheet.setCell(2, EXPENSE_COL.amount, 2500);
+    sheet.setCell(2, EXPENSE_COL.partner, "人が直した取引先");
+
+    adapter.updateExpenseColumns("R-1", {
+      mf_journal_id: "jrnl%2B9%3D%3D",
+      mf_sync_state: "SYNCED",
+      mf_sync_updated_at: 1788000000999,
+      mf_sync_error: null,
+    });
+
+    expect(sheet.getCell(2, EXPENSE_COL.amount)).toBe(2500);
+    expect(sheet.getCell(2, EXPENSE_COL.partner)).toBe("人が直した取引先");
+    expect(sheet.getCell(2, EXPENSE_COL.mf_journal_id)).toBe("jrnl%2B9%3D%3D");
+    expect(sheet.getCell(2, EXPENSE_COL_V3.mf_sync_state)).toBe("SYNCED");
+    expect(sheet.getCell(2, EXPENSE_COL_V3.mf_sync_updated_at)).toBe(1788000000999);
+    expect(sheet.getCell(2, EXPENSE_COL_V3.mf_sync_error)).toBe("");
+
+    // 他の行には触れない。
+    const r2 = adapter.getExpenseByReceiptId("R-2");
+    expect(r2?.partner).toBe("△△商事");
+    expect(r2?.mf_sync_state).toBe("");
+  });
+
+  it("パーセントエンコード済みの ID・日時は text/数値の書式どおりに往復する", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const adapter = new SheetsAdapter(SPREADSHEET_ID);
+    adapter.appendExpense(makeExpenseRow({ receipt_id: "R-1" }));
+
+    adapter.updateExpenseColumns("R-1", {
+      mf_journal_id: "tfAQxNx%2BSnC9teuXKMjdYNpEVoee%2F%2Bn%2B97E9vQmfAupTjPMQ0eZt3lRC7IeI%2FN1L",
+      mf_transaction_id: "BowMhLnFvzZ1y9TeF5%2B3QQ%3D%3D",
+      mf_sync_attempted_at: 1788000000100,
+      mf_sync_input: "1200|2026-09-01|消耗品費|cash|",
+    });
+
+    const r = adapter.getExpenseByReceiptId("R-1");
+    expect(r?.mf_journal_id).toBe("tfAQxNx%2BSnC9teuXKMjdYNpEVoee%2F%2Bn%2B97E9vQmfAupTjPMQ0eZt3lRC7IeI%2FN1L");
+    expect(r?.mf_transaction_id).toBe("BowMhLnFvzZ1y9TeF5%2B3QQ%3D%3D");
+    expect(r?.mf_sync_attempted_at).toBe(1788000000100);
+    expect(r?.mf_sync_input).toBe("1200|2026-09-01|消耗品費|cash|");
+  });
+
+  it("対象行が無ければ例外を投げる", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const adapter = new SheetsAdapter(SPREADSHEET_ID);
+    expect(() => adapter.updateExpenseColumns("R-NONE", { mf_sync_state: "ERROR" })).toThrow(/expense_not_found/);
   });
 });

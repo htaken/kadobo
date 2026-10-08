@@ -6,9 +6,10 @@
  * `kind+key`／`証憑ID` を主キーとして 1 行 upsert する（経費台帳は `appendExpense` で追記した後、
  * `updateExpense` で証憑ID をキーに部分更新する）。
  */
-import type { ExpenseCategory, ExpenseState, ReceiptType } from "@kadobo/shared/expense";
+import type { ExpenseCategory, ExpenseState, PaymentMethod, ReceiptType } from "@kadobo/shared/expense";
 import { businessDateOf, formatJst } from "@kadobo/shared/time";
 import type { RecentDay } from "../core/businessDate";
+import type { JournalSyncState } from "../core/journalSync";
 import type { LoggedEvent, LogEventType } from "../core/state";
 import type { DailyStatus, Rounding, TaxCategory, UnitPriceRow, Withholding } from "../core/aggregate";
 import type { DailySummaryRow, ExpenseLedgerRow, MonthlyBillRow, RawLogRow, SheetsPort } from "../app/ports";
@@ -100,8 +101,10 @@ const MONTHLY_BILL_HEADERS_V1 = MONTHLY_BILL_HEADERS.slice(0, 14);
 
 /**
  * 経費台帳の列（実装設計 経費フェーズ §5.1）。MVP（WP3）の 14 列に、at-least-once 配送・監査・
- * 訂正取消フローに必要な 10 列（システム列 6 ＋ 業務列 4）を追加した 24 列。
- * `EXPENSE_LEDGER_HEADERS_V1`（先頭 14 列）は `migrateExpenseLedger` の移行判定にのみ使う。
+ * 訂正取消フローに必要な 10 列（システム列 6 ＋ 業務列 4）を追加した 24 列（V2）。
+ * 🔄 MF 連携フェーズ（実装設計 MF連携 §6.1）で、末尾に 7 列（業務列 2 ＋ システム列 5）を足した 31 列（V3）。
+ * `EXPENSE_LEDGER_HEADERS_V1`（先頭 14 列）・`EXPENSE_LEDGER_HEADERS_V2`（先頭 24 列）は
+ * `migrateExpenseLedger` の移行判定にのみ使う。
  */
 const EXPENSE_LEDGER_HEADERS = [
   "証憑ID",
@@ -130,16 +133,37 @@ const EXPENSE_LEDGER_HEADERS = [
   "事業使用割合",
   "訂正元証憑ID",
   "訂正理由",
+  // 🔄 MF 連携フェーズ（実装設計 MF連携 §6.1）。25・26 列目は業務列、27〜31 列目はシステム列。
+  "支払方法",
+  "MF明細ID",
+  "MF連携状態",
+  "MF連携エラー",
+  "MF連携更新日時",
+  "MF連携試行日時",
+  "MF連携入力",
 ] as const;
 
 /** 移行前（MVP §7.1）の経費台帳ヘッダー。`migrateExpenseLedger` の一致判定専用。 */
 const EXPENSE_LEDGER_HEADERS_V1 = EXPENSE_LEDGER_HEADERS.slice(0, 14);
+/** 経費フェーズ時点（24 列）の経費台帳ヘッダー。`migrateExpenseLedger` の一致判定専用。 */
+const EXPENSE_LEDGER_HEADERS_V2 = EXPENSE_LEDGER_HEADERS.slice(0, 24);
 
 /** システム列（`idempotency_key`〜`state_updated_at`）の開始列（1-based）と列数。 */
 const EXPENSE_SYSTEM_COLUMN_START = 15;
 const EXPENSE_SYSTEM_COLUMN_COUNT = 6;
 const EXPENSE_SYSTEM_COLUMN_PROTECTION_DESCRIPTION =
   "経費台帳 システム列（idempotency_key〜state_updated_at）: GAS のみが更新します（手編集禁止）";
+
+/**
+ * 🔄 MF 連携のシステム列（`MF連携状態`〜`MF連携入力`。27〜31 列目、実装設計 MF連携 §6.1）の開始列
+ * （1-based）と列数。既存のシステム列（15〜20）とは連続しないため、別の範囲保護にする。
+ * **非表示にはしない**: 運用で `MF連携状態`・`MF連携エラー` を人が読み、`NEEDS_REVIEW`/`ERROR` から
+ * 復帰させるとき `MF連携状態` を空に戻すため（保護は警告付きなので編集できる）。
+ */
+const EXPENSE_MF_SYSTEM_COLUMN_START = 27;
+const EXPENSE_MF_SYSTEM_COLUMN_COUNT = 5;
+const EXPENSE_MF_SYSTEM_COLUMN_PROTECTION_DESCRIPTION =
+  "経費台帳 MF連携システム列（MF連携状態〜MF連携入力）: GAS のみが更新します（手編集は状態を空に戻す操作だけ）";
 
 const INTERNAL_HEADERS = ["kind", "key", "value", "updated_at"] as const;
 
@@ -200,8 +224,9 @@ const NON_TEXT_COLUMNS: Partial<Record<string, readonly number[]>> = {
   // worked_minutes / hours / unit_price / amount / tax_amount / withholding_amount / net_amount /
   // locked_at（現状の型に合わせ number のまま） / updated_at / invoice_attempted_at
   [SHEET_NAMES.monthlyBill]: [3, 4, 5, 6, 7, 8, 9, 12, 14, 17],
-  // 金額 / サイズ / 入力日時 / state_updated_at / 事業使用割合
-  [SHEET_NAMES.expenseLedger]: [4, 11, 12, 20, 22],
+  // 金額 / サイズ / 入力日時 / state_updated_at / 事業使用割合 /
+  // 🔄 MF 連携: MF連携更新日時（29）・MF連携試行日時（30）も数値
+  [SHEET_NAMES.expenseLedger]: [4, 11, 12, 20, 22, 29, 30],
   // updated_at（kind/key/value は text。value がカードの Slack ts で最重要）
   [SHEET_NAMES.internal]: [4],
   // 訂正削除申請（事務処理規程・電子取引 第2条）: 空配列＝全 8 列を text 化する。
@@ -317,15 +342,18 @@ function ensureMinColumns(sheet: GoogleAppsScript.Spreadsheet.Sheet, minColumns:
 }
 
 /**
- * 経費台帳の列マイグレーション（実装設計 経費フェーズ §5.1 の 🔄、§9 WP8a 受入条件）。
+ * 経費台帳の列マイグレーション（実装設計 経費フェーズ §5.1 の 🔄、§9 WP8a 受入条件、
+ * MF連携 §6.1）。
  *
- * - シートが無ければ新規作成し、最初から 24 列ヘッダーを書く（新規デプロイ・テスト用の
+ * - シートが無ければ新規作成し、最初から 31 列ヘッダー（V3）を書く（新規デプロイ・テスト用の
  *   空シートのケース。移行対象の実データが無いため判定不要）
- * - 既存ヘッダーが MVP の 14 列（{@link EXPENSE_LEDGER_HEADERS_V1}）と**完全一致**すれば、
- *   既存 14 列はそのまま、右へ 10 列（システム列 6 ＋ 業務列 4）を追加する一度きりの移行
- * - 既に 24 列（{@link EXPENSE_LEDGER_HEADERS}）と完全一致すれば、何もしない（2 回目以降の
+ * - 既存ヘッダーが MVP の 14 列（{@link EXPENSE_LEDGER_HEADERS_V1}）と**完全一致**し、15 列目以降が
+ *   空なら、15〜31 列目のヘッダーを追加する移行
+ * - 既存ヘッダーが経費フェーズの 24 列（{@link EXPENSE_LEDGER_HEADERS_V2}）と完全一致し、25 列目以降が
+ *   空なら、25〜31 列目のヘッダーを追加する移行（MF 連携の 7 列。既存 24 列の値には一切触れない）
+ * - 既に 31 列（{@link EXPENSE_LEDGER_HEADERS}）と完全一致すれば、何もしない（2 回目以降の
  *   実行に対する冪等性）
- * - どちらとも一致しない場合は**何も書き換えず**例外を投げて中断する（fail closed）。
+ * - どれとも一致しない場合は**何も書き換えず**例外を投げて中断する（fail closed）。
  *   xlsx バックアップの上で実装設計 経費フェーズ §5.1・§10 の手順に従って手動確認すること
  */
 function migrateExpenseLedger(ss: GoogleAppsScript.Spreadsheet.Spreadsheet): void {
@@ -334,35 +362,36 @@ function migrateExpenseLedger(ss: GoogleAppsScript.Spreadsheet.Spreadsheet): voi
   if (sheet === null) {
     sheet = ss.insertSheet(name);
   }
-  // 🔄 この先の 24 列ぶんの getRange が「範囲の列数が多すぎます」で落ちないよう、
+  // 🔄 この先の 31 列ぶんの getRange が「範囲の列数が多すぎます」で落ちないよう、
   // 読み書きより前に列数を確保する（既存セルには一切触れない）。
   ensureMinColumns(sheet, EXPENSE_LEDGER_HEADERS.length);
 
   if (sheet.getLastRow() === 0) {
     sheet.getRange(1, 1, 1, EXPENSE_LEDGER_HEADERS.length).setValues([[...EXPENSE_LEDGER_HEADERS]]);
   } else {
-    // 常に「移行後の 24 列」ぶんを読む。既に移行済みのシートは 1〜14 列目が V1 のヘッダーと
-    // 完全一致するため（移行は既存 14 列に一切触れない）、1〜14 列目だけを見て V1 と一致するかを
-    // 判定すると「既に 24 列」と「まだ 14 列」を区別できない。**先に 24 列との完全一致を判定し**、
-    // 一致しなければ「1〜14 列目が V1 と一致し、かつ 15〜24 列目が空（＝拡張前）」のときだけ
+    // 常に「移行後の 31 列」ぶんを読む。**先に 31 列との完全一致を判定し**、一致しなければ
+    // 「先頭 N 列（N = 14 か 24）が旧ヘッダーと完全一致し、N+1 列目以降が空（＝拡張前）」のときだけ
     // 移行対象と判定する。
-    const header24 = (sheet.getRange(1, 1, 1, EXPENSE_LEDGER_HEADERS.length).getValues()[0] ?? []).map(str);
-    const alreadyMigrated = arraysEqual(header24, EXPENSE_LEDGER_HEADERS);
+    const headerAll = (sheet.getRange(1, 1, 1, EXPENSE_LEDGER_HEADERS.length).getValues()[0] ?? []).map(str);
+    const alreadyMigrated = arraysEqual(headerAll, EXPENSE_LEDGER_HEADERS);
     if (!alreadyMigrated) {
-      const header14 = header24.slice(0, EXPENSE_LEDGER_HEADERS_V1.length);
-      const extension = header24.slice(EXPENSE_LEDGER_HEADERS_V1.length);
-      const isUnmigratedV1 = arraysEqual(header14, EXPENSE_LEDGER_HEADERS_V1) && extension.every((v) => v === "");
-      if (!isUnmigratedV1) {
+      const legacyHeaders = [EXPENSE_LEDGER_HEADERS_V2, EXPENSE_LEDGER_HEADERS_V1];
+      const matched = legacyHeaders.find(
+        (legacy) =>
+          arraysEqual(headerAll.slice(0, legacy.length), legacy) &&
+          headerAll.slice(legacy.length).every((v) => v === ""),
+      );
+      if (matched === undefined) {
         throw new Error(
-          `経費台帳のヘッダーが想定と一致しません（MVP の 14 列にも移行後の 24 列にも一致しません）。` +
+          `経費台帳のヘッダーが想定と一致しません（MVP の 14 列にも経費フェーズの 24 列にも移行後の 31 列にも一致しません）。` +
             `自動移行は行わず中断しました。スプレッドシートを xlsx でバックアップしたうえで、` +
             `実装設計 経費フェーズ.md §5.1・§10 の移行手順に従って手動で確認してください。`,
         );
       }
-      // 🔄 一度きりの列拡張移行。既存 14 列（ヘッダー・データとも）には一切触れず、
-      // 15〜24 列目にヘッダーだけを追加する（列拡張は Sheets 側が自動で行う）。
-      const newHeaders = EXPENSE_LEDGER_HEADERS.slice(EXPENSE_LEDGER_HEADERS_V1.length);
-      sheet.getRange(1, EXPENSE_SYSTEM_COLUMN_START, 1, newHeaders.length).setValues([newHeaders]);
+      // 🔄 一度きりの列拡張移行。既存列（ヘッダー・データとも）には一切触れず、
+      // 旧ヘッダーの右にヘッダーだけを追加する（列拡張は Sheets 側が自動で行う）。
+      const newHeaders = EXPENSE_LEDGER_HEADERS.slice(matched.length);
+      sheet.getRange(1, matched.length + 1, 1, newHeaders.length).setValues([newHeaders]);
     }
     // alreadyMigrated なら何もしない（2 回目以降の実行に対する冪等性）。
   }
@@ -375,23 +404,43 @@ function migrateExpenseLedger(ss: GoogleAppsScript.Spreadsheet.Spreadsheet): voi
 }
 
 /**
- * 経費台帳のシステム列（`idempotency_key`〜`state_updated_at`）を保護し、既定で非表示にする
- * （実装設計 §5.1 の 🔄。手編集されると冪等性と監査証跡が壊れるため）。`証憑ID`〜`MF仕訳ID`・
- * `税区分`〜`訂正理由` は対象外（引き続き人手編集・月次確認・訂正取消フローで編集する）。
+ * 経費台帳のシステム列を保護し、既定で非表示にする（実装設計 §5.1 の 🔄。手編集されると冪等性と
+ * 監査証跡が壊れるため）。対象は 2 つの範囲:
+ * - `idempotency_key`〜`state_updated_at`（15〜20 列目）: 保護＋非表示
+ * - 🔄 `MF連携状態`〜`MF連携入力`（27〜31 列目、実装設計 MF連携 §6.1）: 保護のみ（非表示にしない。
+ *   人が読み、`MF連携状態` を空に戻して復帰させるため）
+ * `証憑ID`〜`MF仕訳ID`・`税区分`〜`訂正理由`・`支払方法`・`MF明細ID` は対象外（引き続き人手編集・
+ * 月次確認・訂正取消フローで編集する）。
  * 冪等: 既に同じ説明文の範囲保護があれば再度は付与しない。
  */
 function protectAndHideExpenseSystemColumns(sheet: GoogleAppsScript.Spreadsheet.Sheet): void {
-  const alreadyProtected = sheet
-    .getProtections(SpreadsheetApp.ProtectionType.RANGE)
-    .some((p) => p.getDescription() === EXPENSE_SYSTEM_COLUMN_PROTECTION_DESCRIPTION);
-  if (!alreadyProtected) {
-    sheet
-      .getRange(1, EXPENSE_SYSTEM_COLUMN_START, sheet.getMaxRows(), EXPENSE_SYSTEM_COLUMN_COUNT)
-      .protect()
-      .setDescription(EXPENSE_SYSTEM_COLUMN_PROTECTION_DESCRIPTION)
-      .setWarningOnly(true);
+  const ranges: { start: number; count: number; description: string; hide: boolean }[] = [
+    {
+      start: EXPENSE_SYSTEM_COLUMN_START,
+      count: EXPENSE_SYSTEM_COLUMN_COUNT,
+      description: EXPENSE_SYSTEM_COLUMN_PROTECTION_DESCRIPTION,
+      hide: true,
+    },
+    {
+      start: EXPENSE_MF_SYSTEM_COLUMN_START,
+      count: EXPENSE_MF_SYSTEM_COLUMN_COUNT,
+      description: EXPENSE_MF_SYSTEM_COLUMN_PROTECTION_DESCRIPTION,
+      hide: false,
+    },
+  ];
+  const existing = sheet.getProtections(SpreadsheetApp.ProtectionType.RANGE).map((p) => p.getDescription());
+  for (const r of ranges) {
+    if (!existing.includes(r.description)) {
+      sheet
+        .getRange(1, r.start, sheet.getMaxRows(), r.count)
+        .protect()
+        .setDescription(r.description)
+        .setWarningOnly(true);
+    }
+    if (r.hide) {
+      sheet.hideColumns(r.start, r.count);
+    }
   }
-  sheet.hideColumns(EXPENSE_SYSTEM_COLUMN_START, EXPENSE_SYSTEM_COLUMN_COUNT);
 }
 
 /**
@@ -657,6 +706,13 @@ function rowToExpense(row: unknown[]): ExpenseLedgerRow {
     business_use_ratio: Number(row[21]),
     correction_of_receipt_id: strOrNull(row[22]),
     correction_reason: strOrNull(row[23]),
+    payment_method: str(row[24]) as PaymentMethod | "",
+    mf_transaction_id: strOrNull(row[25]),
+    mf_sync_state: str(row[26]) as JournalSyncState,
+    mf_sync_error: strOrNull(row[27]),
+    mf_sync_updated_at: numOrNull(row[28]),
+    mf_sync_attempted_at: numOrNull(row[29]),
+    mf_sync_input: str(row[30]),
   };
 }
 
@@ -686,7 +742,57 @@ function expenseToRow(r: ExpenseLedgerRow): unknown[] {
     r.business_use_ratio,
     r.correction_of_receipt_id ?? "",
     r.correction_reason ?? "",
+    r.payment_method,
+    r.mf_transaction_id ?? "",
+    r.mf_sync_state,
+    r.mf_sync_error ?? "",
+    r.mf_sync_updated_at ?? "",
+    r.mf_sync_attempted_at ?? "",
+    r.mf_sync_input,
   ];
+}
+
+/**
+ * 経費台帳の列番号（1-based）。{@link SheetsAdapter.updateExpenseColumns} が `patch` のキーから
+ * 書く列を決めるために使う（`EXPENSE_LEDGER_HEADERS` の並びと一致させること）。
+ */
+const EXPENSE_COLUMN_INDEX: Record<keyof ExpenseLedgerRow, number> = {
+  receipt_id: 1,
+  receipt_type: 2,
+  date: 3,
+  amount: 4,
+  partner: 5,
+  category: 6,
+  memo: 7,
+  drive_link: 8,
+  file_hash: 9,
+  mime_type: 10,
+  size: 11,
+  input_at: 12,
+  state: 13,
+  mf_journal_id: 14,
+  idempotency_key: 15,
+  slack_file_id: 16,
+  drive_file_id: 17,
+  original_file_name: 18,
+  last_error: 19,
+  state_updated_at: 20,
+  tax_category: 21,
+  business_use_ratio: 22,
+  correction_of_receipt_id: 23,
+  correction_reason: 24,
+  payment_method: 25,
+  mf_transaction_id: 26,
+  mf_sync_state: 27,
+  mf_sync_error: 28,
+  mf_sync_updated_at: 29,
+  mf_sync_attempted_at: 30,
+  mf_sync_input: 31,
+};
+
+/** シートへ書くセル値（`expenseToRow` の 1 列ぶんと同じ変換）。`null` は空セルにする。 */
+function expenseCellValue(value: ExpenseLedgerRow[keyof ExpenseLedgerRow]): unknown {
+  return value === null ? "" : value;
 }
 
 export class SheetsAdapter implements SheetsPort {
@@ -924,6 +1030,31 @@ export class SheetsAdapter implements SheetsPort {
     const current = rowToExpense(values[idx]!);
     const merged: ExpenseLedgerRow = { ...current, ...patch };
     this.setFormattedRow(SHEET_NAMES.expenseLedger, idx + 2, expenseToRow(merged));
+  }
+
+  /**
+   * 🔄 `patch` のキーに対応するセルだけを書く（実装設計 MF連携 §0, §6.1, §8）。他の列のセルには
+   * 一切書き込まない（`updateExpense` のように行全体を書き戻さない）。**ロック内から呼ぶこと**。
+   */
+  updateExpenseColumns(receiptId: string, patch: Partial<ExpenseLedgerRow>): void {
+    const values = this.dataRows(SHEET_NAMES.expenseLedger);
+    const idx = values.findIndex((r) => str(r[0]) === receiptId);
+    if (idx === -1) {
+      throw new Error(`expense_not_found:${receiptId}`);
+    }
+    const sheet = this.sheet(SHEET_NAMES.expenseLedger);
+    const rowIndex = idx + 2;
+    for (const [key, value] of Object.entries(patch) as [keyof ExpenseLedgerRow, ExpenseLedgerRow[keyof ExpenseLedgerRow]][]) {
+      const col = EXPENSE_COLUMN_INDEX[key];
+      if (col === undefined) {
+        throw new Error(`unknown_expense_column:${String(key)}`);
+      }
+      // text 書式の列は 1 セルだけに書式を適用してから書く（型自動変換バグ対策A）。
+      if (textColumnIndices(SHEET_NAMES.expenseLedger).includes(col)) {
+        sheet.getRange(rowIndex, col, 1, 1).setNumberFormat("@");
+      }
+      sheet.getRange(rowIndex, col, 1, 1).setValues([[expenseCellValue(value)]]);
+    }
   }
 
   getAllExpenses(): ExpenseLedgerRow[] {

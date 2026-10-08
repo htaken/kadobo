@@ -15,6 +15,7 @@ import {
   weekdayIndexOf,
 } from "./dateUtil";
 import { ensureInvoiceCreated, trackBillingStatus, warnMismatchDaily, weeklyInvoiceKeepalive } from "./invoice";
+import { syncExpenses, weeklyJournalReport } from "./journalSync";
 import { notifyMfFailure, notifyMfSuccess } from "./mf/notify";
 import { evaluateMonthClose } from "./monthClose";
 import { formatYen, recomputeDaily, recomputeMonthly } from "./monthly";
@@ -197,7 +198,8 @@ function runInvoiceStep(ports: AppPorts, label: string, fn: (ports: AppPorts) =>
  * `notifyMfFailure(ports, "invoice", err)`、成功したら `notifyMfSuccess(ports, "invoice")`
  * を呼ぶ（`notifyMfFailure`/`notifyMfSuccess` はロック外から呼ぶ版。§4.4）。
  *
- * ⑤ 経費同期（WP-M4 で追加）。
+ * ⑤ 経費同期（{@link syncExpenses}、実装設計 §6）。MF の例外は `notifyMfFailure(ports, "journal", err)`、
+ * 成功したら `notifyMfSuccess(ports, "journal")`（②〜④ の `"invoice"` とは連続障害の回数を分ける）。
  */
 export function trigMfSync(ports: AppPorts): void {
   try {
@@ -210,7 +212,14 @@ export function trigMfSync(ports: AppPorts): void {
   runInvoiceStep(ports, "trackBillingStatus", trackBillingStatus);
   runInvoiceStep(ports, "warnMismatchDaily", warnMismatchDaily);
 
-  // ⑤ 経費同期（WP-M4 で追加）。
+  // ⑤ 経費同期（実装設計 §6, §7）。
+  try {
+    syncExpenses(ports);
+    notifyMfSuccess(ports, "journal");
+  } catch (e) {
+    console.error("trigMfSync: syncExpenses failed: " + (e instanceof Error ? (e.stack || e.message) : String(e)));
+    notifyMfFailure(ports, "journal", e);
+  }
 }
 
 /**
@@ -357,5 +366,18 @@ export function trigWeeklyOrphanCheck(ports: AppPorts): void {
         (e instanceof Error ? (e.stack || e.message) : String(e)),
     );
     notifyMfFailure(ports, "invoice", e);
+  }
+
+  // MF 連携: 週次報告の仕訳部分（二重作成の疑い・人の判断待ち。実装設計 MF連携 §6.6）。
+  // 上の疎通とは独立に try/catch し、例外は notifyMfFailure（`"journal"`）、成功したら notifyMfSuccess。
+  try {
+    weeklyJournalReport(ports);
+    notifyMfSuccess(ports, "journal");
+  } catch (e) {
+    console.error(
+      "trigWeeklyOrphanCheck: weeklyJournalReport failed: " +
+        (e instanceof Error ? (e.stack || e.message) : String(e)),
+    );
+    notifyMfFailure(ports, "journal", e);
   }
 }

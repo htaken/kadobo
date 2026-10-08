@@ -294,6 +294,40 @@ describe("dispatch — expense_submit（実装設計 経費フェーズ §5.8）
     expect(ports.sheets.expenses).toHaveLength(1);
   });
 
+  // 実装設計 MF連携 §10.2・§11.2 WP-M2/M4: `payment_method` は任意項目。
+  it("payment_method 無し（旧 Worker からの pending 再送）は BAD_REQUEST にならず、台帳には空で書かれる", () => {
+    const ports = readyExpensePorts();
+    const payload = makeExpensePayload();
+    expect("payment_method" in payload).toBe(false);
+
+    const result = dispatch(buildEnvelope(payload, { ts: EXPENSE_TS_SEC }), ports);
+
+    expect(result).toEqual({ ok: true, applied: true });
+    expect(ports.sheets.expenses[0]!.payment_method).toBe("");
+  });
+
+  it("payment_method 有り（有効値）は受理され、台帳の支払方法列に書かれる", () => {
+    const ports = readyExpensePorts();
+
+    const result = dispatch(
+      buildEnvelope(makeExpensePayload({ payment_method: "cash" }), { ts: EXPENSE_TS_SEC }),
+      ports,
+    );
+
+    expect(result).toEqual({ ok: true, applied: true });
+    expect(ports.sheets.expenses[0]!.payment_method).toBe("cash");
+  });
+
+  it("payment_method が不正な値なら BAD_REQUEST", () => {
+    const ports = readyExpensePorts();
+    const bad = { ...makeExpensePayload(), payment_method: "bitcoin" };
+
+    const result = dispatch(buildEnvelope(bad, { ts: EXPENSE_TS_SEC }), ports);
+
+    expect(result).toEqual({ ok: false, error: "BAD_REQUEST", retryable: false });
+    expect(ports.sheets.expenses).toHaveLength(0);
+  });
+
   it("ロック外で呼ばれる: フェーズ2の最中に別のロック取得（打刻相当）が成功する", () => {
     const ports = readyExpensePorts();
     let concurrentLockSucceeded = false;

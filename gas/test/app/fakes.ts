@@ -148,10 +148,32 @@ export class FakeSheets implements SheetsPort {
   }
 
   updateExpense(receiptId: string, patch: Partial<ExpenseLedgerRow>): void {
+    this.updateExpenseCalls++;
     const idx = this.expenses.findIndex((r) => r.receipt_id === receiptId);
     if (idx === -1) {
       throw new Error(`expense_not_found:${receiptId}`);
     }
+    this.expenses[idx] = { ...this.expenses[idx]!, ...patch };
+  }
+
+  /** `updateExpenseColumns` に渡された `patch` のキー集合の履歴（「同期が業務列を書かない」の検証用）。 */
+  columnPatches: { receiptId: string; keys: string[] }[] = [];
+  /** `updateExpense`（行全体の書き戻し）が呼ばれた回数。MF 同期は呼んではならない。 */
+  updateExpenseCalls = 0;
+  /** 設定すると、次の `updateExpenseColumns` 呼び出しがこれを投げる（「作成成功 → シート保存で例外」の注入用）。 */
+  failNextUpdateColumns: Error | null = null;
+
+  updateExpenseColumns(receiptId: string, patch: Partial<ExpenseLedgerRow>): void {
+    if (this.failNextUpdateColumns !== null) {
+      const err = this.failNextUpdateColumns;
+      this.failNextUpdateColumns = null;
+      throw err;
+    }
+    const idx = this.expenses.findIndex((r) => r.receipt_id === receiptId);
+    if (idx === -1) {
+      throw new Error(`expense_not_found:${receiptId}`);
+    }
+    this.columnPatches.push({ receiptId, keys: Object.keys(patch) });
     this.expenses[idx] = { ...this.expenses[idx]!, ...patch };
   }
 
@@ -254,6 +276,11 @@ export class FakeLock implements LockPort {
    * この相互排他モデルでも正しく動く。
    */
   private locked = false;
+
+  /** 今スクリプトロックを保持しているか（「MF をロックの外で呼ぶ」ことの検証用）。 */
+  get held(): boolean {
+    return this.locked;
+  }
 
   withLock<T>(fn: () => T): T {
     if (this.throwTimeoutOnce) {

@@ -1,7 +1,7 @@
 /**
  * 経費モーダル（`callback_id: kado_expense`）まわりのハンドラ（実装設計 経費フェーズ §2.2, §4.1〜§4.3）。
  *
- * - {@link buildExpenseModalView}: §2.2 の 7 ブロックのモーダル JSON を組み立てる（静的）
+ * - {@link buildExpenseModalView}: §2.2 の 8 ブロック（MF連携 §10.2 で支払方法を追加）のモーダル JSON を組み立てる（静的）
  * - {@link validateExpenseSubmission}: §4.3 の全 11 検証（純粋関数、テストしやすいよう分離）
  * - {@link handleExpenseSubmission}: §4.2 の `view_submission` 処理本体。
  *   `worker/src/handlers/view_submission.ts` と同じ構造（`jsonResponse`・冪等キー・
@@ -14,12 +14,16 @@ import {
   EXPENSE_MAX_FILE_BYTES,
   EXPENSE_MEMO_MAX_LENGTH,
   EXPENSE_PARTNER_MAX_LENGTH,
+  PAYMENT_METHODS,
+  PAYMENT_METHOD_LABELS,
   extensionOf,
   isAllowedExtension,
   isAllowedSlackFileUrl,
   isExpenseCategory,
+  isPaymentMethod,
   isReceiptType,
   type ExpenseCategory,
+  type PaymentMethod,
   type ReceiptType,
 } from "@kadobo/shared/expense";
 import { modalIdempotencyKey, ulid } from "@kadobo/shared/ids";
@@ -87,6 +91,20 @@ export function buildExpenseModalView(todayJst: string, enableEDoc = true): Slac
           type: "static_select",
           action_id: "receipt_type_select",
           options: receiptTypeOptions,
+        },
+      },
+      {
+        // 実装設計 MF連携 §10.2: 証憑区分の直後。必須・初期選択なし（推定値を確定させない）。
+        type: "input",
+        block_id: "payment_method",
+        label: { type: "plain_text", text: "支払方法" },
+        element: {
+          type: "static_select",
+          action_id: "payment_method_select",
+          options: PAYMENT_METHODS.map((m) => ({
+            text: { type: "plain_text" as const, text: PAYMENT_METHOD_LABELS[m] },
+            value: m,
+          })),
         },
       },
       {
@@ -163,6 +181,7 @@ function codePointLength(s: string): number {
 
 export interface ValidatedExpenseSubmission {
   receipt_type: ReceiptType;
+  payment_method: PaymentMethod;
   date: string;
   amount: number;
   category: ExpenseCategory;
@@ -189,6 +208,12 @@ export function validateExpenseSubmission(
   const receiptTypeRaw = getStateValue(values, "receipt_type", "receipt_type_select")?.selected_option?.value;
   if (!isReceiptType(receiptTypeRaw)) {
     errors.receipt_type = "証憑区分を選択してください";
+  }
+
+  // 1.5 payment_method: 未選択でない。値が PAYMENT_METHODS のいずれか（実装設計 MF連携 §10.2）。
+  const paymentMethodRaw = getStateValue(values, "payment_method", "payment_method_select")?.selected_option?.value;
+  if (!isPaymentMethod(paymentMethodRaw)) {
+    errors.payment_method = "支払方法を選択してください";
   }
 
   // 2. date: 未選択でない。 2.5 date: 形式・実在チェック（設計 §5.5 追記）。 3. date: 未来日でない（JST の当日まで）。
@@ -268,6 +293,7 @@ export function validateExpenseSubmission(
     value: {
       // 上の検証をすべて通過しているため、以下のキャストは安全。
       receipt_type: receiptTypeRaw as ReceiptType,
+      payment_method: paymentMethodRaw as PaymentMethod,
       date: date as string,
       amount,
       category: categoryRaw as ExpenseCategory,
@@ -393,6 +419,7 @@ export async function handleExpenseSubmission(input: HandleExpenseSubmissionInpu
     view_id: payload.view.id,
     channel_id: channelId,
     receipt_type: validated.value.receipt_type,
+    payment_method: validated.value.payment_method,
     date: validated.value.date,
     amount: validated.value.amount,
     category: validated.value.category,

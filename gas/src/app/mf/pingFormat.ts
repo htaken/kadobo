@@ -11,6 +11,7 @@
  * 会計 API v3 の OpenAPI で確認した形: `accessible_offices[].{name, code, type}`、
  * `accounts[].{id, name, available, tax_id, ...}`、`taxes[].{id, name, tax_rate, available, ...}`。
  */
+import { JOURNAL_ACCOUNT_NAMES } from "../../core/journalSync";
 
 function asRecord(v: unknown): Record<string, unknown> {
   return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : {};
@@ -66,18 +67,10 @@ export function extractAccountCount(res: unknown): number {
 
 /**
  * S-M3（実装設計 MF連携 §11.1）で名前完全一致を確かめる勘定科目名（§6.4 の科目の対応）。
- * WP-M4 で `core/journalSync.ts` の科目対応表へ移す。
+ * WP-M4 で定義を `core/journalSync.ts` の科目対応表（`JOURNAL_ACCOUNT_NAMES`）へ移した。
+ * `mfAccountingPing`・既存テストが使う名前をそのまま残すための別名。
  */
-export const S_M3_ACCOUNT_NAMES: readonly string[] = [
-  "通信費",
-  "消耗品費",
-  "旅費交通費",
-  "新聞図書費",
-  "会議費",
-  "支払手数料",
-  "雑費",
-  "事業主借",
-];
+export const S_M3_ACCOUNT_NAMES: readonly string[] = JOURNAL_ACCOUNT_NAMES;
 
 /** `GET /accounts` の 1 科目（必要な項目だけ）。 */
 export interface AccountEntry {

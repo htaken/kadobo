@@ -8,9 +8,10 @@
  * インメモリのフェイクに差し替えてユースケースをテストする。
  */
 
-import type { ExpenseCategory, ExpenseState, ReceiptType } from "@kadobo/shared/expense";
+import type { ExpenseCategory, ExpenseState, PaymentMethod, ReceiptType } from "@kadobo/shared/expense";
 import type { DailyStatus, UnitPriceRow } from "../core/aggregate";
 import type { RecentDay } from "../core/businessDate";
+import type { JournalSyncState } from "../core/journalSync";
 import type { InvoiceState } from "../core/monthClose";
 import type { LogEventType } from "../core/state";
 
@@ -156,6 +157,25 @@ export interface ExpenseLedgerRow {
   correction_of_receipt_id: string | null;
   /** 訂正理由。実装設計 §5.7。無ければ `null`。 */
   correction_reason: string | null;
+  // -------------------------------------------------------------------------
+  // MF 連携フェーズで追加した 7 列（実装設計 MF連携 §6.1）。既存 24 列の後ろ（25〜31 列目）。
+  // 業務列は `payment_method`・`mf_transaction_id`、システム列は `mf_sync_*`（27〜31 列目）。
+  // MF 同期が書くのは `mf_journal_id`（14 列目）と 26〜31 列目だけ（`updateExpenseColumns`）。
+  // -------------------------------------------------------------------------
+  /** 支払方法（25 列目、業務列）。空文字 = 旧行（支払方法なし。後から人が記入すれば同期の対象になる）。 */
+  payment_method: PaymentMethod | "";
+  /** MF明細ID（26 列目、業務列）。③ で使う。`NEEDS_REVIEW` のときは人が記入できる。 */
+  mf_transaction_id: string | null;
+  /** MF連携状態（27 列目、システム列）。空文字 = 未着手（実装設計 §6.3）。 */
+  mf_sync_state: JournalSyncState;
+  /** MF連携エラー（28 列目、システム列）。最後のエラー要約（トークン・URL を含めない）。 */
+  mf_sync_error: string | null;
+  /** MF連携更新日時（29 列目、システム列）。UTC epoch ms。 */
+  mf_sync_updated_at: number | null;
+  /** MF連携試行日時（30 列目、システム列）。作成系 POST を送った時刻。UTC epoch ms（`UNKNOWN` の判定に使う）。 */
+  mf_sync_attempted_at: number | null;
+  /** MF連携入力（31 列目、システム列）。仕訳を作ったときの入力の要約（`金額|日付|カテゴリ|支払方法|明細ID`）。 */
+  mf_sync_input: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +244,13 @@ export interface SheetsPort {
    * （フェーズ 1 で必ず先に行を作ってから呼ぶ設計のため、無いのは呼び出し順序の誤り）。
    */
   updateExpense(receiptId: string, patch: Partial<ExpenseLedgerRow>): void;
+  /**
+   * 🔄 `証憑ID` に一致する行の**指定した列だけ**を書く（実装設計 MF連携 §0, §6.1, §8）。
+   * `updateExpense` は行全体を読み直して書き戻すが、こちらは `patch` のキーに対応するセルだけを
+   * 書く。MF 同期（`app/journalSync.ts`）は業務列を上書きしないよう、これだけを使う。
+   * 対象行が無い場合は例外を投げる。**呼び出し側が `ports.lock.withLock` の中で呼ぶこと**。
+   */
+  updateExpenseColumns(receiptId: string, patch: Partial<ExpenseLedgerRow>): void;
   /** 全行を返す（週次照合用。月数十件規模なので全件で足りる）。 */
   getAllExpenses(): ExpenseLedgerRow[];
 }

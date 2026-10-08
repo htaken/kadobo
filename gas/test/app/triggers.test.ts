@@ -16,6 +16,7 @@ import {
   type RawLogRow,
 } from "../../src/app/ports";
 import { makeFakePorts } from "./fakes";
+import { accountingCallsOf, installFakeMfAccounting } from "./mf/fakeMfAccounting";
 
 function seedInvoiceTokens(ports: ReturnType<typeof makeFakePorts>): void {
   ports.secrets.set(
@@ -70,6 +71,13 @@ function expenseRow(overrides: Partial<ExpenseLedgerRow> = {}): ExpenseLedgerRow
     business_use_ratio: 100,
     correction_of_receipt_id: null,
     correction_reason: null,
+    payment_method: "",
+    mf_transaction_id: null,
+    mf_sync_state: "",
+    mf_sync_error: null,
+    mf_sync_updated_at: null,
+    mf_sync_attempted_at: null,
+    mf_sync_input: "",
     ...overrides,
   };
 }
@@ -631,5 +639,182 @@ describe("trigWeeklyOrphanCheck — weeklyInvoiceKeepalive（実装設計 MF連�
     // トークン未設定 -> MfReauthRequiredError が投げられる。
 
     expect(() => trigWeeklyOrphanCheck(ports)).not.toThrow();
+  });
+});
+
+// 経費同期（WP-M4。実装設計 MF連携 §6, §7）
+
+function journalReadyRow(id: string, o: Partial<ExpenseLedgerRow> = {}): ExpenseLedgerRow {
+  return {
+    receipt_id: id,
+    receipt_type: "paper",
+    date: "2026-11-10",
+    amount: 800,
+    partner: "○○商店",
+    category: "通信費",
+    memo: "",
+    drive_link: "https://drive.example.test/x",
+    file_hash: "h",
+    mime_type: "image/jpeg",
+    size: 1,
+    input_at: 1,
+    state: "COMPLETED",
+    mf_journal_id: null,
+    idempotency_key: `K-${id}`,
+    slack_file_id: "F",
+    drive_file_id: "D",
+    original_file_name: "a.jpg",
+    last_error: null,
+    state_updated_at: 1,
+    tax_category: "",
+    business_use_ratio: 100,
+    correction_of_receipt_id: null,
+    correction_reason: null,
+    payment_method: "cash",
+    mf_transaction_id: null,
+    mf_sync_state: "",
+    mf_sync_error: null,
+    mf_sync_updated_at: null,
+    mf_sync_attempted_at: null,
+    mf_sync_input: "",
+    ...o,
+  };
+}
+
+describe("trigMfSync ⑤ 経費同期（実装設計 MF連携 §7）", () => {
+  it("フラグ有効: 経費台帳の現金の行を仕訳にする（trigMfSyncSoon からも同じ）", () => {
+    const ports = makeFakePorts(Date.parse("2026-11-15T06:00:00+09:00"));
+    setupChannel(ports);
+    const api = installFakeMfAccounting(ports);
+    ports.props.set("MF_ENABLED", "true");
+    ports.props.set("MF_JOURNAL_ENABLED", "true");
+    ports.props.set("MF_SYNC_START_DATE", "2026-10-01");
+    ports.sheets.appendExpense(journalReadyRow("R-1"));
+    ports.sheets.appendExpense(journalReadyRow("R-2"));
+
+    trigMfSync(ports);
+    expect(api.journals.map((j) => j.tags)).toEqual([["R-1"], ["R-2"]]);
+    expect(ports.sheets.getExpenseByReceiptId("R-1")?.mf_sync_state).toBe("SYNCED");
+
+    ports.sheets.appendExpense(journalReadyRow("R-3"));
+    trigMfSyncSoon(ports);
+    expect(ports.sheets.getExpenseByReceiptId("R-3")?.mf_sync_state).toBe("SYNCED");
+  });
+
+  it("全フラグ無効なら HTTP 0 件", () => {
+    const ports = makeFakePorts(Date.parse("2026-11-15T06:00:00+09:00"));
+    setupChannel(ports);
+    installFakeMfAccounting(ports);
+    ports.props.set("MF_SYNC_START_DATE", "2026-10-01");
+    ports.sheets.appendExpense(journalReadyRow("R-1"));
+
+    trigMfSync(ports);
+
+    expect(ports.http.calls).toHaveLength(0);
+  });
+
+  it("syncExpenses の MfTransientError は投げず、`mf_fail/journal` に数え、6 回連続で「一時障害が続いています」を DM する", () => {
+    const ports = makeFakePorts(Date.parse("2026-11-15T06:00:00+09:00"));
+    setupChannel(ports);
+    ports.props.set("MF_ENABLED", "true");
+    ports.props.set("MF_JOURNAL_ENABLED", "true");
+    ports.props.set("MF_SYNC_START_DATE", "2026-10-01");
+    ports.props.set("SLACK_USER_ID", "U1");
+    ports.props.set("MF_ACCOUNTING_API_KEY", "k");
+    ports.props.set("MF_OFFICE_CODE", "1234-5678");
+    ports.http.defaultResponse = { status: 503, headers: {}, body: "" }; // JWT 交換が 5xx → MfTransientError
+    ports.sheets.appendExpense(journalReadyRow("R-1"));
+
+    for (let i = 0; i < 6; i++) {
+      expect(() => trigMfSync(ports)).not.toThrow();
+    }
+
+    expect(ports.sheets.getInternalValue("mf_fail", "journal")).toBe("6");
+    expect(ports.slack.dms.filter((d) => d.text.includes("一時障害が続いています") && d.text.includes("journal"))).toHaveLength(1);
+    // 請求書側のカウンタ（invoice）とは別。
+    expect(ports.sheets.getInternalValue("mf_fail", "invoice")).toBeNull();
+  });
+
+  it("会計 API が 403: 行は変えず、API キーの有効性・権限の確認を依頼する DM が出る（24 時間に 1 回）", () => {
+    const ports = makeFakePorts(Date.parse("2026-11-15T06:00:00+09:00"));
+    setupChannel(ports);
+    const api = installFakeMfAccounting(ports);
+    ports.props.set("MF_ENABLED", "true");
+    ports.props.set("MF_JOURNAL_ENABLED", "true");
+    ports.props.set("MF_SYNC_START_DATE", "2026-10-01");
+    ports.props.set("SLACK_USER_ID", "U1");
+    api.forbidAll = true;
+    ports.sheets.appendExpense(journalReadyRow("R-1", { mf_sync_state: "CREATING", mf_sync_attempted_at: 1 }));
+
+    expect(() => trigMfSync(ports)).not.toThrow();
+    trigMfSync(ports);
+
+    expect(ports.sheets.getExpenseByReceiptId("R-1")?.mf_sync_state).toBe("CREATING");
+    const dms = ports.slack.dms.filter((d) => d.text.includes("MF_ACCOUNTING_API_KEY") && d.text.includes("権限"));
+    expect(dms).toHaveLength(1);
+    expect(dms[0]!.text).toContain("journal");
+  });
+
+  it("syncExpenses が成功すれば `mf_fail/journal` の連続回数をリセットする", () => {
+    const ports = makeFakePorts(Date.parse("2026-11-15T06:00:00+09:00"));
+    setupChannel(ports);
+    installFakeMfAccounting(ports);
+    ports.props.set("MF_ENABLED", "true");
+    ports.props.set("MF_JOURNAL_ENABLED", "true");
+    ports.props.set("MF_SYNC_START_DATE", "2026-10-01");
+    ports.sheets.setInternalValue("mf_fail", "journal", "3");
+
+    trigMfSync(ports);
+
+    expect(ports.sheets.getInternalValue("mf_fail", "journal")).toBe("0");
+  });
+
+  it("経費同期が例外を投げても ①〜④ は先に実行されている（各ステップが独立）", () => {
+    const ports = makeFakePorts(Date.parse("2026-11-15T06:00:00+09:00"));
+    setupChannel(ports);
+    ports.props.set("MF_BILLING_START_MONTH", "2026-10");
+    seedUnitPrice(ports);
+    ports.props.set("MF_ENABLED", "true");
+    ports.sheets.getAllExpenses = () => {
+      throw new Error("boom");
+    };
+
+    expect(() => trigMfSync(ports)).not.toThrow();
+    expect(ports.sheets.getMonthlyBill("A社", "2026-10")?.state).toBe("REVIEWING");
+  });
+});
+
+describe("trigWeeklyOrphanCheck — 週次報告の仕訳部分（実装設計 MF連携 §6.6）", () => {
+  it("末尾で二重作成の疑い（同じ証憑 ID のタグの仕訳が 2 件以上）と、人の判断待ちの件数を報告する", () => {
+    const ports = makeFakePorts(WEEKLY_NOW);
+    setupChannel(ports);
+    const api = installFakeMfAccounting(ports);
+    ports.props.set("MF_ENABLED", "true");
+    ports.props.set("MF_SYNC_START_DATE", "2026-08-01");
+    ports.sheets.appendExpense(journalReadyRow("R-1", { date: "2026-08-20", mf_sync_state: "SYNCED" }));
+    ports.sheets.appendExpense(journalReadyRow("R-2", { date: "2026-08-21", mf_sync_state: "NEEDS_REVIEW" }));
+    api.plantJournal({ transaction_date: "2026-08-20", tags: ["R-1"] });
+    api.plantJournal({ transaction_date: "2026-08-20", tags: ["R-1"] });
+
+    trigWeeklyOrphanCheck(ports);
+
+    const text = ports.slack.posted.map((p) => p.text).join("\n");
+    expect(text).toContain("二重作成の疑い");
+    expect(text).toContain("R-1");
+    expect(text).toContain("NEEDS_REVIEW 1 件");
+    expect(accountingCallsOf(ports).filter((c) => c === "GET /journals").length).toBeGreaterThan(0);
+  });
+
+  it("仕訳部分が例外を投げても trigWeeklyOrphanCheck 自体は例外を投げない（独立した try/catch）。`mf_fail/journal` に数える", () => {
+    const ports = makeFakePorts(WEEKLY_NOW);
+    setupChannel(ports);
+    ports.props.set("MF_ENABLED", "true");
+    ports.props.set("MF_SYNC_START_DATE", "2026-08-01");
+    ports.props.set("MF_ACCOUNTING_API_KEY", "k");
+    ports.props.set("MF_OFFICE_CODE", "1234-5678");
+    ports.http.defaultResponse = { status: 503, headers: {}, body: "" };
+
+    expect(() => trigWeeklyOrphanCheck(ports)).not.toThrow();
+    expect(ports.sheets.getInternalValue("mf_fail", "journal")).toBe("1");
   });
 });

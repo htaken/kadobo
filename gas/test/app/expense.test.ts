@@ -572,3 +572,29 @@ describe("handleExpenseSubmit — Sheets 数式インジェクション対策（
     expect(ports.sheets.expenses[0]!.memo).toBe("'+1+1");
   });
 });
+
+describe("handleExpenseSubmit — 支払方法・MF 連携列（実装設計 MF連携 §6.1, §10.2）", () => {
+  it("payment_method を台帳の支払方法列に書き、MF 連携の列は未着手（空）で作る", () => {
+    const ports = makeFakePorts(NOW_MS);
+
+    const result = handleExpenseSubmit(makeExpenseRequest({ payment_method: "linked_card" }), ports);
+
+    expect(result).toEqual({ ok: true, applied: true });
+    const row = ports.sheets.expenses[0]!;
+    expect(row.payment_method).toBe("linked_card");
+    expect(row.mf_transaction_id).toBeNull();
+    expect(row.mf_sync_state).toBe("");
+    expect(row.mf_sync_error).toBeNull();
+    expect(row.mf_sync_updated_at).toBeNull();
+    expect(row.mf_sync_attempted_at).toBeNull();
+    expect(row.mf_sync_input).toBe("");
+  });
+
+  it("payment_method が無い（旧 Worker の再送）なら空で書く", () => {
+    const ports = makeFakePorts(NOW_MS);
+
+    handleExpenseSubmit(makeExpenseRequest(), ports);
+
+    expect(ports.sheets.expenses[0]!.payment_method).toBe("");
+  });
+});

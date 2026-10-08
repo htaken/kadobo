@@ -30,6 +30,9 @@ function baseValues(): SlackStateValues {
     receipt_type: {
       receipt_type_select: { type: "static_select", selected_option: { value: "paper" } },
     },
+    payment_method: {
+      payment_method_select: { type: "static_select", selected_option: { value: "cash" } },
+    },
     date: { date_pick: { type: "datepicker", selected_date: PAST_DATE } },
     amount: { amount_input: { type: "plain_text_input", value: "1200" } },
     category: { category_select: { type: "static_select", selected_option: { value: "消耗品費" } } },
@@ -114,11 +117,12 @@ describe("buildExpenseModalView", () => {
     expect(view.private_metadata).toBe("");
   });
 
-  it("§2.2 の 7 ブロックが順序どおりに揃っている", () => {
+  it("§2.2 の 7 ブロック＋支払方法（MF連携 §10.2）が順序どおりに揃っている。支払方法は証憑区分の直後", () => {
     const view = buildExpenseModalView("2026-09-01");
-    expect(view.blocks).toHaveLength(7);
+    expect(view.blocks).toHaveLength(8);
     expect(view.blocks.map((b) => b.block_id)).toEqual([
       "receipt_type",
+      "payment_method",
       "date",
       "amount",
       "category",
@@ -138,6 +142,22 @@ describe("buildExpenseModalView", () => {
   });
 
   // 🔄 実装設計 経費フェーズ §5.9.2, §9 WP9c: enable_e_doc 無効時は e_doc の選択肢を出さない。
+  it("payment_method: 必須の static_select、3択（連携カード／連携口座から直接／現金・その他）、初期選択は置かない（MF連携 §10.2）", () => {
+    const view = buildExpenseModalView("2026-09-01");
+    const block = view.blocks.find((b) => b.block_id === "payment_method") as any;
+    expect(block.type).toBe("input");
+    expect(block.optional).not.toBe(true);
+    expect(block.element.type).toBe("static_select");
+    expect(block.element.action_id).toBe("payment_method_select");
+    expect(block.element.options.map((o: any) => o.value)).toEqual(["linked_card", "linked_bank", "cash"]);
+    expect(block.element.options.map((o: any) => o.text.text)).toEqual([
+      "連携カード",
+      "連携口座から直接（振込・引落）",
+      "現金・その他（立替）",
+    ]);
+    expect(block.element.initial_option).toBeUndefined();
+  });
+
   it("第2引数 enableEDoc=false: receipt_type の選択肢が paper だけになる", () => {
     const view = buildExpenseModalView("2026-09-01", false);
     const block = view.blocks.find((b) => b.block_id === "receipt_type") as any;
@@ -195,6 +215,7 @@ describe("validateExpenseSubmission", () => {
     if (result.ok) {
       expect(result.value).toEqual({
         receipt_type: "paper",
+        payment_method: "cash",
         date: PAST_DATE,
         amount: 1200,
         category: "消耗品費",
@@ -210,6 +231,41 @@ describe("validateExpenseSubmission", () => {
         },
       });
     }
+  });
+
+  // MF連携 §10.2: 支払方法は必須。未選択・不正値は「支払方法を選択してください」。
+  describe("payment_method（MF連携 §10.2）", () => {
+    it("未選択（selected_option なし）はエラー「支払方法を選択してください」", () => {
+      const values = baseValues();
+      values.payment_method = { payment_method_select: { type: "static_select" } };
+      const result = validateExpenseSubmission(values, TODAY_JST);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.errors.payment_method).toBe("支払方法を選択してください");
+    });
+
+    it("ブロックごと欠落してもエラー", () => {
+      const values = baseValues();
+      delete values.payment_method;
+      const result = validateExpenseSubmission(values, TODAY_JST);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.errors.payment_method).toBe("支払方法を選択してください");
+    });
+
+    it("不正な値はエラー", () => {
+      const values = baseValues();
+      values.payment_method = { payment_method_select: { type: "static_select", selected_option: { value: "bitcoin" } } };
+      const result = validateExpenseSubmission(values, TODAY_JST);
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.errors.payment_method).toBe("支払方法を選択してください");
+    });
+
+    it.each(["linked_card", "linked_bank", "cash"])("%s は通り、検証結果に載る", (method) => {
+      const values = baseValues();
+      values.payment_method = { payment_method_select: { type: "static_select", selected_option: { value: method } } };
+      const result = validateExpenseSubmission(values, TODAY_JST);
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.value.payment_method).toBe(method);
+    });
   });
 
   // 1. receipt_type: 未選択でない。値が paper / e_doc のいずれか。
@@ -591,11 +647,29 @@ describe("handleExpenseSubmission", () => {
     const body = (await res.json()) as any;
     expect(body.response_action).toBe("errors");
     expect(body.errors.receipt_type).toBeDefined();
+    expect(body.errors.payment_method).toBe("支払方法を選択してください");
     expect(body.errors.date).toBeDefined();
     expect(body.errors.amount).toBeDefined();
     expect(body.errors.category).toBeDefined();
     expect(body.errors.partner).toBeDefined();
     expect(body.errors.file).toBeDefined();
+
+    await flush();
+    expect(await allJournalRows()).toHaveLength(0);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("支払方法だけ未選択: errors.payment_method を同期で返し、journal にも GAS にも送らない（MF連携 §10.2）", async () => {
+    const env = makeEnv(db);
+    const { ctx, flush } = createTestCtx();
+    const { fetchImpl, calls } = createFetchStub();
+    const values = baseValues();
+    values.payment_method = { payment_method_select: { type: "static_select" } };
+
+    const res = await handleExpenseSubmission({ env, ctx, payload: makeExpensePayload(values), fetchImpl });
+    const body = (await res.json()) as any;
+    expect(body.response_action).toBe("errors");
+    expect(body.errors).toEqual({ payment_method: "支払方法を選択してください" });
 
     await flush();
     expect(await allJournalRows()).toHaveLength(0);
@@ -643,6 +717,7 @@ describe("handleExpenseSubmission", () => {
     expect(sent.view_id).toBe("V1");
     expect(sent.channel_id).toBe("C1");
     expect(sent.receipt_type).toBe("paper");
+    expect(sent.payment_method).toBe("cash");
     expect(sent.date).toBe(PAST_DATE);
     expect(sent.amount).toBe(1200);
     expect(sent.category).toBe("消耗品費");

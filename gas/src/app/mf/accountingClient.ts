@@ -6,8 +6,9 @@
  *
  * JWT は `POST /auth/exchange`（`Authorization: Bearer <APIキー>`）で取得し、
  * `TtlCachePort` のキー `mf_acc_jwt` に 3000 秒（`expires_in` 3600 より短く）保存する。
- * 401 → キャッシュを消して再交換し、1 回だけ再試行する。403 は {@link MfApiError}
- * （`classifyFinalOutcome` の 4xx 分岐がそのまま処理する）。
+ * 401 → キャッシュを消して再交換し、1 回だけ再試行する。403（権限不足。API キーの権限は設計書 §9）は
+ * 行・対象ごとの業務エラーではなく設定不備なので {@link MfAuthError}（`service: "accounting"`）にする
+ * （呼び出し側は対象の状態を変えずに上へ投げ、`notifyMfFailure` が API キーの有効性・権限の確認を依頼する）。
  *
  * 3 回/秒のレート制限に対応するため、同じインスタンス内では直前のリクエストから 350ms
  * 空ける（`clock.sleep`）。別インスタンス（別の実行）間の制御はしない（429 からの復旧で吸収する）。
@@ -129,6 +130,10 @@ export class MfAccountingClient {
       } else {
         throw new MfTransientError("MF_ACCOUNTING_429_RETRY_AFTER_TOO_LONG");
       }
+    }
+
+    if (outcome.kind === "response" && outcome.value.status === 403) {
+      throw new MfAuthError("MF_ACCOUNTING_FORBIDDEN", "accounting");
     }
 
     return classifyFinalOutcome(outcome, create);

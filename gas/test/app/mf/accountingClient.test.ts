@@ -150,7 +150,7 @@ describe("MfAccountingClient.request", () => {
     }
   });
 
-  it("403 は MfApiError（権限不足）", () => {
+  it("403 は MfAuthError（service: accounting。権限不足は行ごとの業務エラーにしない）", () => {
     const ports = makeFakePorts();
     setup(ports);
     ports.ttlCache.put(MF_ACCOUNTING_JWT_CACHE_KEY, "JWT1", 3000);
@@ -161,10 +161,10 @@ describe("MfAccountingClient.request", () => {
 
     try {
       makeClient(ports).request("get", "/accounts");
-      throw new Error("MfApiError を期待した");
+      throw new Error("MfAuthError を期待した");
     } catch (e) {
-      expect(e).toBeInstanceOf(MfApiError);
-      expect((e as MfApiError).status).toBe(403);
+      expect(e).toBeInstanceOf(MfAuthError);
+      expect((e as MfAuthError).service).toBe("accounting");
     }
   });
 

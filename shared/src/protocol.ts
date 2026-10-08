@@ -6,7 +6,7 @@
  * 呼び出し側から注入する（`shared/src/ids.ts` 参照）。
  */
 
-import type { ExpenseCategory, ReceiptType } from "./expense";
+import type { ExpenseCategory, PaymentMethod, ReceiptType } from "./expense";
 
 /** 封筒のプロトコルバージョン（実装設計 §3.1）。 */
 export const ENVELOPE_VERSION = 1;
@@ -147,6 +147,12 @@ export type GasRequest =
        */
       channel_id: string;
       receipt_type: ReceiptType;
+      /**
+       * 支払方法（実装設計 MF連携 §10.2）。**任意**: GAS を先にデプロイしたとき、旧 Worker からの
+       * pending 再送（`payment_method` なし）も受け付けるため。欠けていれば台帳には空で書く
+       * （後から人が記入すれば同期の対象になる。§6.2）。
+       */
+      payment_method?: PaymentMethod;
       /** 取引年月日 `YYYY-MM-DD`（JST）。 */
       date: string;
       /** 税込円。正の整数。 */

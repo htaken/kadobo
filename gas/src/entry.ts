@@ -12,6 +12,8 @@
 import { handlePostBody } from "./app/dispatch";
 import { makeMfAccountingClient } from "./app/mf/accountingClient";
 import { makeMfInvoiceClient } from "./app/mf/invoiceClient";
+import { runInvoiceSpikeS1 } from "./app/mf/spikeInvoice";
+import { runJournalSpikeS5 } from "./app/mf/spikeJournal";
 import {
   collectTaxIds,
   extractOfficeName,
@@ -186,4 +188,24 @@ export function mfAccountingPing(): void {
   for (const id of taxIds) {
     Logger.log(formatTaxLine(id, taxes));
   }
+}
+
+/**
+ * 手動実行: スパイク S-M1・S-M2（実装設計 MF連携 §11.1）。請求書 KD-TEST-S1 を作って金額・設定・
+ * 検索の挙動を確かめ、最後に削除する（前回の削除失敗分があれば作らずに回収して使う）。
+ * シートには書かず、`MF_*_ENABLED` フラグも見ない。**トークンは出力しない**。
+ */
+export function mfInvoiceSpikeS1(): void {
+  runInvoiceSpikeS1(buildPorts(), (line) => Logger.log(line));
+}
+
+/**
+ * 手動実行: スパイク S-M5 の `POST /journals` 部分（実装設計 MF連携 §11.1）。テスト仕訳
+ * （tags `kadobo-spike-s5`、借方 雑費 1 円／貸方 事業主借 1 円、`tax_id` なし）を作り、免税設定で税区分が
+ * どう入ったか・tags 検索で見つかるか・削除できるかを Logger に出して、最後に必ず削除する
+ * （前回の削除失敗分があれば作らずに回収して使う）。シートには書かず、`MF_*_ENABLED` フラグも見ない。
+ * 連携明細の `journalize` は WP-M5。**API キー・トークンは出力しない**。
+ */
+export function mfJournalSpikeS5(): void {
+  runJournalSpikeS5(buildPorts(), (line) => Logger.log(line));
 }
