@@ -3,7 +3,7 @@
  * 会計 API は `fakeMfAccounting.ts` の簡易フェイクサーバ。実際の MF にはアクセスしない。
  */
 import { describe, expect, it } from "vitest";
-import { MfApiError } from "../../../src/app/mf/errors";
+import { MfApiError, MfTransientError } from "../../../src/app/mf/errors";
 import {
   SPIKE_JOURNAL_REMARK,
   SPIKE_JOURNAL_TAG,
@@ -61,15 +61,16 @@ describe("runJournalSpikeS5", () => {
     expect(text).toContain("branches[0].creditor: account_name=事業主借 value=1 tax_name=対象外 tax_value=0");
   });
 
-  it("作成直後に tags で検索して見つかるか、DELETE 後に 404 になるかを確かめ、仕訳は残らない（ID にエンコードを重ねない）", () => {
+  it("作成直後に tags で検索して見つかるか、DELETE 後に「存在しない」になるかを確かめ、仕訳は残らない（パスの ID は pathWithId）", () => {
     const { ports, api, lines, log } = setup();
 
     runJournalSpikeS5(ports, log);
 
     const text = lines.join("\n");
     expect(text).toContain("今回作った仕訳が見つかった");
-    expect(text).toContain("DELETE 後の GET");
-    expect(text).toContain("404");
+    // 実機では削除後の GET は 404 ではなく 400 invalid_request_path_parameter（isMfNotFound が「存在しない」と判定）。
+    expect(text).toContain("S-M5 削除済み: DELETE 後の GET");
+    expect(text).toContain("status=400 code=invalid_request_path_parameter");
     expect(api.journals).toHaveLength(0);
     const calls = accountingCallsOf(ports);
     expect(calls.filter((c) => c === "POST /journals")).toHaveLength(1);
@@ -103,6 +104,76 @@ describe("runJournalSpikeS5", () => {
     expect(lines.join("\n")).toContain(`既存の ${SPIKE_JOURNAL_TAG} を 1 件検出したため新規作成しない。id=${old.id}`);
     expect(lines.join("\n")).toContain("作成直後の検索: 既存を回収したため今回は行わない");
     expect(api.journals).toHaveLength(0);
+  });
+
+  it("パスの ID は pathWithId（encodeURIComponent 1 回）で置く。読み直し・DELETE・確認 GET とも同じ表記", () => {
+    const { ports, api, log } = setup();
+
+    runJournalSpikeS5(ports, log);
+
+    const idCalls = ports.http.calls.filter((c) => c.url.includes("/journals/"));
+    expect(idCalls.map((c) => c.method)).toEqual(["get", "delete", "get"]);
+    const paths = new Set(idCalls.map((c) => c.url.split("?")[0]));
+    expect(paths.size).toBe(1);
+    expect([...paths][0]).toContain("%25");
+    expect(api.journals).toHaveLength(0);
+  });
+
+  it("探査用の複数表記の GET はもう行わない（H1 確定）", () => {
+    const { ports, lines, log } = setup();
+    runJournalSpikeS5(ports, log);
+    expect(lines.join("\n")).not.toContain("ID 表記");
+    expect(ports.http.calls.filter((c) => c.method === "get" && c.url.includes("/journals/"))).toHaveLength(2);
+  });
+
+  it("削除後の GET が 200 のままなら削除が効いていないとして例外", () => {
+    const { ports, api, lines, log } = setup();
+    const orig = api.handle.bind(api);
+    api.handle = (req) => {
+      if (req.method === "delete") {
+        return { status: 204, headers: {}, body: "" }; // 削除したと言うが実際は残る
+      }
+      return orig(req);
+    };
+
+    expect(() => runJournalSpikeS5(ports, log)).toThrow(/SPIKE_DELETE_NOT_EFFECTIVE/);
+    expect(lines.join("\n")).toContain("手動削除してください");
+  });
+
+  it("削除後の GET が従来どおりの 404 でも「削除済み」", () => {
+    const { ports, api, lines, log } = setup();
+    const orig = api.handle.bind(api);
+    let deleted = false;
+    api.handle = (req) => {
+      if (req.method === "delete") {
+        deleted = true;
+      }
+      if (deleted && req.method === "get" && /\/journals\/[^?]+\?/.test(req.url)) {
+        return { status: 404, headers: {}, body: JSON.stringify({ errors: [{ code: "not_found", message: "n" }] }) };
+      }
+      return orig(req);
+    };
+
+    runJournalSpikeS5(ports, log);
+
+    expect(lines.join("\n")).toContain("status=404");
+  });
+
+  it("MfApiError 以外（認証・一時障害）の例外はそのまま伝播する", () => {
+    const { ports, api, log } = setup();
+    const orig = api.handle.bind(api);
+    let n = 0;
+    api.handle = (req) => {
+      if (req.method === "get" && /\/journals\/[^?]+\?/.test(req.url)) {
+        n++;
+        if (n >= 2) {
+          return { status: 503, headers: {}, body: "" };
+        }
+      }
+      return orig(req);
+    };
+
+    expect(() => runJournalSpikeS5(ports, log)).toThrow(MfTransientError);
   });
 
   it("削除に失敗したら仕訳 ID と手動削除の案内を出して例外を投げる", () => {

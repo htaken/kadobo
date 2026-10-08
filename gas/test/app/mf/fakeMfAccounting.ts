@@ -3,8 +3,11 @@
  * `FakeHttp.fetch` を差し替えて使う（`installFakeMfAccounting`）。
  *
  * 会計 API は ID をパーセントエンコード済みの文字列で返す（実装設計 MF連携 §3.2 🔬）ので、このフェイクの
- * ID も `…%2B…%3D%3D` の形にし、パスの ID は**デコードせず生のまま**比較する。パスに
- * `encodeURIComponent` が重ねられていると（`%252B…`）見つからず 404 になる。
+ * ID も `…%2B…%3D%3D` の形にする。実機（2026-10-08 の S-M5）の観測を再現する:
+ * - パスの ID は 1 回デコードしてから保存済みの ID と比較する（`encodeURIComponent(id)` = `pathWithId` は 200。
+ *   返された文字列そのままも 200）。`decodeURIComponent(id)`（素の base64 `…+…=`）は一致せず 400。
+ * - **存在しない ID への GET/DELETE は 404 ではなく 400 `invalid_request_path_parameter`**
+ *   （404 を返す分岐は持たない）。
  */
 import type { FakeHttpRequest, FakePorts } from "../fakes";
 
@@ -47,7 +50,8 @@ export class FakeMfAccounting {
   postMode: PostMode = "ok";
   /** `postMode` を `n` 回だけ有効にして、その後は `ok` に戻す。 */
   postModeRemaining = Infinity;
-  deleteStatus: 204 | 404 | 400 = 204;
+  /** `400` にすると、存在する仕訳への DELETE が業務エラー（code `bad`。存在しない ID とは別）になる。 */
+  deleteStatus: 204 | 400 = 204;
   /** 受け取った POST /journals の本文（パース済み）。 */
   postedBodies: Record<string, unknown>[] = [];
   /** accounts に含めない名前（科目解決の失敗の再現）。 */
@@ -175,19 +179,29 @@ export class FakeMfAccounting {
     }
     const m = /^\/journals\/(.+)$/.exec(path);
     if (m !== null) {
-      const idRaw = m[1] as string; // デコードしない（二重エンコードを検出するため）
-      const idx = this.journals.findIndex((j) => j.id === idRaw);
+      const pathId = m[1] as string;
+      let decoded: string;
+      try {
+        decoded = decodeURIComponent(pathId); // 1 回デコードして比較する（実機 H1 の再現）
+      } catch {
+        decoded = pathId;
+      }
+      const idx = this.journals.findIndex((j) => j.id === decoded || j.id === pathId);
+      const notFound = (): { status: number; headers: Record<string, string>; body: string } =>
+        json(400, {
+          errors: [{ code: "invalid_request_path_parameter", message: "The given id does not exist for this office." }],
+        });
       if (req.method === "get") {
         return idx === -1
-          ? json(404, { errors: [{ code: "not_found", message: "not found" }] })
+          ? notFound()
           : json(200, { journal: this.toResponseJournal(this.journals[idx] as FakeJournal) });
       }
       if (req.method === "delete") {
+        if (idx === -1) {
+          return notFound();
+        }
         if (this.deleteStatus === 400) {
           return json(400, { errors: [{ code: "bad", message: "cannot delete" }] });
-        }
-        if (this.deleteStatus === 404 || idx === -1) {
-          return json(404, { errors: [{ code: "not_found", message: "not found" }] });
         }
         this.journals.splice(idx, 1);
         return { status: 204, headers: {}, body: "" };

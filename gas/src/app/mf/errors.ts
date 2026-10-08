@@ -109,3 +109,17 @@ export function parseMfApiErrorBody(body: string): { code?: string; message?: st
   }
   return { code, message };
 }
+
+/**
+ * 会計 API で「その ID の対象が存在しない」を表す `MfApiError` か。実機（2026-10-08 の S-M5）で、存在しない
+ * 仕訳 ID への `GET`・`DELETE` は 404 ではなく **400 `invalid_request_path_parameter`**
+ * （"The given id does not exist for this office"）だった。従来どおりの 404 も含める。判定はここに集約する。
+ * 形式の誤り（例: 素の base64 `+` を置いた場合の "An invalid value was specified for one of the path
+ * parameters"）も同じ code で返るため、ID の表記（`pathWithId`）が正しいことが前提。
+ */
+export function isMfNotFound(err: unknown): boolean {
+  return (
+    err instanceof MfApiError &&
+    (err.status === 404 || (err.status === 400 && err.code === "invalid_request_path_parameter"))
+  );
+}

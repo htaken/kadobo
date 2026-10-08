@@ -35,6 +35,20 @@ const JWT_CACHE_TTL_SEC = 3000;
 /** 同一インスタンス内での最小リクエスト間隔（実装設計 §4.3「3 回/秒」への対応）。 */
 const MIN_INTERVAL_MS = 350;
 
+/**
+ * `GET/PUT/DELETE /journals/{id}` 等、ID をパスに置く URL パスを組み立てる（ID のパスエンコードをここに集約する）。
+ *
+ * 会計 API が返す ID はパーセントエンコード済みの文字列（`…%2B…%3D`）。実機の S-M5（2026-10-08）で、
+ * `encodeURIComponent(id)` を 1 回かけた形は 200、`decodeURIComponent(id)`（素の base64 `…+…=`）は
+ * 400 `invalid_request_path_parameter`、返された文字列そのままも 200 だった（H1: サーバーがパスを 1 回
+ * デコードして比較する）。この関数は 1 回エンコードする形に統一する。本文（`account_id` 等）には引き続き
+ * 返された文字列をそのまま入れる。存在しない ID への GET/DELETE は 404 ではなく 400
+ * `invalid_request_path_parameter` になる（`isMfNotFound` 参照）。
+ */
+export function pathWithId(basePath: string, id: string): string {
+  return `${basePath}/${encodeURIComponent(id)}`;
+}
+
 export type MfAccountingClientPorts = Pick<AppPorts, "http" | "ttlCache" | "clock" | "props">;
 
 function requireApiKey(ports: MfAccountingClientPorts): string {

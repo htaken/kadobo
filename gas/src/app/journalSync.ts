@@ -15,8 +15,9 @@
  * ロックの外で行う。書くときは行を読み直し、§6.1 の列（`MF仕訳ID`・`MF明細ID`・27〜31 列目）だけを
  * `updateExpenseColumns` で書く（業務列は書かない）。Slack・`notifyMf*` もロックの外で呼ぶ。
  *
- * **ID の扱い（§3.2 🔬）**: 会計 API の ID はパーセントエンコード済みの文字列。本文にもパスにも
- * そのまま入れ、`encodeURIComponent` を重ねない。
+ * **ID の扱い（§3.2 🔬）**: 会計 API の ID はパーセントエンコード済みの文字列。本文（`account_id` 等）には
+ * そのまま入れる。パスに置くときは `pathWithId`（`accountingClient.ts`）に集約する（実機の S-M5 で、
+ * そのまま置くと 400 になったため。方式は同関数の JSDoc 参照）。
  *
  * **フラグ（§9）**: 全体は `MF_ENABLED`。新規作成（5）だけ `MF_JOURNAL_ENABLED` も要る。回収・取消・
  * 取り込み・変更検出は `MF_ENABLED` だけで動く（作りかけを放置しないため）。
@@ -43,8 +44,8 @@ import {
   summarizeSyncInput,
   totalPagesOf,
 } from "../core/journalSync";
-import { makeMfAccountingClient, type MfAccountingClient } from "./mf/accountingClient";
-import { MfApiError, MfOutcomeUnknownError } from "./mf/errors";
+import { makeMfAccountingClient, pathWithId, type MfAccountingClient } from "./mf/accountingClient";
+import { MfApiError, MfOutcomeUnknownError, isMfNotFound } from "./mf/errors";
 import { isJournalEnabled, isMfEnabled } from "./mf/flags";
 import { withLease } from "./mf/lease";
 import { lookupAccountsByName } from "./mf/pingFormat";
@@ -206,7 +207,7 @@ interface SyncCtx {
 }
 
 // ---------------------------------------------------------------------------
-// MF 呼び出し（ID はパーセントエンコード済み。エンコードを重ねない）
+// MF 呼び出し（ID は MF が返したパーセントエンコード済みの文字列。パスに置くときは pathWithId）
 // ---------------------------------------------------------------------------
 
 /**
@@ -241,25 +242,28 @@ export function findJournalsByTag(
   return matched;
 }
 
-/** `GET /journals/{id}`。存在すれば `true`、404 なら `false`（他の失敗は投げる）。 */
+/**
+ * `GET /journals/{id}`（パスは `pathWithId`）。存在すれば `true`、存在しない（{@link isMfNotFound}: 404、または
+ * 400 `invalid_request_path_parameter`）なら `false`（他の失敗は投げる）。
+ */
 function journalExists(client: MfAccountingClient, id: string): boolean {
   try {
-    client.request("get", `/journals/${id}`);
+    client.request("get", pathWithId("/journals", id));
     return true;
   } catch (e) {
-    if (e instanceof MfApiError && e.status === 404) {
+    if (isMfNotFound(e)) {
       return false;
     }
     throw e;
   }
 }
 
-/** `DELETE /journals/{id}`。404 は削除済みとして成功扱い（実装設計 §6.7）。 */
+/** `DELETE /journals/{id}`。存在しない（{@link isMfNotFound}）は削除済みとして成功扱い（実装設計 §6.7）。 */
 function deleteJournal(client: MfAccountingClient, id: string): void {
   try {
-    client.request("delete", `/journals/${id}`);
+    client.request("delete", pathWithId("/journals", id));
   } catch (e) {
-    if (e instanceof MfApiError && e.status === 404) {
+    if (isMfNotFound(e)) {
       return;
     }
     throw e;
@@ -470,7 +474,7 @@ function importStep(ctx: SyncCtx): void {
       continue;
     }
     // MF に無い ID が書かれている。人の確認を待つ（状態が `UNKNOWN` のときは変えず、理由だけ書く）。
-    const message = `MF仕訳ID ${truncate(id, 80)} の仕訳が MF に見つかりません`;
+    const message = `MF仕訳ID が見つかりません（${truncate(id, 80)} の仕訳が MF にありません）`;
     if (row.mf_sync_error === message) {
       continue;
     }

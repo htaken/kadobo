@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   MF_ACCOUNTING_JWT_CACHE_KEY,
   MfAccountingClient,
+  pathWithId,
   type MfAccountingClientPorts,
 } from "../../../src/app/mf/accountingClient";
 import { MfApiError, MfAuthError, MfOutcomeUnknownError, MfTransientError } from "../../../src/app/mf/errors";
@@ -294,5 +295,17 @@ describe("MfAccountingClient: トークン・API キーのログ非漏洩（実�
       expect(err.message).not.toContain("API_KEY_VALUE");
       expect(err.message).not.toContain("SECRET_JWT_VALUE");
     }
+  });
+});
+
+describe("pathWithId（ID をパスに置くときのエンコードを集約）", () => {
+  it("MF が返したパーセントエンコード済みの ID に encodeURIComponent を 1 回かける（仮説 H1）", () => {
+    expect(pathWithId("/journals", "qgmk%2B0le%3D")).toBe("/journals/qgmk%252B0le%253D");
+    expect(pathWithId("/journals", "abc")).toBe("/journals/abc");
+  });
+
+  it("decodeURIComponent すると MF が返した ID に戻る（サーバーが 1 回デコードして比較する前提）", () => {
+    const id = "tfAQxNx%2BSnC9teuXKMjdYNpEVoee%2F%2Bn%2B97E9vQmfAupTjPMQ0eZt3lRC7IeI%2FN1L";
+    expect(decodeURIComponent(pathWithId("/journals", id).slice("/journals/".length))).toBe(id);
   });
 });

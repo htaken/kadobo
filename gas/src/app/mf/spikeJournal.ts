@@ -7,18 +7,25 @@
  * （§3.2 🔄。`tax_name`・`tax_value` を Logger に出す）。あわせて次を確かめる:
  * - `tags`・`remark`・`memo` が保存されるか
  * - 作成直後の `GET /journals?start_date&end_date` の tags 検索で見つかるか（§6.4 の回収の前提）
- * - `DELETE /journals/{id}` が効き、削除後の `GET` が 404 になるか（§6.7 の前提）
+ * - `DELETE /journals/{id}` が効き、削除後の `GET` が「存在しない」（404、または 400 `invalid_request_path_parameter`。
+ *   `isMfNotFound`）になるか（§6.7 の前提）
  *
  * 借方 雑費 1 円／貸方 事業主借 1 円で作る。**作ったテスト仕訳は最後に必ず削除する**（会計帳簿に残ると
  * 決算に影響する）。先に同じタグの既存（前回の削除失敗分）を検索し、あれば作らずに回収する。
- * ID は MF が返したパーセントエンコード済みの文字列をそのまま使う（パスにも `encodeURIComponent` を重ねない）。
+ * ID は MF が返したパーセントエンコード済みの文字列。パスに置くときは `pathWithId`（`encodeURIComponent` を
+ * 1 回。実機の S-M5 で確定した表記）を使う。
  * 出力は `log` だけで、API キー・JWT は扱わない。
  */
 import { businessDateOf } from "@kadobo/shared/time";
 import { extractJournalItem, journalIdOf } from "../../core/journalSync";
 import { findJournalsByTag } from "../journalSync";
-import { MfApiError } from "./errors";
-import { makeMfAccountingClient, type MfAccountingClient, type MfAccountingClientPorts } from "./accountingClient";
+import { isMfNotFound } from "./errors";
+import {
+  makeMfAccountingClient,
+  pathWithId,
+  type MfAccountingClient,
+  type MfAccountingClientPorts,
+} from "./accountingClient";
 import { lookupAccountsByName } from "./pingFormat";
 
 /** スパイク仕訳の `tags`（検索キー）。 */
@@ -93,14 +100,21 @@ function logJournalDetail(journal: Record<string, unknown>, log: (line: string) 
   }
 }
 
-/** 削除して、読み直しが 404 になることを確かめる。失敗は呼び出し側で案内して再スローする。 */
+/**
+ * 削除して、読み直しが「存在しない」になることを確かめる。実機では削除後の GET が 404 ではなく
+ * 400 `invalid_request_path_parameter`（"The given id does not exist for this office"）だった
+ * （{@link isMfNotFound} が両方を「存在しない」と判定する）。200 なら削除が効いていない。
+ * 失敗は呼び出し側で案内して再スローする。
+ */
 function deleteAndVerify(client: MfAccountingClient, id: string, log: (line: string) => void): void {
-  client.request("delete", `/journals/${id}`);
+  const path = pathWithId("/journals", id);
+  client.request("delete", path);
   try {
-    client.request("get", `/journals/${id}`);
+    client.request("get", path);
   } catch (e) {
-    if (e instanceof MfApiError && e.status === 404) {
-      log(`S-M5 削除済み: DELETE 後の GET /journals/${id} が 404 を返した。`);
+    if (isMfNotFound(e)) {
+      const err = e as { status: number; code?: string };
+      log(`S-M5 削除済み: DELETE 後の GET ${path} が「存在しない」を返した（status=${err.status} code=${show(err.code)}）。`);
       return;
     }
     throw e;
@@ -152,7 +166,7 @@ export function runJournalSpikeS5(ports: MfAccountingClientPorts, log: (line: st
 
   let primaryError: unknown = null;
   try {
-    const detail = extractJournalItem(client.request("get", `/journals/${id}`));
+    const detail = extractJournalItem(client.request("get", pathWithId("/journals", id)));
     if (detail === null) {
       log("S-M5 GET /journals/{id}: 応答に journal がありません。");
     } else {

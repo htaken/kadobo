@@ -588,7 +588,7 @@ describe("3 経路: 応答喪失・シート保存失敗・その間の取消（
 });
 
 describe("取消（§6.7）", () => {
-  it("SYNCED の行が CORRECTED になったら DELETE（パスの ID はエンコードを重ねない）→ REVERSED、Slack に 1 行", () => {
+  it("SYNCED の行が CORRECTED になったら DELETE（パスの ID は pathWithId で 1 回エンコード）→ REVERSED、Slack に 1 行", () => {
     const { ports, api } = setup();
     const j = api.plantJournal({ transaction_date: "2026-10-05", tags: ["R-1"] });
     add(ports, "R-1", { state: "CORRECTED", mf_sync_state: "SYNCED", mf_journal_id: j.id });
@@ -596,18 +596,42 @@ describe("取消（§6.7）", () => {
     syncExpenses(ports);
 
     const del = ports.http.calls.find((c) => c.method === "delete");
-    expect(del?.url).toContain(`/journals/${j.id}?`); // そのまま（%252B などになっていない）
-    expect(del?.url).not.toContain("%25");
+    // パスには encodeURIComponent を 1 回かけた形（`%` → `%25`）を置く。生のままでは MF が 400 にする（実機 S-M5）。
+    expect(del?.url).toContain(`/journals/${encodeURIComponent(j.id)}?`);
+    expect(del?.url).toContain("%25");
+    expect(del?.url).not.toContain(`/journals/${j.id}?`);
     expect(api.journals).toHaveLength(0);
     expect(get(ports, "R-1").mf_sync_state).toBe("REVERSED");
     expect(ports.slack.posted).toHaveLength(1);
     expect(ports.slack.posted[0]!.text).toContain("R-1");
   });
 
-  it("VOID も同じ。DELETE の 404 は削除済みとして成功扱い", () => {
-    const { ports, api } = setup();
-    api.deleteStatus = 404;
+  it("VOID も同じ。存在しない ID への DELETE（実機は 400 invalid_request_path_parameter）は削除済みとして REVERSED", () => {
+    const { ports } = setup();
     add(ports, "R-1", { state: "VOID", mf_sync_state: "SYNCED", mf_journal_id: "gone%3D%3D" });
+
+    syncExpenses(ports);
+
+    expect(get(ports, "R-1").mf_sync_state).toBe("REVERSED");
+    expect(get(ports, "R-1").mf_sync_error).toBeNull();
+    expect(ports.http.calls.filter((c) => c.method === "delete")).toHaveLength(1);
+  });
+
+  it("従来どおりの 404 も削除済みとして REVERSED", () => {
+    const { ports, api } = setup();
+    add(ports, "R-1", { state: "CORRECTED", mf_sync_state: "SYNCED", mf_journal_id: "gone%3D%3D" });
+    const orig = api.handle.bind(api);
+    api.handle = (req) =>
+      req.method === "delete" ? { status: 404, headers: {}, body: JSON.stringify({ errors: [{ code: "not_found", message: "n" }] }) } : orig(req);
+
+    syncExpenses(ports);
+
+    expect(get(ports, "R-1").mf_sync_state).toBe("REVERSED");
+  });
+
+  it("REVERSING で DELETE が「存在しない」（400 invalid_request_path_parameter）なら REVERSED（削除は成功済みだった）", () => {
+    const { ports } = setup();
+    add(ports, "R-1", { state: "CORRECTED", mf_sync_state: "REVERSING", mf_journal_id: "already%3D%3D" });
 
     syncExpenses(ports);
 
@@ -693,10 +717,10 @@ describe("手入力の MF仕訳ID の取り込み（B7）", () => {
       expect(r.mf_sync_input).toBe(`1200|2026-10-05|消耗品費|${r.payment_method}|`);
     });
     expect(postCount(ports)).toBe(0);
-    // 存在確認は GET /journals/{id}（エンコードを重ねない）。
+    // 存在確認は GET /journals/{id}（パスの ID は pathWithId で 1 回エンコード）。
     const gets = ports.http.calls.filter((c) => c.method === "get" && /\/journals\/[^?]+\?/.test(c.url));
     expect(gets).toHaveLength(states.length);
-    expect(gets.every((c) => !c.url.includes("%25"))).toBe(true);
+    expect(gets.every((c) => c.url.includes("%25"))).toBe(true);
   });
 
   it("MF に無い ID が書かれていたら NEEDS_REVIEW にして 1 回だけ通知し、作らない", () => {
@@ -708,9 +732,36 @@ describe("手入力の MF仕訳ID の取り込み（B7）", () => {
 
     const r = get(ports, "R-1");
     expect(r.mf_sync_state).toBe("NEEDS_REVIEW");
-    expect(r.mf_sync_error).toContain("見つかりません");
+    expect(r.mf_sync_error).toContain("MF仕訳ID が見つかりません");
+    expect(r.mf_sync_error).toContain("typo%3D%3D");
     expect(postCount(ports)).toBe(0);
     expect(postedTexts(ports).filter((t) => t.includes("R-1"))).toHaveLength(1);
+  });
+
+  it("存在しない ID（従来どおりの 404）でも NEEDS_REVIEW。他の 4xx（403 以外の業務エラー）は取り込みを止めず例外にする", () => {
+    const { ports, api } = setup();
+    add(ports, "R-1", { mf_journal_id: "typo%3D%3D" });
+    const orig = api.handle.bind(api);
+    api.handle = (req) =>
+      req.method === "get" && /\/journals\/[^?]+\?/.test(req.url)
+        ? { status: 404, headers: {}, body: JSON.stringify({ errors: [{ code: "not_found", message: "n" }] }) }
+        : orig(req);
+
+    syncExpenses(ports);
+
+    expect(get(ports, "R-1").mf_sync_state).toBe("NEEDS_REVIEW");
+    expect(get(ports, "R-1").mf_sync_error).toContain("MF仕訳ID が見つかりません");
+
+    // 「存在しない」ではない 400（別の code）は NEEDS_REVIEW に落とさず例外として上へ伝える。
+    const env2 = setup();
+    add(env2.ports, "R-2", { mf_journal_id: "x%3D" });
+    const orig2 = env2.api.handle.bind(env2.api);
+    env2.api.handle = (req) =>
+      req.method === "get" && /\/journals\/[^?]+\?/.test(req.url)
+        ? { status: 400, headers: {}, body: JSON.stringify({ errors: [{ code: "invalid_param", message: "bad" }] }) }
+        : orig2(req);
+    expect(() => syncExpenses(env2.ports)).toThrow();
+    expect(get(env2.ports, "R-2").mf_sync_state).toBe("");
   });
 
   it("MF仕訳ID がある未着手の行は新規作成の対象にならない（取り込みの予算が尽きた場合でも作らない）", () => {
