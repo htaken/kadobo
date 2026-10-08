@@ -151,6 +151,7 @@
 - `POST /journals`・`POST /transactions/journalize` の 201 応答は `{ journal: { id, transaction_id, tags, ... } }`
 - 🔄 `GET /transactions` は **`start_date` と `end_date` の差が 366 日以内**。長く照合できない行が残ったときのため、期間を分割して呼ぶ（§6.5）
 - 🔄 `journalize` の `transaction_date` は省略すると**明細の日付**になる。kadobo は**必ず経費台帳の `日付`（証憑の取引年月日）を指定する**（§6.5）
+- 🔬 **会計 API は ID（`account_id`・`tax_id`・仕訳 ID 等）をパーセントエンコード済みの文字列で返す**（2026-10-08 実測。OpenAPI の例示値も `…%3D%3D`）。本文にはそのまま入れ、**パスに入れるときに `encodeURIComponent` を重ねない**
 - 🔄 **免税事業者に設定した事業者では、仕訳に税区分を登録できない**（[MF 公式](https://biz.moneyforward.com/support/account/guide/office02/of02.html)「「免税事業者」では、「消費税」機能が利用不可となり、仕訳に税区分を登録できません」）。
   kadobo は `tax_id`・`invoice_kind` を**送らない**。送った場合の挙動は S-M5 で確認する
 
@@ -822,7 +823,7 @@ shared を変えるので**両側**をデプロイする（runbook 02）。**GAS
 |---|---|---|---|
 | **S-M1** | テスト用の請求書を作る。**`quantity: 160.01`、`price: 1800`、`ten_percent`**（報酬 288,018 円、消費税 28,801.8 円で**端数が出る**）。応答の `subtotal_price`・`excise_price`・`total_price`・`config.rounding`・`config.rounding_consumption_tax` が単価マスタの計算（切捨）と一致するか確かめる。MF 画面で「消費税相当額」の見え方を目視する。確認後に削除する | 10/1 の取引先・部署の登録 | MF 側の端数処理の設定、小数数量の可否 |
 | **S-M2** | `GET /billings?document_number=` が完全一致か部分一致か。作成直後に検索して**すぐ見つかるか** | S-M1 の請求書 | §5.5 の回収の前提 |
-| **S-M3** | API キーの発行 → `/auth/exchange` → `GET /accessible_offices`（`office_code`）→ `GET /accounts`（§6.4 の 8 科目が名前完全一致で引けるか） | なし（すぐできる） | 科目名の対応表 |
+| **S-M3** | API キーの発行 → `/auth/exchange` → `GET /accessible_offices`（`office_code`）→ `GET /accounts`（§6.4 の 8 科目が名前完全一致で引けるか） | なし（すぐできる） | ✅ **2026-10-08 完了**（`mfAccountingPing` で実施。未決事項 §6.14 の実測表）。8 科目とも 1 件ずつ引ける。既定 `tax_id` は `available: false`（免税設定）なので送らない方針で確定 |
 | **S-M4** | カードと口座を MF に連携 → `GET /connected_accounts` → `GET /transactions`。**カード明細の `date` が利用日か計上日か**、`content` の表記（店名・**NISA のクレカ積立と口座積立**・カード引落し） | 利用者による連携 | `MATCH_DAYS_*`、明細ルールの文字列と金額、`MF_CARD_ACCOUNT_IDS`/`MF_BANK_ACCOUNT_IDS` |
 | **S-M5** | テスト仕訳を `POST /journals` で作る（**`tax_id` なしで作れるか、免税事業者の設定で金額が税込のまま入るか**、tags・remark・memo が保存されるか）→ 作成直後に `GET /journals` で見つかるか → `DELETE`。連携明細 1 件を `journalize` → `DELETE` して**明細が未仕訳に戻るか** | S-M3・S-M4 | §6.4・§6.7 の前提 |
 | **S-M6** 🔄 | GAS で、ユーザーロックを持ったまま別の実行がスクリプトロックを取れるか（2 つのロックが干渉しないか） | なし | §4.1 の `AuthLockPort` |
