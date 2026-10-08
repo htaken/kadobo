@@ -256,6 +256,16 @@ export function summarizeSyncInput(row: SyncRowView): string {
 }
 
 /**
+ * `mf_sync_input` に保存した**作成時の日付**（2 番目の項目）。仕訳を作った時点の `日付` で、作成後に台帳の
+ * `日付` を直されても変わらない回収キー（`GET /journals?start_date&end_date` の検索日）として使う。
+ * 要約が空・形式が違えば `null`。
+ */
+export function creationDateFromInput(input: string): string | null {
+  const d = input.split("|")[1];
+  return d !== undefined && /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null;
+}
+
+/**
  * 保存済みの要約（`mf_sync_input`）と今の業務列から作った要約が違うか。保存済みが空（要約を持たない
  * 行。手で状態を書いた場合など）は比較できないので `false`。
  */

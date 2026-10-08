@@ -755,7 +755,7 @@ describe("trigMfSync ⑤ 経費同期（実装設計 MF連携 §7）", () => {
     expect(dms[0]!.text).toContain("journal");
   });
 
-  it("syncExpenses が成功すれば `mf_fail/journal` の連続回数をリセットする", () => {
+  it("syncExpenses が MF を呼んで成功すれば `mf_fail/journal` の連続回数をリセットする", () => {
     const ports = makeFakePorts(Date.parse("2026-11-15T06:00:00+09:00"));
     setupChannel(ports);
     installFakeMfAccounting(ports);
@@ -763,10 +763,30 @@ describe("trigMfSync ⑤ 経費同期（実装設計 MF連携 §7）", () => {
     ports.props.set("MF_JOURNAL_ENABLED", "true");
     ports.props.set("MF_SYNC_START_DATE", "2026-10-01");
     ports.sheets.setInternalValue("mf_fail", "journal", "3");
+    ports.sheets.appendExpense(journalReadyRow("R-1"));
 
     trigMfSync(ports);
 
+    expect(ports.http.calls.length).toBeGreaterThan(0);
     expect(ports.sheets.getInternalValue("mf_fail", "journal")).toBe("0");
+  });
+
+  it("MF を呼ばなかった実行は成功に数えない: カウンタをリセットしない（レビュー M5）", () => {
+    const ports = makeFakePorts(Date.parse("2026-11-15T06:00:00+09:00"));
+    setupChannel(ports);
+    installFakeMfAccounting(ports);
+    ports.props.set("MF_ENABLED", "true");
+    ports.props.set("MF_JOURNAL_ENABLED", "true");
+    ports.props.set("MF_SYNC_START_DATE", "2026-10-01");
+    ports.sheets.setInternalValue("mf_fail", "journal", "3");
+    ports.sheets.setInternalValue("mf_fail", "invoice", "4");
+    // 対象の行が 1 つも無い（経費も請求書も）。
+
+    trigMfSync(ports);
+
+    expect(ports.http.calls).toHaveLength(0);
+    expect(ports.sheets.getInternalValue("mf_fail", "journal")).toBe("3");
+    expect(ports.sheets.getInternalValue("mf_fail", "invoice")).toBe("4");
   });
 
   it("経費同期が例外を投げても ①〜④ は先に実行されている（各ステップが独立）", () => {
@@ -781,6 +801,79 @@ describe("trigMfSync ⑤ 経費同期（実装設計 MF連携 §7）", () => {
 
     expect(() => trigMfSync(ports)).not.toThrow();
     expect(ports.sheets.getMonthlyBill("A社", "2026-10")?.state).toBe("REVIEWING");
+  });
+});
+
+describe("trigMfSync — 請求書の連続障害通知（レビュー M5）と絶対期限（レビュー M4）", () => {
+  function invoiceFailingPorts() {
+    const ports = makeFakePorts(Date.parse("2026-11-15T06:00:00+09:00"));
+    setupChannel(ports);
+    ports.props.set("SLACK_USER_ID", "U1");
+    ports.props.set("MF_ENABLED", "true");
+    ports.props.set("MF_INVOICE_ENABLED", "true");
+    ports.props.set("MF_DEPARTMENT_ID", "DEPT-1");
+    seedInvoiceTokens(ports);
+    seedUnitPrice(ports);
+    ports.sheets.monthlyBills.set("A社|2026-10", {
+      client: "A社",
+      month: "2026-10",
+      worked_minutes: 9600,
+      hours: 160,
+      unit_price: 1800,
+      amount: 288000,
+      tax_amount: 28800,
+      withholding_amount: 0,
+      net_amount: 316800,
+      state: "LOCKED",
+      mf_invoice_id: null,
+      locked_at: 1,
+      note: null,
+      updated_at: 1,
+      invoice_state: "PENDING",
+      invoice_error: null,
+      invoice_attempted_at: null,
+      close_card_ts: null,
+    });
+    return ports;
+  }
+
+  it("請求書の検索が 6 回連続 500 なら、6 回目に「一時障害が続いています」を DM する（他のステップの正常終了でリセットされない）", () => {
+    const ports = invoiceFailingPorts();
+    ports.http.defaultResponse = { status: 500, headers: {}, body: "" };
+
+    for (let i = 1; i <= 5; i++) {
+      trigMfSync(ports);
+      expect(ports.sheets.getInternalValue("mf_fail", "invoice")).toBe(String(i));
+      expect(ports.slack.dms).toHaveLength(0);
+    }
+    trigMfSync(ports);
+
+    expect(ports.sheets.getInternalValue("mf_fail", "invoice")).toBe("6");
+    expect(ports.slack.dms.filter((d) => d.text.includes("一時障害が続いています") && d.text.includes("invoice"))).toHaveLength(1);
+  });
+
+  it("開始時刻基準の絶対期限: 請求書の処理で 4 分を使い切ったら、同じ実行の経費同期は MF を呼ばない", () => {
+    const ports = invoiceFailingPorts();
+    const api = installFakeMfAccounting(ports);
+    ports.props.set("MF_JOURNAL_ENABLED", "true");
+    ports.props.set("MF_SYNC_START_DATE", "2026-10-01");
+    ports.sheets.appendExpense(journalReadyRow("R-1"));
+    // 請求書側の HTTP（invoice.moneyforward.com）が 1 回 5 分かかる。会計 API は即答。
+    const accFetch = ports.http.fetch;
+    ports.http.fetch = (req) => {
+      if (req.url.startsWith("https://invoice.moneyforward.com")) {
+        ports.clock.currentMs += 5 * 60 * 1000;
+        ports.http.calls.push(req);
+        return { status: 500, headers: {}, body: "" };
+      }
+      return accFetch(req);
+    };
+
+    trigMfSync(ports);
+
+    expect(api.journals).toHaveLength(0);
+    expect(ports.sheets.getExpenseByReceiptId("R-1")?.mf_sync_state).not.toBe("SYNCED");
+    expect(ports.http.calls.some((c) => c.url.startsWith("https://api-accounting"))).toBe(false);
   });
 });
 

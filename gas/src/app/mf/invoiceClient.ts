@@ -158,14 +158,24 @@ export function refreshInvoiceTokens(ports: MfInvoiceClientPorts, usedGeneration
       generation: current.generation + 1,
     };
     const serialized = JSON.stringify(next);
-    ports.secrets.set(MF_INVOICE_TOKENS_KEY, serialized);
-    if (ports.secrets.get(MF_INVOICE_TOKENS_KEY) !== serialized) {
-      // 読み直しが一致しない → もう 1 回 set して確認する（実装設計 §4.2）。
+    // 保存・読み直しの**例外**も含めて、新トークンを保存できなかった場合は再認可に倒す（古いリフレッシュ
+    // トークンはトークンエンドポイントが更新を処理した時点で使えない可能性がある。実装設計 §4.2）。
+    // 例外の内容は新トークンを含み得るので、固定メッセージにして握りつぶす。
+    let saved: boolean;
+    try {
       ports.secrets.set(MF_INVOICE_TOKENS_KEY, serialized);
-      if (ports.secrets.get(MF_INVOICE_TOKENS_KEY) !== serialized) {
-        // それでも一致しない → 取得した新トークンは保存できず失われている。
-        throw new MfReauthRequiredError("MF_TOKEN_SAVE_VERIFY_FAILED", "invoice");
+      saved = ports.secrets.get(MF_INVOICE_TOKENS_KEY) === serialized;
+      if (!saved) {
+        // 読み直しが一致しない → もう 1 回 set して確認する（実装設計 §4.2）。
+        ports.secrets.set(MF_INVOICE_TOKENS_KEY, serialized);
+        saved = ports.secrets.get(MF_INVOICE_TOKENS_KEY) === serialized;
       }
+    } catch {
+      throw new MfReauthRequiredError("MF_TOKEN_SAVE_FAILED", "invoice");
+    }
+    if (!saved) {
+      // それでも一致しない → 取得した新トークンは保存できず失われている。
+      throw new MfReauthRequiredError("MF_TOKEN_SAVE_VERIFY_FAILED", "invoice");
     }
     return next.access_token;
   });

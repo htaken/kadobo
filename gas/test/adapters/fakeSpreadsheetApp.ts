@@ -108,6 +108,12 @@ export class FakeRange {
   }
 
   getValues(): unknown[][] {
+    const out = this.readValues();
+    this.sheet.afterRead?.();
+    return out;
+  }
+
+  private readValues(): unknown[][] {
     const out: unknown[][] = [];
     for (let r = 0; r < this.numRows; r++) {
       const rowArr: unknown[] = [];
@@ -120,6 +126,7 @@ export class FakeRange {
   }
 
   setValues(values: unknown[][]): FakeRange {
+    this.sheet.writes.push({ row: this.row, col: this.col, numRows: this.numRows, numCols: this.numCols });
     for (let r = 0; r < this.numRows; r++) {
       const rowValues = values[r] ?? [];
       for (let c = 0; c < this.numCols; c++) {
@@ -187,6 +194,13 @@ export class FakeSheet {
   private maxCols: number;
   private readonly protections: FakeProtectionImpl[] = [];
   private readonly hiddenColumns = new Set<number>();
+  /** `setValues` で書かれたレンジの履歴（「実際に書き込んだ範囲」の検証用）。 */
+  readonly writes: { row: number; col: number; numRows: number; numCols: number }[] = [];
+  /**
+   * `getValues`（読み取り）が終わった直後に呼ぶフック。1 回呼んだら自動で外す。「読み取り後に人がシートを編集した」
+   * 状況を再現する（実 GAS ではスクリプトロックは人の編集を直列化しない）。
+   */
+  afterReadOnce: (() => void) | null = null;
 
   // 実 Google Sheets の新規シートは既定で 26 列を持つ（`sheets.ts` の経費台帳マイグレーション
   // §5.1 の 🔄 で列数ガードを検証するテストのため、列削除で 26 未満になっている状態を
@@ -199,6 +213,18 @@ export class FakeSheet {
 
   private key(row: number, col: number): string {
     return `${row}:${col}`;
+  }
+
+  /** `FakeRange.getValues` が呼ぶ。`afterReadOnce` があれば 1 回だけ実行する。 */
+  get afterRead(): (() => void) | undefined {
+    const f = this.afterReadOnce;
+    if (f === null) {
+      return undefined;
+    }
+    return () => {
+      this.afterReadOnce = null;
+      f();
+    };
   }
 
   /** テスト専用: レンジ API を経由せずセルへ直接値を置く（レガシー破損データの再現用）。 */

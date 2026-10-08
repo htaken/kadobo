@@ -366,6 +366,75 @@ describe("refreshInvoiceTokens（generation による並行性制御。実装設
       expect(() => refreshInvoiceTokens(ports, 1)).toThrow(MfReauthRequiredError);
     });
   });
+
+  describe("保存・読み直しが例外を投げる（レビュー M6。新トークンを失った可能性がある）", () => {
+    function setupRefresh() {
+      const ports = makeFakePorts();
+      seedTokens(ports, { access_token: "OLD_ACCESS_TOKEN", refresh_token: "OLD_REFRESH_TOKEN", generation: 1 });
+      setClientCreds(ports);
+      ports.http.queueResponse({
+        status: 200,
+        body: JSON.stringify({ access_token: "NEW_ACCESS_TOKEN", refresh_token: "NEW_REFRESH_TOKEN" }),
+      });
+      return ports;
+    }
+
+    it("secrets.set が例外を投げたら MfReauthRequiredError(MF_TOKEN_SAVE_FAILED, invoice)。新トークンをメッセージに含めない", () => {
+      const ports = setupRefresh();
+      ports.secrets.set = () => {
+        throw new Error("Service invoked too many times: NEW_REFRESH_TOKEN");
+      };
+
+      try {
+        refreshInvoiceTokens(ports, 1);
+        throw new Error("MfReauthRequiredError を期待した");
+      } catch (e) {
+        expect(e).toBeInstanceOf(MfReauthRequiredError);
+        expect((e as MfReauthRequiredError).message).toBe("MF_TOKEN_SAVE_FAILED");
+        expect((e as MfReauthRequiredError).service).toBe("invoice");
+        expect((e as Error).message).not.toContain("NEW_REFRESH_TOKEN");
+      }
+    });
+
+    it("読み直しの secrets.get が例外を投げても MfReauthRequiredError(MF_TOKEN_SAVE_FAILED)", () => {
+      const ports = setupRefresh();
+      const origGet = ports.secrets.get.bind(ports.secrets);
+      let sets = 0;
+      const origSet = ports.secrets.set.bind(ports.secrets);
+      ports.secrets.set = (k, v) => {
+        sets++;
+        origSet(k, v);
+      };
+      ports.secrets.get = (k) => {
+        if (sets > 0) {
+          throw new Error("get failed");
+        }
+        return origGet(k);
+      };
+
+      expect(() => refreshInvoiceTokens(ports, 1)).toThrow(
+        expect.objectContaining({ name: "MfReauthRequiredError", message: "MF_TOKEN_SAVE_FAILED" }),
+      );
+    });
+
+    it("1 回目の set は成功し、再保存の set が例外を投げた場合も MF_TOKEN_SAVE_FAILED", () => {
+      const ports = setupRefresh();
+      ports.secrets.armMismatchAfterNextWrite(1);
+      const origSet = ports.secrets.set.bind(ports.secrets);
+      let sets = 0;
+      ports.secrets.set = (k, v) => {
+        sets++;
+        if (sets >= 2) {
+          throw new Error("second set failed");
+        }
+        origSet(k, v);
+      };
+
+      expect(() => refreshInvoiceTokens(ports, 1)).toThrow(
+        expect.objectContaining({ name: "MfReauthRequiredError", message: "MF_TOKEN_SAVE_FAILED" }),
+      );
+    });
+  });
 });
 
 describe("トークン・秘密情報のログ非漏洩（実装設計 §4.4）", () => {

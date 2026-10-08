@@ -5,7 +5,7 @@
 import { createHash, createHmac } from "node:crypto";
 import { shiftBusinessDate } from "../../src/app/dateUtil";
 import { MfTransientError } from "../../src/app/mf/errors";
-import { LockTimeoutError } from "../../src/app/ports";
+import { LockTimeoutError, orderedColumnKeys } from "../../src/app/ports";
 import type {
   AppPorts,
   AuthLockPort,
@@ -103,7 +103,11 @@ export class FakeSheets implements SheetsPort {
     return this.monthlyBills.get(`${client}|${month}`) ?? null;
   }
 
+  /** `updateMonthlyBillColumns` に渡された `patch` のキー集合の履歴（「集計が状態列を書かない」の検証用）。 */
+  monthlyPatchKeys: string[][] = [];
+
   updateMonthlyBillColumns(client: string, month: string, patch: Partial<MonthlyBillRow>): void {
+    this.monthlyPatchKeys.push(Object.keys(patch));
     const key = `${client}|${month}`;
     const current = this.monthlyBills.get(key);
     if (current === undefined) {
@@ -163,7 +167,25 @@ export class FakeSheets implements SheetsPort {
   /** 設定すると、次の `updateExpenseColumns` 呼び出しがこれを投げる（「作成成功 → シート保存で例外」の注入用）。 */
   failNextUpdateColumns: Error | null = null;
 
-  updateExpenseColumns(receiptId: string, patch: Partial<ExpenseLedgerRow>): void {
+  /** 実際に書いたセルの列名の履歴（書込み順の検証用）。 */
+  cellWrites: string[] = [];
+  /**
+   * `n` を設定すると、`updateExpenseColumns` の「今から数えて n 個目のセル書込み」で例外を投げる
+   * （それより前のセルは保存済み）。実アダプタがセル単位で書くため途中で失敗しうる状況の再現。
+   */
+  failAtCellWrite: number | null = null;
+  private cellWritesSinceArm = 0;
+
+  armFailAtCellWrite(n: number): void {
+    this.failAtCellWrite = n;
+    this.cellWritesSinceArm = 0;
+  }
+
+  updateExpenseColumns(
+    receiptId: string,
+    patch: Partial<ExpenseLedgerRow>,
+    order?: readonly (keyof ExpenseLedgerRow)[],
+  ): void {
     if (this.failNextUpdateColumns !== null) {
       const err = this.failNextUpdateColumns;
       this.failNextUpdateColumns = null;
@@ -174,7 +196,17 @@ export class FakeSheets implements SheetsPort {
       throw new Error(`expense_not_found:${receiptId}`);
     }
     this.columnPatches.push({ receiptId, keys: Object.keys(patch) });
-    this.expenses[idx] = { ...this.expenses[idx]!, ...patch };
+    for (const key of orderedColumnKeys(patch, order)) {
+      if (this.failAtCellWrite !== null) {
+        this.cellWritesSinceArm++;
+        if (this.cellWritesSinceArm === this.failAtCellWrite) {
+          this.failAtCellWrite = null;
+          throw new Error(`CELL_WRITE_FAILED:${String(key)}`);
+        }
+      }
+      this.cellWrites.push(String(key));
+      this.expenses[idx] = { ...this.expenses[idx]!, [key]: patch[key] };
+    }
   }
 
   getAllExpenses(): ExpenseLedgerRow[] {

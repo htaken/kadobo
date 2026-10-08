@@ -105,6 +105,14 @@ describe("recomputeMonthly — 既存行がある（未凍結）とき", () => {
     expect(bill.invoice_error).toBe("古いエラー");
     expect(bill.invoice_attempted_at).toBe(12345);
     expect(bill.close_card_ts).toBe("1700000000.000100");
+    // 列指定の書込み: ポートに渡した patch のキーが数値列・note・updated_at だけ（状態・請求書の列を含まない）。
+    const allowed = new Set([
+      "worked_minutes", "hours", "unit_price", "amount", "tax_amount", "withholding_amount", "net_amount", "note", "updated_at",
+    ]);
+    expect(ports.sheets.monthlyPatchKeys).toHaveLength(1);
+    for (const k of ports.sheets.monthlyPatchKeys[0]!) {
+      expect(allowed.has(k)).toBe(true);
+    }
   });
 
   it("単価エラー時も note だけを書き、状態列には触れない", () => {
@@ -139,6 +147,10 @@ describe("recomputeMonthly — 既存行がある（未凍結）とき", () => {
     const bill = ports.sheets.getMonthlyBill("A社", "2026-08")!;
     expect(bill.note).toBe("単価マスタ: 該当なし");
     expect(bill.state).toBe("REVIEWING"); // 状態列は変わらない
+    const stateKeys = ["state", "mf_invoice_id", "locked_at", "invoice_state", "invoice_error", "invoice_attempted_at", "close_card_ts"];
+    for (const k of ports.sheets.monthlyPatchKeys.flat()) {
+      expect(stateKeys).not.toContain(k);
+    }
   });
 });
 

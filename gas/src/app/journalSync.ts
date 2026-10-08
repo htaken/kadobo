@@ -11,6 +11,11 @@
  * 4. 変更検出
  * 5. 新規（`MF_JOURNAL_ENABLED` が有効なときだけ）
  *
+ * 1〜3（維持作業）は 1 つの「維持キュー」にまとめ、内部シート `mf_sync/cursor` に保存した位置から巡回する
+ * （同じ未解決行が毎回先頭を塞がないため）。API を呼ぶ行の予算 20 行は、維持作業に最大 10 行、新規に残り
+ * （最大 10 行）を割り当て、新規が余れば維持作業の続きに回す（レビュー M3）。実行全体は
+ * `trigMfSync` 開始時刻基準の絶対期限（{@link RunDeadline}、4 分）で打ち切る（レビュー M4）。
+ *
  * **ロックの扱い（§0, §6.8）**: シートの読み書きは短い `ports.lock.withLock` の中で行い、MF の呼び出しは
  * ロックの外で行う。書くときは行を読み直し、§6.1 の列（`MF仕訳ID`・`MF明細ID`・27〜31 列目）だけを
  * `updateExpenseColumns` で書く（業務列は書かない）。Slack・`notifyMf*` もロックの外で呼ぶ。
@@ -30,6 +35,7 @@ import {
   NO_JOURNAL_STATES,
   buildJournalRequestBody,
   canTransition,
+  creationDateFromInput,
   debitAccountNameOf,
   decideSyncTarget,
   extractJournalItem,
@@ -45,10 +51,12 @@ import {
   totalPagesOf,
 } from "../core/journalSync";
 import { makeMfAccountingClient, pathWithId, type MfAccountingClient } from "./mf/accountingClient";
+import { MF_RUN_DEADLINE_MS, RunDeadline, RunDeadlineExceededError } from "./mf/deadline";
 import { MfApiError, MfOutcomeUnknownError, isMfNotFound } from "./mf/errors";
 import { isJournalEnabled, isMfEnabled } from "./mf/flags";
 import { withLease } from "./mf/lease";
 import { lookupAccountsByName } from "./mf/pingFormat";
+import { shiftBusinessDate } from "./dateUtil";
 import { ConfigMissingError, type AppPorts, type ExpenseLedgerRow } from "./ports";
 
 // ---------------------------------------------------------------------------
@@ -60,8 +68,13 @@ export const MF_SYNC_LEASE_KEY = "mf_sync";
 const LEASE_TTL_MS = 10 * 60 * 1000;
 /** `trigMfSync` 1 回で API を呼ぶ行の上限（`MF_SYNC_BATCH`。実装設計 §6.8）。 */
 export const MF_SYNC_BATCH = 20;
-/** 実行開始からこの時間たったら新しい行に手を付けずに終える（GAS の 1 実行 6 分の内側。§6.8）。 */
-export const MF_SYNC_DEADLINE_MS = 4 * 60 * 1000;
+/** 実行開始（`trigMfSync` の開始）からこの時間たったら新しい行に手を付けずに終える（§6.8）。 */
+export const MF_SYNC_DEADLINE_MS = MF_RUN_DEADLINE_MS;
+/** 維持作業（回収・取消・取り込み）に最初に割り当てる行数。残りは新規に回す（レビュー M3）。 */
+export const MF_SYNC_MAINTENANCE_FIRST = 10;
+/** 維持作業の巡回位置（内部シート `mf_sync/cursor`。最後に手を付けた証憑 ID）。 */
+const CURSOR_KIND = "mf_sync";
+const CURSOR_KEY = "cursor";
 /** `CREATING` から 24 時間たっても見つからなければ `UNKNOWN`（§6.4）。 */
 const UNKNOWN_AFTER_MS = 24 * 60 * 60 * 1000;
 /** 科目名 → ID の解決結果を `TtlCachePort` に置くキーと保存秒数（§6.4。6 時間）。 */
@@ -133,6 +146,20 @@ function snapshotRows(ports: AppPorts): ExpenseLedgerRow[] {
 }
 
 /**
+ * セル単位の書込みの順序。確定を表す `mf_sync_state` を**最後**にし、`MF仕訳ID`・試行時刻・入力要約を先に書く
+ * （途中で失敗しても「状態だけ進んで必要な情報が無い」行を残さない。レビュー M2）。
+ */
+const MF_WRITE_ORDER = [
+  "mf_journal_id",
+  "mf_transaction_id",
+  "mf_sync_error",
+  "mf_sync_attempted_at",
+  "mf_sync_input",
+  "mf_sync_updated_at",
+  "mf_sync_state",
+] as const;
+
+/**
  * 短いロックの中で行を読み直し、`guard` を満たすときだけ §6.1 の列を書く（実装設計 §6.8 手順 3）。
  * 書けたら書いた後の行を、書かなかった（行が無い・`guard` を満たさない）ら `null` を返す。
  * `mf_sync_state` を変える書込みは {@link canTransition} の表を通す（`force` は「仕訳が MF に存在すると
@@ -159,7 +186,7 @@ function writeIfCurrent(
       throw new Error(`mf_sync_invalid_transition:${receiptId}:${current.mf_sync_state}->${patch.mf_sync_state}`);
     }
     const full: MfColumnsPatch = { ...patch, mf_sync_updated_at: ports.clock.nowMs() };
-    ports.sheets.updateExpenseColumns(receiptId, full);
+    ports.sheets.updateExpenseColumns(receiptId, full, MF_WRITE_ORDER);
     return { ...current, ...full };
   });
 }
@@ -176,25 +203,38 @@ function claimDailyNotice(ports: AppPorts, key: string): boolean {
   });
 }
 
-/** 1 回の実行の「API を呼ぶ行」の予算（20 行・4 分。実装設計 §6.8）。 */
+type BudgetPhase = "maintenance" | "new";
+
+/**
+ * 1 回の実行の「API を呼ぶ行」の予算（20 行。実装設計 §6.8）と、絶対期限（{@link RunDeadline}）の確認。
+ * 維持作業は最初 {@link MF_SYNC_MAINTENANCE_FIRST} 行まで。新規は残り全部。{@link RunBudget.openMaintenance}
+ * で維持作業の上限を外し、新規が余らせた分を使えるようにする。
+ */
 class RunBudget {
-  private readonly startedAtMs: number;
   private used = 0;
+  private maintenanceUsed = 0;
+  private maintenanceCap = MF_SYNC_MAINTENANCE_FIRST;
 
-  constructor(private readonly ports: AppPorts) {
-    this.startedAtMs = ports.clock.nowMs();
-  }
+  constructor(private readonly deadline: RunDeadline) {}
 
-  /** 新しい行に API を呼ぶ手を付けてよければ数えて `true`。上限・時間切れなら `false`。 */
-  tryStartRow(): boolean {
-    if (this.used >= MF_SYNC_BATCH) {
+  /** 新しい行に API を呼ぶ手を付けてよければ数えて `true`。上限・期限切れなら `false`。 */
+  tryStartRow(phase: BudgetPhase): boolean {
+    if (this.used >= MF_SYNC_BATCH || this.deadline.isExpired()) {
       return false;
     }
-    if (this.ports.clock.nowMs() - this.startedAtMs >= MF_SYNC_DEADLINE_MS) {
+    if (phase === "maintenance" && this.maintenanceUsed >= this.maintenanceCap) {
       return false;
     }
     this.used++;
+    if (phase === "maintenance") {
+      this.maintenanceUsed++;
+    }
     return true;
+  }
+
+  /** 維持作業の上限を全体の上限まで広げる（新規が余らせた分を維持作業の続きに回す）。 */
+  openMaintenance(): void {
+    this.maintenanceCap = MF_SYNC_BATCH;
   }
 }
 
@@ -202,6 +242,9 @@ interface SyncCtx {
   ports: AppPorts;
   client: MfAccountingClient;
   budget: RunBudget;
+  deadline: RunDeadline;
+  /** `MF_SYNC_START_DATE`。未設定は `null`。 */
+  startDate: string | null;
   /** 作成の結果が分からなかった（`MfOutcomeUnknownError`）ので、この実行ではこれ以上作らない。 */
   halted: boolean;
 }
@@ -219,9 +262,14 @@ export function findJournalsByTag(
   tag: string,
   startDate: string,
   endDate: string,
+  deadline?: RunDeadline,
 ): Record<string, unknown>[] {
   const matched: Record<string, unknown>[] = [];
   for (let page = 1; page <= SEARCH_MAX_PAGES; page++) {
+    // 期限切れ: 途中までの結果を「見つからなかった」と読むと二重作成になるので、結果を返さず例外にする。
+    if (deadline?.isExpired() === true) {
+      throw new RunDeadlineExceededError();
+    }
     const res = client.request("get", "/journals", {
       start_date: startDate,
       end_date: endDate,
@@ -307,17 +355,50 @@ function resolveAccountIds(ctx: SyncCtx, names: readonly string[]): Record<strin
 }
 
 // ---------------------------------------------------------------------------
-// 1. 回収
+// 1〜3. 維持作業（回収・取消・手入力の取り込み）
 // ---------------------------------------------------------------------------
 
 const UNKNOWN_REQUEST_TEXT =
   "MF に仕訳が無ければ MF連携状態 を空に戻してください（作り直します）。あれば MF仕訳ID に ID を書いてください。";
 
+/**
+ * `CREATING`・`UNKNOWN` の回収検索の範囲（`[開始日, 終了日]` の配列。レビュー M1）。
+ * - `mf_sync_input` に保存した**作成時の日付**を最優先の検索日にする（作成後に台帳の `日付` を直されても
+ *   仕訳は作成時の `transaction_date` のまま MF にあるため）。現在の `日付` と違えば両方の日で検索する。
+ * - 要約が無い行は、試行時刻（無ければ更新時刻）の前後 1 日と、現在の `日付` を検索する。
+ */
+function recoverySearchRanges(row: ExpenseLedgerRow): { start: string; end: string }[] {
+  const ranges: { start: string; end: string }[] = [];
+  const add = (start: string, end: string): void => {
+    if (!ranges.some((r) => r.start === start && r.end === end)) {
+      ranges.push({ start, end });
+    }
+  };
+  const created = creationDateFromInput(row.mf_sync_input);
+  if (created !== null) {
+    add(created, created);
+  } else {
+    const base = row.mf_sync_attempted_at ?? row.mf_sync_updated_at;
+    if (base !== null) {
+      const d = businessDateOf(base);
+      add(shiftBusinessDate(d, -1), shiftBusinessDate(d, 1));
+    }
+  }
+  add(row.date, row.date);
+  return ranges;
+}
+
 /** `CREATING`・`UNKNOWN` の行を `tags` の検索で回収する（実装設計 §6.4）。 */
 function recoverCreating(ctx: SyncCtx, row: ExpenseLedgerRow): void {
   const { ports, client } = ctx;
-  const found = findJournalsByTag(client, row.receipt_id, row.date, row.date);
-  const id = found.length > 0 ? journalIdOf(found[0]!) : null;
+  let id: string | null = null;
+  for (const range of recoverySearchRanges(row)) {
+    const found = findJournalsByTag(client, row.receipt_id, range.start, range.end, ctx.deadline);
+    id = found.length > 0 ? journalIdOf(found[0]!) : null;
+    if (id !== null) {
+      break;
+    }
+  }
   if (id !== null) {
     writeIfCurrent(
       ports,
@@ -328,10 +409,15 @@ function recoverCreating(ctx: SyncCtx, row: ExpenseLedgerRow): void {
     );
     return;
   }
-  if (row.mf_sync_state !== "CREATING" || row.mf_sync_attempted_at === null) {
+  if (row.mf_sync_state !== "CREATING") {
     return; // UNKNOWN は依頼済み。次回また検索するだけ。
   }
-  if (ports.clock.nowMs() - row.mf_sync_attempted_at < UNKNOWN_AFTER_MS) {
+  // 試行時刻が空の `CREATING`（保存の途中で失敗した等）は、更新時刻を試行時刻の代わりにする（レビュー M2）。
+  const attemptedAt = row.mf_sync_attempted_at ?? row.mf_sync_updated_at;
+  if (attemptedAt === null) {
+    return;
+  }
+  if (ports.clock.nowMs() - attemptedAt < UNKNOWN_AFTER_MS) {
     return; // 試行から 24 時間未満は待つ（次回また検索する）。
   }
   const written = writeIfCurrent(ports, row.receipt_id, (cur) => cur.mf_sync_state === "CREATING", {
@@ -381,118 +467,177 @@ function finishReversal(ctx: SyncCtx, row: ExpenseLedgerRow): void {
   }
 }
 
-function recoverStep(ctx: SyncCtx): void {
-  const rows = snapshotRows(ctx.ports);
-  for (const row of rows) {
-    if (row.mf_sync_state !== "CREATING" && row.mf_sync_state !== "UNKNOWN") {
-      continue;
-    }
-    if (!ctx.budget.tryStartRow()) {
-      return;
-    }
-    recoverCreating(ctx, row);
-  }
-  // `JOURNALIZING` は WP-M5（§6.5）の範囲。ここでは触らない。
-  for (const row of rows) {
-    if (row.mf_sync_state !== "REVERSING") {
-      continue;
-    }
-    if (!ctx.budget.tryStartRow()) {
-      return;
-    }
-    finishReversal(ctx, row);
-  }
+/** 取消された行に仕訳があるか（`SYNCED`、または `MF仕訳ID` が入っている「仕訳が無い状態」の行。§6.7）。 */
+function cancelledRowHasJournal(row: ExpenseLedgerRow): boolean {
+  return (
+    isCancelledExpenseState(row.state) &&
+    (row.mf_sync_state === "SYNCED" || (hasValue(row.mf_journal_id) && NO_JOURNAL_STATES.includes(row.mf_sync_state)))
+  );
 }
 
-// ---------------------------------------------------------------------------
-// 2. 取消（§6.7）
-// ---------------------------------------------------------------------------
-
-function cancelStep(ctx: SyncCtx): void {
-  const { ports } = ctx;
-  const rows = snapshotRows(ports).filter((r) => isCancelledExpenseState(r.state));
-  for (const row of rows) {
-    const s = row.mf_sync_state;
-    const hasJournal = s === "SYNCED" || (hasValue(row.mf_journal_id) && NO_JOURNAL_STATES.includes(s));
-    if (hasJournal) {
-      if (!ctx.budget.tryStartRow()) {
-        return;
-      }
-      const marked = writeIfCurrent(
-        ports,
-        row.receipt_id,
-        (cur) => isCancelledExpenseState(cur.state) && cur.mf_sync_state === s,
-        { mf_sync_state: "REVERSING", mf_sync_error: null },
-      );
-      if (marked !== null) {
-        finishReversal(ctx, marked);
-      }
-    } else if (NO_JOURNAL_STATES.includes(s)) {
-      // 仕訳が無い状態の取消は `REVERSED` にするだけ（MF は呼ばない）。
-      writeIfCurrent(
-        ports,
-        row.receipt_id,
-        (cur) =>
-          isCancelledExpenseState(cur.state) && cur.mf_sync_state === s && !hasValue(cur.mf_journal_id),
-        { mf_sync_state: "REVERSED", mf_sync_error: null },
-      );
-    }
-  }
+/** 手入力の取り込みの「存在しない」の理由文（行ごとに ID を含むので、ID が直れば別の文になる）。 */
+function importNotFoundMessage(id: string): string {
+  return `MF仕訳ID が見つかりません（${truncate(id, 80)} の仕訳が MF にありません）`;
 }
 
-// ---------------------------------------------------------------------------
-// 3. 手入力の取り込み（B7）
-// ---------------------------------------------------------------------------
+/** 手入力の `MF仕訳ID` を取り込む対象か（実装設計 §6.3 手順 3 ＋ `UNKNOWN`）。MF を呼ぶ前に判定できる範囲。 */
+function isImportCandidate(row: ExpenseLedgerRow): boolean {
+  if (!IMPORTABLE_STATES.includes(row.mf_sync_state) || !hasValue(row.mf_journal_id)) {
+    return false;
+  }
+  // kadobo が変更を検出して `NEEDS_REVIEW` にした行は、人が `MF連携状態` を空に戻すまで取り込み直さない
+  // （取り込むと確認を待たずに `SYNCED` へ戻って変更検出が無意味になる）。
+  if (row.mf_sync_state === "NEEDS_REVIEW" && hasInputChanged(row)) {
+    return false;
+  }
+  // 既に「見つかりません」と記録済みの ID は、ID が直るまで毎回 GET しない（予算を食い続けないため）。
+  if (row.mf_sync_error === importNotFoundMessage(row.mf_journal_id)) {
+    return false;
+  }
+  return true;
+}
 
-function importStep(ctx: SyncCtx): void {
+/** 維持作業の対象か（回収・削除のやり直し・取消・取り込みのどれかが要る行）。 */
+function isMaintenanceCandidate(row: ExpenseLedgerRow): boolean {
+  return (
+    row.mf_sync_state === "CREATING" ||
+    row.mf_sync_state === "UNKNOWN" ||
+    row.mf_sync_state === "REVERSING" ||
+    cancelledRowHasJournal(row) ||
+    isImportCandidate(row)
+  );
+}
+
+function importRow(ctx: SyncCtx, row: ExpenseLedgerRow): void {
   const { ports, client } = ctx;
-  const rows = snapshotRows(ports);
-  for (const row of rows) {
-    if (!IMPORTABLE_STATES.includes(row.mf_sync_state) || !hasValue(row.mf_journal_id)) {
-      continue;
-    }
-    // kadobo が変更を検出して `NEEDS_REVIEW` にした行は、人が `MF連携状態` を空に戻すまで取り込み直さない
-    // （取り込むと確認を待たずに `SYNCED` へ戻って変更検出が無意味になる）。
-    if (row.mf_sync_state === "NEEDS_REVIEW" && hasInputChanged(row)) {
-      continue;
-    }
-    if (!ctx.budget.tryStartRow()) {
-      return;
-    }
-    const id = row.mf_journal_id;
-    if (journalExists(client, id)) {
-      writeIfCurrent(
-        ports,
-        row.receipt_id,
-        (cur) => cur.mf_journal_id === id && IMPORTABLE_STATES.includes(cur.mf_sync_state),
-        {
-          mf_sync_state: "SYNCED",
-          mf_sync_error: null,
-          mf_sync_input: summarizeSyncInput(row),
-        },
-      );
-      continue;
-    }
-    // MF に無い ID が書かれている。人の確認を待つ（状態が `UNKNOWN` のときは変えず、理由だけ書く）。
-    const message = `MF仕訳ID が見つかりません（${truncate(id, 80)} の仕訳が MF にありません）`;
-    if (row.mf_sync_error === message) {
-      continue;
-    }
-    const wasNeedsReview = row.mf_sync_state === "NEEDS_REVIEW";
-    const patch: MfColumnsPatch =
-      row.mf_sync_state === "UNKNOWN"
-        ? { mf_sync_error: message }
-        : { mf_sync_state: "NEEDS_REVIEW", mf_sync_error: message };
-    const written = writeIfCurrent(
+  const id = row.mf_journal_id as string;
+  if (journalExists(client, id)) {
+    writeIfCurrent(
       ports,
       row.receipt_id,
       (cur) => cur.mf_journal_id === id && IMPORTABLE_STATES.includes(cur.mf_sync_state),
-      patch,
+      {
+        mf_sync_state: "SYNCED",
+        mf_sync_error: null,
+        mf_sync_input: summarizeSyncInput(row),
+      },
     );
-    if (written !== null && !wasNeedsReview) {
-      postBestEffort(ports, `⚠️ ${row.receipt_id}: ${message}。MF仕訳ID を直してください。`);
+    return;
+  }
+  // MF に無い ID が書かれている。人の確認を待つ（状態が `UNKNOWN` のときは変えず、理由だけ書く）。
+  const message = importNotFoundMessage(id);
+  const wasNeedsReview = row.mf_sync_state === "NEEDS_REVIEW";
+  const patch: MfColumnsPatch =
+    row.mf_sync_state === "UNKNOWN"
+      ? { mf_sync_error: message }
+      : { mf_sync_state: "NEEDS_REVIEW", mf_sync_error: message };
+  const written = writeIfCurrent(
+    ports,
+    row.receipt_id,
+    (cur) => cur.mf_journal_id === id && IMPORTABLE_STATES.includes(cur.mf_sync_state),
+    patch,
+  );
+  if (written !== null && !wasNeedsReview) {
+    postBestEffort(ports, `⚠️ ${row.receipt_id}: ${message}。MF仕訳ID を直してください。`);
+  }
+}
+
+/**
+ * 維持作業 1 行ぶん。行は 1 行 = 予算 1 行として数える（検索・削除・確認の複数回の呼び出しを含む）。
+ * 回収した行がその取消なら同じ実行で削除まで進める（実装設計 §11.2 の「その間に取消 → 回収後に DELETE」）。
+ */
+function processMaintenanceRow(ctx: SyncCtx, receiptId: string): void {
+  const { ports } = ctx;
+  const read = (): ExpenseLedgerRow | null => ports.lock.withLock(() => ports.sheets.getExpenseByReceiptId(receiptId));
+  let row = read();
+  if (row === null) {
+    return;
+  }
+  if (row.mf_sync_state === "CREATING" || row.mf_sync_state === "UNKNOWN") {
+    recoverCreating(ctx, row);
+    row = read();
+    if (row === null) {
+      return;
     }
   }
+  if (row.mf_sync_state === "REVERSING") {
+    finishReversal(ctx, row);
+    return;
+  }
+  if (cancelledRowHasJournal(row)) {
+    const s = row.mf_sync_state;
+    const marked = writeIfCurrent(
+      ports,
+      receiptId,
+      (cur) => isCancelledExpenseState(cur.state) && cur.mf_sync_state === s,
+      { mf_sync_state: "REVERSING", mf_sync_error: null },
+    );
+    if (marked !== null) {
+      finishReversal(ctx, marked);
+    }
+    return;
+  }
+  if (isImportCandidate(row)) {
+    importRow(ctx, row);
+  }
+}
+
+/** 仕訳が無い状態の取消は `REVERSED` にするだけ（MF は呼ばない。実装設計 §6.7）。予算を使わない。 */
+function reverseWithoutJournalStep(ctx: SyncCtx): void {
+  const { ports } = ctx;
+  for (const row of snapshotRows(ports)) {
+    if (!isCancelledExpenseState(row.state) || hasValue(row.mf_journal_id) || !NO_JOURNAL_STATES.includes(row.mf_sync_state)) {
+      continue;
+    }
+    const s = row.mf_sync_state;
+    writeIfCurrent(
+      ports,
+      row.receipt_id,
+      (cur) => isCancelledExpenseState(cur.state) && cur.mf_sync_state === s && !hasValue(cur.mf_journal_id),
+      { mf_sync_state: "REVERSED", mf_sync_error: null },
+    );
+  }
+}
+
+/** 維持キュー: 対象行の証憑 ID を、保存した巡回位置の次から一巡する順に並べたもの。 */
+interface MaintenanceQueue {
+  ids: string[];
+  pos: number;
+  /** 最後に手を付けた行（巡回位置として保存する）。 */
+  lastStarted: string | null;
+}
+
+function buildMaintenanceQueue(ports: AppPorts): MaintenanceQueue {
+  const rows = snapshotRows(ports);
+  const cursor = ports.lock.withLock(() => ports.sheets.getInternalValue(CURSOR_KIND, CURSOR_KEY));
+  const cursorIdx = cursor === null || cursor === "" ? -1 : rows.findIndex((r) => r.receipt_id === cursor);
+  const ordered = [...rows.slice(cursorIdx + 1), ...rows.slice(0, cursorIdx + 1)];
+  return { ids: ordered.filter(isMaintenanceCandidate).map((r) => r.receipt_id), pos: 0, lastStarted: null };
+}
+
+/** 維持キューを予算の許す限り処理する。キューを最後まで処理し終えたら `true`。 */
+function runMaintenanceQueue(ctx: SyncCtx, q: MaintenanceQueue): boolean {
+  while (q.pos < q.ids.length) {
+    if (!ctx.budget.tryStartRow("maintenance")) {
+      return false;
+    }
+    const id = q.ids[q.pos]!;
+    q.pos++;
+    q.lastStarted = id;
+    processMaintenanceRow(ctx, id);
+  }
+  return true;
+}
+
+/** 巡回位置の保存。最後まで回ったら空にして次回は先頭から。 */
+function saveCursor(ports: AppPorts, q: MaintenanceQueue): void {
+  const finished = q.pos >= q.ids.length;
+  const value = finished ? "" : (q.lastStarted ?? "");
+  ports.lock.withLock(() => {
+    if ((ports.sheets.getInternalValue(CURSOR_KIND, CURSOR_KEY) ?? "") !== value) {
+      ports.sheets.setInternalValue(CURSOR_KIND, CURSOR_KEY, value);
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -570,7 +715,7 @@ function createCashJournal(ctx: SyncCtx, row: ExpenseLedgerRow): void {
   const accounts = resolveAccountIds(ctx, [debitAccountNameOf(row.category), CASH_CREDITOR_ACCOUNT_NAME]);
 
   // 1. 冪等確認: 既に tags に証憑 ID を持つ仕訳があれば、それを採用する。
-  const found = findJournalsByTag(client, row.receipt_id, row.date, row.date);
+  const found = findJournalsByTag(client, row.receipt_id, row.date, row.date, ctx.deadline);
   const foundId = found.length > 0 ? journalIdOf(found[0]!) : null;
   if (foundId !== null) {
     writeIfCurrent(
@@ -583,12 +728,21 @@ function createCashJournal(ctx: SyncCtx, row: ExpenseLedgerRow): void {
     return;
   }
 
-  // 2. ロック内で CREATING・試行時刻・入力要約を書く（POST の前に保存する）。
+  // 2. ロック内で CREATING・試行時刻・入力要約を書く（POST の前に保存する。状態を最後に書く）。
+  // 再読込した行が、科目解決・タグ検索に使ったスナップショット（`row`）と同じ入力で、§6.2 の対象条件
+  // （現金・100%・COMPLETED・開業日以降）をなお満たすときだけ進む。違えばこの実行では POST せず、状態も
+  // 変えない（次回の実行が再評価する。レビュー B2）。本文・借方科目・入力要約は同じスナップショットから作る。
   const input = summarizeSyncInput(row);
   const marked = writeIfCurrent(
     ports,
     row.receipt_id,
-    (cur) => cur.mf_sync_state === "PENDING" && cur.state === "COMPLETED" && !hasValue(cur.mf_journal_id),
+    (cur) => {
+      if (cur.mf_sync_state !== "PENDING" || cur.state !== "COMPLETED" || hasValue(cur.mf_journal_id)) {
+        return false;
+      }
+      const d = decideSyncTarget(cur, ctx.startDate);
+      return d.kind === "ready" && d.method === "cash" && summarizeSyncInput(cur) === input;
+    },
     {
       mf_sync_state: "CREATING",
       mf_sync_attempted_at: ports.clock.nowMs(),
@@ -662,7 +816,7 @@ function createStep(ctx: SyncCtx): void {
       !hasValue(r.mf_journal_id),
   );
   for (const row of candidates) {
-    if (ctx.halted || !ctx.budget.tryStartRow()) {
+    if (ctx.halted || !ctx.budget.tryStartRow("new")) {
       return;
     }
     createCashJournal(ctx, row);
@@ -678,25 +832,37 @@ function newStep(ctx: SyncCtx, startDate: string): void {
 // エントリポイント
 // ---------------------------------------------------------------------------
 
-function runSync(ports: AppPorts): void {
+function runSync(ports: AppPorts, deadline: RunDeadline): void {
+  const startDateRaw = ports.props.get("MF_SYNC_START_DATE");
+  const startDate = startDateRaw === null || startDateRaw === "" ? null : startDateRaw;
   const ctx: SyncCtx = {
     ports,
     client: makeMfAccountingClient(ports),
-    budget: new RunBudget(ports),
+    budget: new RunBudget(deadline),
+    deadline,
+    startDate,
     halted: false,
   };
-  const startDateRaw = ports.props.get("MF_SYNC_START_DATE");
-  const startDate = startDateRaw === null || startDateRaw === "" ? null : startDateRaw;
+  let queue: MaintenanceQueue | null = null;
   try {
-    recoverStep(ctx);
-    cancelStep(ctx);
-    importStep(ctx);
+    // 仕訳が無い状態の取消は MF を呼ばずに `REVERSED` にする（予算を使わない）。
+    reverseWithoutJournalStep(ctx);
+    // 維持作業（回収・取消・取り込み）: 最初は 10 行まで。残りの予算は新規に残す。
+    queue = buildMaintenanceQueue(ports);
+    runMaintenanceQueue(ctx, queue);
     detectChangeStep(ctx);
-    // 5. 新規作成だけ `MF_JOURNAL_ENABLED` が要る（§9）。`MF_SYNC_START_DATE` 未設定なら同期しない（§9）。
+    // 新規作成だけ `MF_JOURNAL_ENABLED` が要る（§9）。`MF_SYNC_START_DATE` 未設定なら同期しない（§9）。
     if (isJournalEnabled(ports.props) && startDate !== null) {
       newStep(ctx, startDate);
     }
+    // 新規が予算を余らせたら、維持作業の続きに回す（レビュー M3）。
+    ctx.budget.openMaintenance();
+    runMaintenanceQueue(ctx, queue);
   } catch (e) {
+    if (e instanceof RunDeadlineExceededError) {
+      // 期限切れで検索を打ち切った。状態は変えず、次回のトリガーが続きを処理する。
+      return;
+    }
     if (e instanceof ConfigMissingError) {
       // 設定不備は時間では直らない。通知して止める（毎時の通知を避けるため 1 日 1 回）。
       console.error(`journalSync: config missing (${e.propertyKey})`);
@@ -706,6 +872,11 @@ function runSync(ports: AppPorts): void {
       return;
     }
     throw e;
+  } finally {
+    // 例外で終わった場合も、最後に手を付けた行までを巡回位置として保存する（同じ行が毎回先頭を塞がないため）。
+    if (queue !== null) {
+      saveCursor(ports, queue);
+    }
   }
 }
 
@@ -714,12 +885,14 @@ function runSync(ports: AppPorts): void {
  * `MF_ENABLED` が無効なら何もしない（HTTP 0 件）。lease `mf_sync`（10 分）を取れなければ何もしない
  * （別の実行が処理中。§6.8）。MF の例外（`MfTransientError` 等）は呼び出し元（トリガー）へ伝播させ、
  * `notifyMfFailure(ports, "journal", err)` に任せる。
+ *
+ * `deadline` は `trigMfSync` の開始時刻を基準にした絶対期限（省略時はこの呼び出しの開始時刻から 4 分）。
  */
-export function syncExpenses(ports: AppPorts): void {
+export function syncExpenses(ports: AppPorts, deadline: RunDeadline = new RunDeadline(ports.clock)): void {
   if (!isMfEnabled(ports.props)) {
     return;
   }
-  withLease(ports, MF_SYNC_LEASE_KEY, LEASE_TTL_MS, () => runSync(ports));
+  withLease(ports, MF_SYNC_LEASE_KEY, LEASE_TTL_MS, () => runSync(ports, deadline));
 }
 
 // ---------------------------------------------------------------------------

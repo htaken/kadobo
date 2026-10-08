@@ -4,6 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { ensureInvoiceCreated, trackBillingStatus, warnMismatchDaily, weeklyInvoiceKeepalive } from "../../src/app/invoice";
+import { RunDeadline } from "../../src/app/mf/deadline";
 import { MF_INVOICE_TOKENS_KEY } from "../../src/app/mf/invoiceClient";
 import type { MonthlyBillRow } from "../../src/app/ports";
 import { makeFakePorts, type FakePorts } from "./fakes";
@@ -609,6 +610,52 @@ describe("weeklyInvoiceKeepalive", () => {
     const ports = makeFakePorts();
 
     weeklyInvoiceKeepalive(ports);
+
+    expect(ports.http.calls).toHaveLength(0);
+  });
+});
+
+describe("絶対期限（実装設計 §6.8、レビュー M4）", () => {
+  it("期限切れの実行は、月ごとの処理に手を付けない（HTTP 0 件・状態は変わらない）", () => {
+    const ports = setupPorts();
+    const deadline = new RunDeadline(ports.clock, 4 * 60 * 1000);
+    ports.clock.currentMs += 5 * 60 * 1000;
+
+    ensureInvoiceCreated(ports, deadline);
+
+    expect(ports.http.calls).toHaveLength(0);
+    expect(ports.sheets.getMonthlyBill("A社", "2026-10")?.invoice_state).toBe("PENDING");
+  });
+
+  it("請求書の検索ループ（ページ取得）の途中で期限切れ: 結果を『見つからない』と読まず POST せず、状態は変えない", () => {
+    const ports = setupPorts();
+    const deadline = new RunDeadline(ports.clock, 4 * 60 * 1000);
+    // 1 ページ目の取得に 5 分かかったことにする。総ページ数は 3（2 ページ目以降がある）。
+    ports.http.fetch = (req) => {
+      ports.http.calls.push(req);
+      ports.clock.currentMs += 5 * 60 * 1000;
+      return {
+        status: 200,
+        headers: {},
+        body: JSON.stringify({ data: [], pagination: { total_count: 0, total_pages: 3, per_page: 100, current_page: 1 } }),
+      };
+    };
+
+    expect(() => ensureInvoiceCreated(ports, deadline)).not.toThrow();
+
+    expect(ports.http.calls.filter((c) => c.method === "get" && c.url.includes("/billings"))).toHaveLength(1);
+    expect(ports.http.calls.some((c) => c.method === "post")).toBe(false);
+    expect(ports.sheets.getMonthlyBill("A社", "2026-10")?.invoice_state).toBe("PENDING");
+    // lease は解放されている（次回すぐ続きを処理できる）。
+    expect(ports.sheets.getInternalValue("lease", "mf_invoice/A社:2026-10")).toBe("0");
+  });
+
+  it("trackBillingStatus も期限切れなら何もしない", () => {
+    const ports = trackedBill();
+    const deadline = new RunDeadline(ports.clock, 4 * 60 * 1000);
+    ports.clock.currentMs += 5 * 60 * 1000;
+
+    trackBillingStatus(ports, deadline);
 
     expect(ports.http.calls).toHaveLength(0);
   });

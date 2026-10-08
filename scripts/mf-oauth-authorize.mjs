@@ -62,6 +62,21 @@ authorizeUrl.searchParams.set("state", state);
 authorizeUrl.searchParams.set("code_challenge", codeChallenge);
 authorizeUrl.searchParams.set("code_challenge_method", "S256");
 
+/** HTML に埋め込む文字列のエスケープ（`error`/`error_description` 等、外部から来る値は必ず通す）。 */
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/** 端末に出す外部由来の文字列から制御文字を除き、長さを制限する。 */
+function sanitizeForTerminal(value) {
+  return String(value).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 300);
+}
+
 function htmlPage(title, body) {
   return (
     `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head>` +
@@ -89,7 +104,22 @@ async function exchangeToken(code) {
   });
   const text = await res.text();
   if (res.status < 200 || res.status >= 300) {
-    throw new Error(`トークン交換に失敗しました（HTTP ${res.status}）: ${text}`);
+    // 応答本文全体は出さない（秘密情報を含み得る）。OAuth のエラー項目 `error`・`error_description` だけを出す。
+    let detail = "";
+    try {
+      const errJson = JSON.parse(text);
+      const parts = [];
+      if (typeof errJson.error === "string") {
+        parts.push(`error=${sanitizeForTerminal(errJson.error)}`);
+      }
+      if (typeof errJson.error_description === "string") {
+        parts.push(`error_description=${sanitizeForTerminal(errJson.error_description)}`);
+      }
+      detail = parts.join(" ");
+    } catch {
+      // JSON でなければ詳細は出さない。
+    }
+    throw new Error(`トークン交換に失敗しました（HTTP ${res.status}）${detail === "" ? "" : `: ${detail}`}`);
   }
   let json;
   try {
@@ -128,17 +158,6 @@ const server = createServer((req, res) => {
     return;
   }
 
-  const errorParam = url.searchParams.get("error");
-  if (errorParam !== null) {
-    const desc = url.searchParams.get("error_description") ?? "";
-    settled = true;
-    res
-      .writeHead(400, { "content-type": "text/html; charset=utf-8" })
-      .end(htmlPage("認可エラー", `${errorParam} ${desc}`));
-    finishAfterResponse(() => fail(`MF から認可エラーが返されました: ${errorParam} ${desc}`));
-    return;
-  }
-
   const returnedState = url.searchParams.get("state");
   if (returnedState !== state) {
     settled = true;
@@ -146,6 +165,20 @@ const server = createServer((req, res) => {
       .writeHead(400, { "content-type": "text/html; charset=utf-8" })
       .end(htmlPage("state 不一致", "state パラメータが一致しません。最初からやり直してください。"));
     finishAfterResponse(() => fail("state パラメータが一致しません（CSRF の可能性、または古いリンクです）。"));
+    return;
+  }
+
+  // 認可エラー応答（`error` あり）も、先に state を照合してから扱う（state が合わない応答の内容は信用しない）。
+  const errorParam = url.searchParams.get("error");
+  if (errorParam !== null) {
+    const desc = url.searchParams.get("error_description") ?? "";
+    settled = true;
+    res
+      .writeHead(400, { "content-type": "text/html; charset=utf-8" })
+      .end(htmlPage("認可エラー", `${escapeHtml(errorParam)} ${escapeHtml(desc)}`));
+    finishAfterResponse(() =>
+      fail(`MF から認可エラーが返されました: ${sanitizeForTerminal(errorParam)} ${sanitizeForTerminal(desc)}`),
+    );
     return;
   }
 

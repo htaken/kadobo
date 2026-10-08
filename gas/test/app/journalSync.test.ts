@@ -5,6 +5,7 @@
 import { describe, expect, it } from "vitest";
 import { syncExpenses, weeklyJournalReport, MF_ACCOUNTS_CACHE_KEY } from "../../src/app/journalSync";
 import { acquireLease } from "../../src/app/mf/lease";
+import { RunDeadline } from "../../src/app/mf/deadline";
 import { MfAuthError, MfTransientError } from "../../src/app/mf/errors";
 import type { ExpenseLedgerRow } from "../../src/app/ports";
 import { makeFakePorts, type FakePorts } from "./fakes";
@@ -883,6 +884,356 @@ describe("書く列・ロック（§0, §6.8）", () => {
     expect(ports.http.calls.length).toBeGreaterThan(5);
     expect(ports.slack.posted.length).toBeGreaterThan(2);
     expect(lockViolations).toEqual([]);
+  });
+});
+
+describe("B2: 作成直前の再読込で対象条件・入力の一致を確認する", () => {
+  /** 最初の `GET /journals`（タグ検索）が来た瞬間に、人が台帳を編集した状況を再現する。 */
+  function editDuringSearch(env: Env, receiptId: string, patch: Partial<ExpenseLedgerRow>): void {
+    const prev = env.api.onRequest;
+    let done = false;
+    env.api.onRequest = (req) => {
+      prev?.(req);
+      if (!done && req.method === "get" && req.url.includes("/journals?")) {
+        done = true;
+        env.ports.sheets.updateExpense(receiptId, patch);
+      }
+    };
+  }
+
+  it("タグ検索中に「消耗品費・cash・100%」→「通信費・linked_card・50%」に変わったら POST しない。次回は NEEDS_REVIEW に再評価", () => {
+    const env = setup();
+    const { ports, api } = env;
+    add(ports, "R-1", { mf_sync_state: "PENDING", category: "消耗品費", payment_method: "cash", business_use_ratio: 100 });
+    editDuringSearch(env, "R-1", { category: "通信費", payment_method: "linked_card", business_use_ratio: 50 });
+
+    syncExpenses(ports);
+
+    expect(postCount(ports)).toBe(0);
+    expect(api.journals).toHaveLength(0);
+    const r = get(ports, "R-1");
+    expect(r.mf_sync_state).toBe("PENDING"); // 状態は変えない
+    expect(r.mf_sync_attempted_at).toBeNull();
+
+    syncExpenses(ports);
+    expect(get(ports, "R-1").mf_sync_state).toBe("NEEDS_REVIEW");
+    expect(postCount(ports)).toBe(0);
+  });
+
+  it("金額だけ変わった場合も、その実行では POST しない（古い入力で作らない）。次回は新しい入力で作る", () => {
+    const env = setup();
+    const { ports, api } = env;
+    add(ports, "R-1", { mf_sync_state: "PENDING", amount: 1200 });
+    editDuringSearch(env, "R-1", { amount: 1500 });
+
+    syncExpenses(ports);
+    expect(postCount(ports)).toBe(0);
+    expect(get(ports, "R-1").mf_sync_state).toBe("PENDING");
+
+    syncExpenses(ports);
+    expect(postCount(ports)).toBe(1);
+    const body = api.postedBodies[0] as { journal: { branches: { debitor: { value: number } }[] } };
+    expect(body.journal.branches[0]!.debitor.value).toBe(1500);
+    expect(get(ports, "R-1").mf_sync_input).toBe("1500|2026-10-05|消耗品費|cash|");
+  });
+
+  it("本文・借方科目・保存する入力要約は同じスナップショット（再読込した行）から作る", () => {
+    const { ports, api } = setup();
+    add(ports, "R-1", { category: "旅費交通費", amount: 700 });
+
+    syncExpenses(ports);
+
+    const body = api.postedBodies[0] as { journal: { branches: { debitor: { account_id: string; value: number } }[] } };
+    expect(body.journal.branches[0]!.debitor).toEqual({ account_id: accountIdOf("旅費交通費"), value: 700 });
+    expect(get(ports, "R-1").mf_sync_input).toBe("700|2026-10-05|旅費交通費|cash|");
+  });
+
+  it("人が処理状態を CORRECTED にした（COMPLETED でなくなった）場合も POST しない", () => {
+    const env = setup();
+    add(env.ports, "R-1", { mf_sync_state: "PENDING" });
+    editDuringSearch(env, "R-1", { state: "CORRECTED" });
+
+    syncExpenses(env.ports);
+
+    expect(postCount(env.ports)).toBe(0);
+  });
+});
+
+describe("M1: 日付を変えても作成時の日付で回収・取消できる", () => {
+  it("作成後に応答を失い、台帳の日付を直して取消しても、作成時の日付で回収して DELETE できる", () => {
+    const { ports, api } = setup();
+    api.postMode = "created_but_500";
+    api.postModeRemaining = 1;
+    add(ports, "R-1", { date: "2026-10-05" });
+    syncExpenses(ports);
+    expect(get(ports, "R-1").mf_sync_state).toBe("CREATING");
+    expect(api.journals[0]!.transaction_date).toBe("2026-10-05");
+
+    ports.sheets.updateExpense("R-1", { date: "2026-10-06", state: "CORRECTED" });
+    syncExpenses(ports);
+
+    expect(api.journals).toHaveLength(0);
+    expect(get(ports, "R-1").mf_sync_state).toBe("REVERSED");
+  });
+
+  it("現在の日付と作成時の日付の両方で検索する（作成時の日付が先）", () => {
+    const { ports } = setup();
+    add(ports, "R-1", {
+      mf_sync_state: "UNKNOWN",
+      date: "2026-10-09",
+      mf_sync_input: "1200|2026-10-05|消耗品費|cash|",
+      mf_sync_attempted_at: NOW - 30 * HOUR,
+    });
+
+    syncExpenses(ports);
+
+    const dates = ports.http.calls
+      .filter((c) => c.url.includes("/journals?"))
+      .map((c) => /start_date=([^&]*)/.exec(c.url)?.[1]);
+    expect(dates).toEqual(["2026-10-05", "2026-10-09"]);
+  });
+
+  it("mf_sync_input が無い CREATING は、mf_sync_updated_at の前後 1 日と現在の日付で検索する", () => {
+    const { ports, api } = setup();
+    // 日付は 10/07 に直されたが、仕訳は前日（updated_at の前日 = 10/19）の transaction_date で作られていた。
+    const j = api.plantJournal({ transaction_date: "2026-10-19", tags: ["R-1"] });
+    add(ports, "R-1", {
+      mf_sync_state: "CREATING",
+      date: "2026-10-07",
+      mf_sync_input: "",
+      mf_sync_attempted_at: null,
+      mf_sync_updated_at: NOW - HOUR,
+    });
+
+    syncExpenses(ports);
+
+    expect(get(ports, "R-1")).toMatchObject({ mf_sync_state: "SYNCED", mf_journal_id: j.id });
+    const range = ports.http.calls.find((c) => c.url.includes("/journals?"));
+    expect(range?.url).toContain("start_date=2026-10-19");
+    expect(range?.url).toContain("end_date=2026-10-21");
+  });
+});
+
+describe("M2: セル単位の途中書込み失敗からの復旧", () => {
+  it("作成前の書込み順は 試行時刻・入力要約・更新日時 → 状態（最後）", () => {
+    const { ports } = setup();
+    add(ports, "R-1", { mf_sync_state: "PENDING" });
+    ports.sheets.cellWrites.length = 0;
+
+    syncExpenses(ports);
+
+    // PENDING のまま始めるので、最初の更新が CREATING への書込み。
+    expect(ports.sheets.cellWrites.slice(0, 5)).toEqual([
+      "mf_sync_error",
+      "mf_sync_attempted_at",
+      "mf_sync_input",
+      "mf_sync_updated_at",
+      "mf_sync_state",
+    ]);
+  });
+
+  it.each([1, 2, 3, 4, 5])(
+    "CREATING への書込みの %i 個目のセルで失敗しても、『CREATING なのに試行時刻・入力要約が無い』行を残さない。POST もしない。次回に作れる",
+    (n) => {
+      const { ports, api } = setup();
+      add(ports, "R-1", { mf_sync_state: "PENDING" });
+      ports.sheets.armFailAtCellWrite(n);
+
+      expect(() => syncExpenses(ports)).toThrow(/CELL_WRITE_FAILED/);
+
+      const r = get(ports, "R-1");
+      if (r.mf_sync_state === "CREATING") {
+        throw new Error("CREATING が残ってはいけない（状態は最後に書く）");
+      }
+      expect(r.mf_sync_state).toBe("PENDING");
+      expect(postCount(ports)).toBe(0);
+      expect(api.journals).toHaveLength(0);
+
+      syncExpenses(ports);
+      expect(get(ports, "R-1").mf_sync_state).toBe("SYNCED");
+      expect(postCount(ports)).toBe(1);
+    },
+  );
+
+  it("POST 成功後の SYNCED 書込みの途中（MF仕訳ID は保存、状態は未保存）で失敗 → 次回の回収で SYNCED。二重作成しない", () => {
+    const { ports, api } = setup();
+    add(ports, "R-1", { mf_sync_state: "PENDING" });
+    // CREATING への書込み 5 セル + SYNCED への書込み（mf_journal_id, mf_sync_error, mf_sync_updated_at, mf_sync_state）の 4 個目。
+    ports.sheets.armFailAtCellWrite(9);
+
+    expect(() => syncExpenses(ports)).toThrow(/CELL_WRITE_FAILED:mf_sync_state/);
+    const mid = get(ports, "R-1");
+    expect(mid.mf_sync_state).toBe("CREATING");
+    expect(mid.mf_journal_id).toBe(api.journals[0]!.id); // ID は先に保存されている
+
+    syncExpenses(ports);
+
+    expect(get(ports, "R-1")).toMatchObject({ mf_sync_state: "SYNCED", mf_journal_id: api.journals[0]!.id });
+    expect(postCount(ports)).toBe(1);
+  });
+
+  it("試行時刻が空の CREATING は mf_sync_updated_at を代わりに使い、24 時間後に UNKNOWN にして通知する", () => {
+    const { ports } = setup();
+    add(ports, "R-1", {
+      mf_sync_state: "CREATING",
+      mf_sync_attempted_at: null,
+      mf_sync_input: "",
+      mf_sync_updated_at: NOW - 30 * HOUR,
+    });
+
+    syncExpenses(ports);
+
+    expect(get(ports, "R-1").mf_sync_state).toBe("UNKNOWN");
+    expect(postedTexts(ports).filter((t) => t.includes("R-1"))).toHaveLength(1);
+  });
+
+  it("試行時刻も更新日時も無い CREATING は 24 時間の判定ができないので待つ（通知しない）", () => {
+    const { ports } = setup();
+    add(ports, "R-1", { mf_sync_state: "CREATING", mf_sync_attempted_at: null, mf_sync_updated_at: null, mf_sync_input: "" });
+
+    syncExpenses(ports);
+
+    expect(get(ports, "R-1").mf_sync_state).toBe("CREATING");
+    expect(ports.slack.posted).toHaveLength(0);
+  });
+});
+
+describe("M3: 予算のフェーズ別配分と巡回", () => {
+  it("UNKNOWN 20 件＋新規 1 件でも、1 回の同期で新規が作られる", () => {
+    const { ports } = setup();
+    for (let i = 1; i <= 20; i++) {
+      add(ports, `R-U${String(i).padStart(2, "0")}`, {
+        mf_sync_state: "UNKNOWN",
+        date: `2026-10-${String(i).padStart(2, "0")}`,
+        mf_sync_attempted_at: NOW - 30 * HOUR,
+        mf_sync_input: `1200|2026-10-${String(i).padStart(2, "0")}|消耗品費|cash|`,
+      });
+    }
+    add(ports, "R-NEW", { date: "2026-10-25" });
+
+    syncExpenses(ports);
+
+    expect(get(ports, "R-NEW").mf_sync_state).toBe("SYNCED");
+    expect(postCount(ports)).toBe(1);
+  });
+
+  it("維持作業は最大 10 行、新規が少なければ余りを維持作業の続きに回す（合計 20 行まで）", () => {
+    const { ports } = setup();
+    for (let i = 1; i <= 25; i++) {
+      add(ports, `R-U${String(i).padStart(2, "0")}`, {
+        mf_sync_state: "UNKNOWN",
+        date: `2026-10-${String(i).padStart(2, "0")}`,
+        mf_sync_attempted_at: NOW - 30 * HOUR,
+        mf_sync_input: `1200|2026-10-${String(i).padStart(2, "0")}|消耗品費|cash|`,
+      });
+    }
+
+    syncExpenses(ports);
+
+    // 新規が無いので 20 行ぶん（1 行 1 回の検索）まで維持作業が進む。
+    const searches = ports.http.calls.filter((c) => c.url.includes("/journals?"));
+    expect(searches).toHaveLength(20);
+  });
+
+  it("新規が 10 行を超えて残っていても、維持作業に先に最大 10 行が割り当たる（新規は残り 10 行まで）", () => {
+    const { ports } = setup();
+    for (let i = 1; i <= 15; i++) {
+      add(ports, `R-U${String(i).padStart(2, "0")}`, {
+        mf_sync_state: "UNKNOWN",
+        date: `2026-10-${String(i).padStart(2, "0")}`,
+        mf_sync_attempted_at: NOW - 30 * HOUR,
+        mf_sync_input: `1200|2026-10-${String(i).padStart(2, "0")}|消耗品費|cash|`,
+      });
+    }
+    for (let i = 1; i <= 15; i++) {
+      add(ports, `R-N${String(i).padStart(2, "0")}`, { date: "2026-10-28" });
+    }
+
+    syncExpenses(ports);
+
+    expect(postCount(ports)).toBe(10);
+    expect(ports.http.calls.filter((c) => c.url.includes("/journals?") && c.url.includes("2026-10-28")).length).toBe(10);
+  });
+
+  it("巡回位置 mf_sync/cursor を保存し、次回は続きから始める。後ろの REVERSING にも到達する", () => {
+    const { ports, api } = setup();
+    for (let i = 1; i <= 20; i++) {
+      add(ports, `R-U${String(i).padStart(2, "0")}`, {
+        mf_sync_state: "UNKNOWN",
+        date: `2026-10-${String(i).padStart(2, "0")}`,
+        mf_sync_attempted_at: NOW - 30 * HOUR,
+        mf_sync_input: `1200|2026-10-${String(i).padStart(2, "0")}|消耗品費|cash|`,
+      });
+    }
+    const j = api.plantJournal({ transaction_date: "2026-10-25", tags: ["R-REV"] });
+    add(ports, "R-REV", { state: "CORRECTED", mf_sync_state: "REVERSING", mf_journal_id: j.id, date: "2026-10-25" });
+
+    syncExpenses(ports);
+
+    expect(get(ports, "R-REV").mf_sync_state).toBe("REVERSING"); // 1 回目は 20 行で打ち切り。REVERSING は 21 行目
+    expect(ports.sheets.getInternalValue("mf_sync", "cursor")).toBe("R-U20");
+
+    syncExpenses(ports);
+
+    expect(get(ports, "R-REV").mf_sync_state).toBe("REVERSED");
+    expect(api.journals).toHaveLength(0);
+  });
+
+  it("全件を処理し終えたら巡回位置は空に戻る", () => {
+    const { ports } = setup();
+    add(ports, "R-U1", { mf_sync_state: "UNKNOWN", mf_sync_attempted_at: NOW - 30 * HOUR });
+
+    syncExpenses(ports);
+
+    expect(ports.sheets.getInternalValue("mf_sync", "cursor") ?? "").toBe("");
+  });
+
+  it("既に『見つかりません』と記録した手入力 ID の行は、ID が直るまで予算を使わない（毎回 GET しない）", () => {
+    const { ports } = setup();
+    add(ports, "R-1", { mf_journal_id: "typo%3D%3D" });
+    syncExpenses(ports);
+    expect(get(ports, "R-1").mf_sync_state).toBe("NEEDS_REVIEW");
+    const calls = ports.http.calls.length;
+
+    syncExpenses(ports);
+
+    expect(ports.http.calls.length).toBe(calls);
+  });
+});
+
+describe("M4: 仕訳検索のページ取得ループでも絶対期限を確認する", () => {
+  it("検索の途中で期限切れ: 『見つからなかった』と読んで POST することはなく、状態は変わらない（次回に続ける）", () => {
+    const { ports, api } = setup();
+    for (let i = 0; i < 250; i++) {
+      api.plantJournal({ transaction_date: "2026-10-05", tags: [`other-${i}`] });
+    }
+    add(ports, "R-1", { mf_sync_state: "PENDING" });
+    // 1 ページ取るごとに 3 分かかる（3 ページ必要。2 ページ目は 4 分以内に始まるが、3 ページ目の前に期限切れ）。
+    api.onRequest = (req) => {
+      if (req.method === "get" && req.url.includes("/journals?")) {
+        ports.clock.currentMs += 3 * 60 * 1000;
+      }
+    };
+
+    expect(() => syncExpenses(ports)).not.toThrow();
+
+    expect(postCount(ports)).toBe(0);
+    expect(accountingCallsOf(ports).filter((c) => c === "GET /journals")).toHaveLength(2);
+    const r = get(ports, "R-1");
+    expect(r.mf_sync_state).toBe("PENDING");
+    expect(r.mf_sync_attempted_at).toBeNull();
+  });
+
+  it("渡された絶対期限（trigMfSync 開始基準）が既に過ぎていれば、MF を一切呼ばない", () => {
+    const { ports } = setup();
+    add(ports, "R-1", { mf_sync_state: "CREATING", mf_sync_attempted_at: NOW - HOUR });
+    const deadline = new RunDeadline(ports.clock, 4 * 60 * 1000);
+    ports.clock.currentMs += 5 * 60 * 1000;
+
+    syncExpenses(ports, deadline);
+
+    expect(accountingCallsOf(ports)).toHaveLength(0);
+    expect(get(ports, "R-1").mf_sync_state).toBe("CREATING");
   });
 });
 

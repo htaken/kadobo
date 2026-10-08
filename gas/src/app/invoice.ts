@@ -45,6 +45,7 @@ import { nextStateOnBillingStatus, type MonthCloseState } from "../core/monthClo
 import { lastDayOfMonthStr } from "./dateUtil";
 import { isInvoiceEnabled } from "./mf/flags";
 import { makeMfInvoiceClient, type MfInvoiceClient } from "./mf/invoiceClient";
+import { RunDeadline, RunDeadlineExceededError } from "./mf/deadline";
 import { MfApiError, MfOutcomeUnknownError, MfTransientError } from "./mf/errors";
 import { withLease } from "./mf/lease";
 import { extraHolidaysOf } from "./monthClose";
@@ -243,10 +244,18 @@ function extractPagination(res: unknown): { total_pages: number; current_page: n
   return null;
 }
 
-export function searchBillingsByDocumentNumber(client: MfInvoiceClient, billingNumber: string): Record<string, unknown>[] {
+export function searchBillingsByDocumentNumber(
+  client: MfInvoiceClient,
+  billingNumber: string,
+  deadline?: RunDeadline,
+): Record<string, unknown>[] {
   const matched: Record<string, unknown>[] = [];
   let page = 1;
   while (page <= SEARCH_MAX_PAGES) {
+    // 期限切れ（実装設計 §6.8）: 途中までの結果を「見つからなかった」と読むと二重作成になるので、結果を返さず例外にする。
+    if (deadline?.isExpired() === true) {
+      throw new RunDeadlineExceededError();
+    }
     const path =
       `/billings?document_number=${encodeURIComponent(billingNumber)}` +
       `&page=${page}&per_page=${SEARCH_PER_PAGE}`;
@@ -371,7 +380,13 @@ function compareAndFinalize(
 }
 
 /** 1 か月分の作成・照合処理（実装設計 §5.5 の擬似コード）。lease 取得後、ロックの外で呼ばれる。 */
-function processOneInvoice(ports: AppPorts, invoiceClient: MfInvoiceClient, client: string, month: string): void {
+function processOneInvoice(
+  ports: AppPorts,
+  invoiceClient: MfInvoiceClient,
+  client: string,
+  month: string,
+  deadline: RunDeadline,
+): void {
   const current = ports.sheets.getMonthlyBill(client, month);
   if (current === null || current.state !== "LOCKED") {
     return;
@@ -384,7 +399,7 @@ function processOneInvoice(ports: AppPorts, invoiceClient: MfInvoiceClient, clie
   }
 
   const billingNumber = invoiceBillingNumberOf(month);
-  const found = searchBillingsByDocumentNumber(invoiceClient, billingNumber);
+  const found = searchBillingsByDocumentNumber(invoiceClient, billingNumber, deadline);
 
   if (found.length >= 2) {
     handleDuplicate(ports, current, billingNumber, found.length);
@@ -471,7 +486,7 @@ function processOneInvoice(ports: AppPorts, invoiceClient: MfInvoiceClient, clie
  * （`invoice_state = MANUAL` の月はそもそも対象条件 `{PENDING, UNKNOWN}` に含まれないため、
  * フラグを後から有効にしても作られない。実装設計 §5.1 B7）。
  */
-export function ensureInvoiceCreated(ports: AppPorts): void {
+export function ensureInvoiceCreated(ports: AppPorts, deadline: RunDeadline = new RunDeadline(ports.clock)): void {
   if (!isInvoiceEnabled(ports.props)) {
     return;
   }
@@ -481,9 +496,20 @@ export function ensureInvoiceCreated(ports: AppPorts): void {
     .filter((b) => b.state === "LOCKED" && (b.invoice_state === "PENDING" || b.invoice_state === "UNKNOWN"));
 
   for (const target of targets) {
-    withLease(ports, `mf_invoice/${target.client}:${target.month}`, LEASE_TTL_MS, () => {
-      processOneInvoice(ports, invoiceClient, target.client, target.month);
-    });
+    // 月ごとの処理に手を付ける前に絶対期限を確認する（実装設計 §6.8）。打ち切った分は状態を変えず次回に続ける。
+    if (deadline.isExpired()) {
+      return;
+    }
+    try {
+      withLease(ports, `mf_invoice/${target.client}:${target.month}`, LEASE_TTL_MS, () => {
+        processOneInvoice(ports, invoiceClient, target.client, target.month, deadline);
+      });
+    } catch (e) {
+      if (e instanceof RunDeadlineExceededError) {
+        return;
+      }
+      throw e;
+    }
   }
 }
 
@@ -506,7 +532,7 @@ function trackingMessage(state: MonthCloseState, client: string, month: string):
  * `GET /billings/{id}` を 1 回呼び、`normalizeBillingStatus` → `nextStateOnBillingStatus` で
  * 遷移したら `state` 列だけを書き、Slack に 1 行通知する。
  */
-export function trackBillingStatus(ports: AppPorts): void {
+export function trackBillingStatus(ports: AppPorts, deadline: RunDeadline = new RunDeadline(ports.clock)): void {
   if (!isInvoiceEnabled(ports.props)) {
     return;
   }
@@ -518,6 +544,9 @@ export function trackBillingStatus(ports: AppPorts): void {
     );
 
   for (const target of targets) {
+    if (deadline.isExpired()) {
+      return;
+    }
     const detail = extractBillingDetail(
       invoiceClient.request("get", `/billings/${encodeURIComponent(target.mf_invoice_id as string)}`),
     );

@@ -16,6 +16,7 @@ import {
 } from "./dateUtil";
 import { ensureInvoiceCreated, trackBillingStatus, warnMismatchDaily, weeklyInvoiceKeepalive } from "./invoice";
 import { syncExpenses, weeklyJournalReport } from "./journalSync";
+import { RunDeadline } from "./mf/deadline";
 import { notifyMfFailure, notifyMfSuccess } from "./mf/notify";
 import { evaluateMonthClose } from "./monthClose";
 import { formatYen, recomputeDaily, recomputeMonthly } from "./monthly";
@@ -179,47 +180,95 @@ export function trigMonthly(ports: AppPorts): void {
 // MF 連携: 月次締めのトリガー（実装設計 MF連携 §7）
 // ---------------------------------------------------------------------------
 
-/** 1 ステップを try/catch し、MF の例外は `notifyMfFailure`、成功したら `notifyMfSuccess` を呼ぶ（実装設計 §7）。 */
-function runInvoiceStep(ports: AppPorts, label: string, fn: (ports: AppPorts) => void): void {
+/**
+ * `ports.http.fetch` の呼び出し回数を数える（MF を実際に呼んだステップだけを「成功」に数えるため。
+ * レビュー M5: HTTP を呼ばなかったステップの正常終了で連続障害のカウンタをリセットしてはならない）。
+ * 数える以外は元のポートにそのまま委譲する。
+ */
+function withHttpCounter(ports: AppPorts): { counted: AppPorts; calls: () => number } {
+  let n = 0;
+  const counted: AppPorts = {
+    ...ports,
+    http: {
+      fetch: (req) => {
+        n++;
+        return ports.http.fetch(req);
+      },
+    },
+  };
+  return { counted, calls: () => n };
+}
+
+/**
+ * MF を呼ぶ 1 ステップを try/catch する。例外は `notifyMfFailure(ports, target, e)`（ロック外から呼ぶ版）。
+ * 成功の判定は呼び出し側に返す（`failed`: 例外を投げた、`called`: 1 回以上 HTTP を呼んだ）。
+ */
+function runMfStep(
+  ports: AppPorts,
+  calls: () => number,
+  target: string,
+  label: string,
+  fn: () => void,
+): { failed: boolean; called: boolean } {
+  const before = calls();
   try {
-    fn(ports);
-    notifyMfSuccess(ports, "invoice");
+    fn();
+    return { failed: false, called: calls() > before };
   } catch (e) {
-    console.error(`trigMfSync: ${label} failed: ` + (e instanceof Error ? (e.stack || e.message) : String(e)));
-    notifyMfFailure(ports, "invoice", e);
+    console.error(`${label} failed: ` + (e instanceof Error ? (e.stack || e.message) : String(e)));
+    notifyMfFailure(ports, target, e);
+    return { failed: true, called: calls() > before };
+  }
+}
+
+/**
+ * 連続障害のカウンタを 1 回だけリセットする。**MF を実際に呼んだステップが 1 つ以上あり、呼んだステップ
+ * がすべて成功した（どのステップも失敗していない）ときだけ**リセットする（レビュー M5）。
+ */
+function resetIfAllCalledStepsSucceeded(
+  ports: AppPorts,
+  target: string,
+  results: readonly { failed: boolean; called: boolean }[],
+): void {
+  if (results.every((r) => !r.failed) && results.some((r) => r.called)) {
+    notifyMfSuccess(ports, target);
   }
 }
 
 /**
  * 毎時トリガー（実装設計 §7）。① `evaluateMonthClose`（MF を呼ばない）→ ② `ensureInvoiceCreated`
  * （実装設計 §5.5）→ ③ `trackBillingStatus`（送付・入金の追跡、実装設計 §5.7）→
- * ④ `warnMismatchDaily`（`MISMATCH` の毎日の警告、実装設計 §5.5）。各ステップは独立に
- * try/catch し、1 つが例外を投げても他のステップは実行される。②〜④ の MF 呼び出しの例外は
- * `notifyMfFailure(ports, "invoice", err)`、成功したら `notifyMfSuccess(ports, "invoice")`
- * を呼ぶ（`notifyMfFailure`/`notifyMfSuccess` はロック外から呼ぶ版。§4.4）。
+ * ④ `warnMismatchDaily`（`MISMATCH` の毎日の警告、実装設計 §5.5）→ ⑤ `syncExpenses`（経費同期、§6）。
+ * 各ステップは独立に try/catch し、1 つが例外を投げても他のステップは実行される。
  *
- * ⑤ 経費同期（{@link syncExpenses}、実装設計 §6）。MF の例外は `notifyMfFailure(ports, "journal", err)`、
- * 成功したら `notifyMfSuccess(ports, "journal")`（②〜④ の `"invoice"` とは連続障害の回数を分ける）。
+ * 🔄 **絶対期限（レビュー M4）**: 開始時刻を基準にした 4 分の期限（{@link RunDeadline}）を 1 つ作り、
+ * ②③⑤ に渡す。各処理は行・ページ取得の開始前に確認して打ち切る（状態は変えず次回に続ける）。
+ *
+ * 🔄 **連続障害の数え方（レビュー M5）**: ②〜④ は `"invoice"`、⑤ は `"journal"` のカウンタ。失敗は
+ * `notifyMfFailure(ports, target, err)`。成功の `notifyMfSuccess` は、MF を実際に呼んだステップがあり、
+ * そのターゲットのステップがすべて成功したときだけ 1 回呼ぶ（HTTP を呼ばなかったステップは成功に数えない）。
  */
 export function trigMfSync(ports: AppPorts): void {
+  const deadline = new RunDeadline(ports.clock);
   try {
     evaluateMonthClose(ports);
   } catch (e) {
     console.error("trigMfSync: evaluateMonthClose failed: " + (e instanceof Error ? (e.stack || e.message) : String(e)));
   }
 
-  runInvoiceStep(ports, "ensureInvoiceCreated", ensureInvoiceCreated);
-  runInvoiceStep(ports, "trackBillingStatus", trackBillingStatus);
-  runInvoiceStep(ports, "warnMismatchDaily", warnMismatchDaily);
+  const { counted, calls } = withHttpCounter(ports);
+  const invoiceResults = [
+    runMfStep(ports, calls, "invoice", "trigMfSync: ensureInvoiceCreated", () => ensureInvoiceCreated(counted, deadline)),
+    runMfStep(ports, calls, "invoice", "trigMfSync: trackBillingStatus", () => trackBillingStatus(counted, deadline)),
+    runMfStep(ports, calls, "invoice", "trigMfSync: warnMismatchDaily", () => warnMismatchDaily(counted)),
+  ];
+  resetIfAllCalledStepsSucceeded(ports, "invoice", invoiceResults);
 
   // ⑤ 経費同期（実装設計 §6, §7）。
-  try {
-    syncExpenses(ports);
-    notifyMfSuccess(ports, "journal");
-  } catch (e) {
-    console.error("trigMfSync: syncExpenses failed: " + (e instanceof Error ? (e.stack || e.message) : String(e)));
-    notifyMfFailure(ports, "journal", e);
-  }
+  const journalResult = runMfStep(ports, calls, "journal", "trigMfSync: syncExpenses", () =>
+    syncExpenses(counted, deadline),
+  );
+  resetIfAllCalledStepsSucceeded(ports, "journal", [journalResult]);
 }
 
 /**
@@ -355,29 +404,16 @@ export function trigWeeklyOrphanCheck(ports: AppPorts): void {
 
   ports.sheets.setInternalValue("expense_scan", "last_success_at", String(nowMs));
 
-  // MF 連携: 請求書 API の週次の疎通（実装設計 MF連携 §4.2, §7）。独立に try/catch し、
-  // 例外は notifyMfFailure（ロック外から呼ぶ版）、成功したら notifyMfSuccess を呼ぶ。
-  try {
-    weeklyInvoiceKeepalive(ports);
-    notifyMfSuccess(ports, "invoice");
-  } catch (e) {
-    console.error(
-      "trigWeeklyOrphanCheck: weeklyInvoiceKeepalive failed: " +
-        (e instanceof Error ? (e.stack || e.message) : String(e)),
-    );
-    notifyMfFailure(ports, "invoice", e);
-  }
-
-  // MF 連携: 週次報告の仕訳部分（二重作成の疑い・人の判断待ち。実装設計 MF連携 §6.6）。
-  // 上の疎通とは独立に try/catch し、例外は notifyMfFailure（`"journal"`）、成功したら notifyMfSuccess。
-  try {
-    weeklyJournalReport(ports);
-    notifyMfSuccess(ports, "journal");
-  } catch (e) {
-    console.error(
-      "trigWeeklyOrphanCheck: weeklyJournalReport failed: " +
-        (e instanceof Error ? (e.stack || e.message) : String(e)),
-    );
-    notifyMfFailure(ports, "journal", e);
-  }
+  // MF 連携: 請求書 API の週次の疎通（実装設計 MF連携 §4.2, §7）と、週次報告の仕訳部分（§6.6）。それぞれ独立に
+  // try/catch し、例外は notifyMfFailure（ロック外から呼ぶ版）。成功のリセットは、MF を実際に呼んだときだけ
+  // （無効で何もしなかった週はカウンタに触れない。trigMfSync と同じ。レビュー M5）。
+  const { counted, calls } = withHttpCounter(ports);
+  const keepalive = runMfStep(ports, calls, "invoice", "trigWeeklyOrphanCheck: weeklyInvoiceKeepalive", () =>
+    weeklyInvoiceKeepalive(counted),
+  );
+  resetIfAllCalledStepsSucceeded(ports, "invoice", [keepalive]);
+  const journalReport = runMfStep(ports, calls, "journal", "trigWeeklyOrphanCheck: weeklyJournalReport", () =>
+    weeklyJournalReport(counted),
+  );
+  resetIfAllCalledStepsSucceeded(ports, "journal", [journalReport]);
 }

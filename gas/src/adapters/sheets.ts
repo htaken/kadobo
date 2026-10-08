@@ -12,7 +12,14 @@ import type { RecentDay } from "../core/businessDate";
 import type { JournalSyncState } from "../core/journalSync";
 import type { LoggedEvent, LogEventType } from "../core/state";
 import type { DailyStatus, Rounding, TaxCategory, UnitPriceRow, Withholding } from "../core/aggregate";
-import type { DailySummaryRow, ExpenseLedgerRow, MonthlyBillRow, RawLogRow, SheetsPort } from "../app/ports";
+import {
+  orderedColumnKeys,
+  type DailySummaryRow,
+  type ExpenseLedgerRow,
+  type MonthlyBillRow,
+  type RawLogRow,
+  type SheetsPort,
+} from "../app/ports";
 import { shiftBusinessDate } from "../app/dateUtil";
 
 const SHEET_NAMES = {
@@ -795,6 +802,31 @@ function expenseCellValue(value: ExpenseLedgerRow[keyof ExpenseLedgerRow]): unkn
   return value === null ? "" : value;
 }
 
+/**
+ * 月次請求の列番号（1-based）。{@link SheetsAdapter.updateMonthlyBillColumns} が `patch` のキーから書く列を
+ * 決めるために使う（`MONTHLY_BILL_HEADERS` の並びと一致させること）。
+ */
+const MONTHLY_COLUMN_INDEX: Record<keyof MonthlyBillRow, number> = {
+  client: 1,
+  month: 2,
+  worked_minutes: 3,
+  hours: 4,
+  unit_price: 5,
+  amount: 6,
+  tax_amount: 7,
+  withholding_amount: 8,
+  net_amount: 9,
+  state: 10,
+  mf_invoice_id: 11,
+  locked_at: 12,
+  note: 13,
+  updated_at: 14,
+  invoice_state: 15,
+  invoice_error: 16,
+  invoice_attempted_at: 17,
+  close_card_ts: 18,
+};
+
 export class SheetsAdapter implements SheetsPort {
   private readonly spreadsheetId: string;
   private spreadsheet: GoogleAppsScript.Spreadsheet.Spreadsheet | null = null;
@@ -946,7 +978,8 @@ export class SheetsAdapter implements SheetsPort {
   }
 
   /**
-   * 🔄 `client + month` の月次請求行を指定列だけ更新する（実装設計 MF連携 §0, §8）。
+   * 🔄 `client + month` の月次請求行の**指定列のセルだけ**を書く（実装設計 MF連携 §0, §8）。行全体は書き戻さない
+   * （人が同時に編集した `state` 等を古い値で上書きしないため）。text 書式の列は 1 セルだけ書式を当ててから書く。
    * 行が無い場合は例外を投げる（`updateExpense` と同じ方針。新規作成は `upsertMonthlyBill`）。
    */
   updateMonthlyBillColumns(client: string, month: string, patch: Partial<MonthlyBillRow>): void {
@@ -955,9 +988,19 @@ export class SheetsAdapter implements SheetsPort {
     if (idx === -1) {
       throw new Error(`monthly_bill_not_found:${client}|${month}`);
     }
-    const current = rowToMonthlyBill(values[idx]!);
-    const merged: MonthlyBillRow = { ...current, ...patch };
-    this.setFormattedRow(SHEET_NAMES.monthlyBill, idx + 2, monthlyBillToRow(merged));
+    const sheet = this.sheet(SHEET_NAMES.monthlyBill);
+    const rowIndex = idx + 2;
+    const textCols = textColumnIndices(SHEET_NAMES.monthlyBill);
+    for (const [key, value] of Object.entries(patch) as [keyof MonthlyBillRow, MonthlyBillRow[keyof MonthlyBillRow]][]) {
+      const col = MONTHLY_COLUMN_INDEX[key];
+      if (col === undefined) {
+        throw new Error(`unknown_monthly_bill_column:${String(key)}`);
+      }
+      if (textCols.includes(col)) {
+        sheet.getRange(rowIndex, col, 1, 1).setNumberFormat("@");
+      }
+      sheet.getRange(rowIndex, col, 1, 1).setValues([[value === null ? "" : value]]);
+    }
   }
 
   listMonthlyBills(): MonthlyBillRow[] {
@@ -1036,7 +1079,11 @@ export class SheetsAdapter implements SheetsPort {
    * 🔄 `patch` のキーに対応するセルだけを書く（実装設計 MF連携 §0, §6.1, §8）。他の列のセルには
    * 一切書き込まない（`updateExpense` のように行全体を書き戻さない）。**ロック内から呼ぶこと**。
    */
-  updateExpenseColumns(receiptId: string, patch: Partial<ExpenseLedgerRow>): void {
+  updateExpenseColumns(
+    receiptId: string,
+    patch: Partial<ExpenseLedgerRow>,
+    order?: readonly (keyof ExpenseLedgerRow)[],
+  ): void {
     const values = this.dataRows(SHEET_NAMES.expenseLedger);
     const idx = values.findIndex((r) => str(r[0]) === receiptId);
     if (idx === -1) {
@@ -1044,7 +1091,8 @@ export class SheetsAdapter implements SheetsPort {
     }
     const sheet = this.sheet(SHEET_NAMES.expenseLedger);
     const rowIndex = idx + 2;
-    for (const [key, value] of Object.entries(patch) as [keyof ExpenseLedgerRow, ExpenseLedgerRow[keyof ExpenseLedgerRow]][]) {
+    for (const key of orderedColumnKeys(patch, order)) {
+      const value = patch[key] as ExpenseLedgerRow[keyof ExpenseLedgerRow];
       const col = EXPENSE_COLUMN_INDEX[key];
       if (col === undefined) {
         throw new Error(`unknown_expense_column:${String(key)}`);

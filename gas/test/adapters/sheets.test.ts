@@ -1056,6 +1056,67 @@ describe("SheetsAdapter.updateMonthlyBillColumns / listMonthlyBills（実装設�
     expect(after?.close_card_ts).toBe("1756260000.000100");
   });
 
+  it("実際に書き込んだ範囲は patch の列の 1 セルずつだけ（行全体 [行,1,1,18] を書かない）", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const adapter = new SheetsAdapter(SPREADSHEET_ID);
+    adapter.upsertMonthlyBill(makeMonthlyBillRow());
+    const sheet = harness.spreadsheet.getSheetByName(MONTHLY_BILL_SHEET) as FakeSheet;
+    sheet.writes.length = 0;
+
+    adapter.updateMonthlyBillColumns("A社", "2026-10", { worked_minutes: 100, hours: 1.67, note: null });
+
+    expect(sheet.writes).toEqual([
+      { row: 2, col: 3, numRows: 1, numCols: 1 },
+      { row: 2, col: 4, numRows: 1, numCols: 1 },
+      { row: 2, col: 13, numRows: 1, numCols: 1 },
+    ]);
+    expect(sheet.getCell(2, 13)).toBe(""); // null は空セル
+  });
+
+  it("読み取り後に人が state・MF ID を変えても、数値列の更新はそれらを戻さない（B1 の再現ケース）", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const adapter = new SheetsAdapter(SPREADSHEET_ID);
+    adapter.upsertMonthlyBill(makeMonthlyBillRow());
+    const sheet = harness.spreadsheet.getSheetByName(MONTHLY_BILL_SHEET) as FakeSheet;
+
+    // アダプタが行を読んだ直後（書く前）に、人が締め状態・請求書 ID・請求書状態をシートで編集した状況。
+    sheet.afterReadOnce = () => {
+      sheet.setCell(2, 10, "LOCKED");
+      sheet.setCell(2, 11, "INV-HUMAN");
+      sheet.setCell(2, 15, "PENDING");
+    };
+    adapter.updateMonthlyBillColumns("A社", "2026-10", { worked_minutes: 9700, amount: 291000, updated_at: 5 });
+
+    expect(sheet.getCell(2, 10)).toBe("LOCKED");
+    expect(sheet.getCell(2, 11)).toBe("INV-HUMAN");
+    expect(sheet.getCell(2, 15)).toBe("PENDING");
+    expect(sheet.getCell(2, 3)).toBe(9700);
+    expect(sheet.getCell(2, 6)).toBe(291000);
+  });
+
+  it("text 書式の列は 1 セルだけ書式を当てて書く（invoice_state・close_card_ts）。数値列は text 化しない", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const adapter = new SheetsAdapter(SPREADSHEET_ID);
+    adapter.upsertMonthlyBill(makeMonthlyBillRow());
+    const sheet = harness.spreadsheet.getSheetByName(MONTHLY_BILL_SHEET) as FakeSheet;
+
+    adapter.updateMonthlyBillColumns("A社", "2026-10", { close_card_ts: "1756260000.000100", invoice_attempted_at: 777 });
+
+    expect(sheet.getFormat(2, 18)).toBe(TEXT_FORMAT);
+    expect(sheet.getCell(2, 18)).toBe("1756260000.000100"); // 末尾ゼロが落ちない
+    expect(sheet.getFormat(2, 17)).not.toBe(TEXT_FORMAT);
+    expect(sheet.getCell(2, 17)).toBe(777);
+  });
+
+  it("未知のキーは例外（列対応表に無い列は書かない）", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const adapter = new SheetsAdapter(SPREADSHEET_ID);
+    adapter.upsertMonthlyBill(makeMonthlyBillRow());
+    expect(() =>
+      adapter.updateMonthlyBillColumns("A社", "2026-10", { bogus: 1 } as unknown as Partial<MonthlyBillRow>),
+    ).toThrow(/unknown_monthly_bill_column/);
+  });
+
   it("対象行が無い場合は例外を投げる", () => {
     setupSpreadsheet(SPREADSHEET_ID);
     const adapter = new SheetsAdapter(SPREADSHEET_ID);
@@ -1258,6 +1319,27 @@ describe("SheetsAdapter.updateExpenseColumns（実装設計 MF連携 §0, §6.1,
     const r2 = adapter.getExpenseByReceiptId("R-2");
     expect(r2?.partner).toBe("△△商事");
     expect(r2?.mf_sync_state).toBe("");
+  });
+
+  it("order を渡すと、その順にセルを書く（確定を表す状態列を最後にできる）。残りは patch のキー順", () => {
+    setupSpreadsheet(SPREADSHEET_ID);
+    const adapter = new SheetsAdapter(SPREADSHEET_ID);
+    adapter.appendExpense(makeExpenseRow({ receipt_id: "R-1" }));
+    const sheet = harness.spreadsheet.getSheetByName(EXPENSE_SHEET) as FakeSheet;
+    sheet.writes.length = 0;
+
+    adapter.updateExpenseColumns(
+      "R-1",
+      { mf_sync_state: "CREATING", mf_sync_input: "x", mf_sync_attempted_at: 5, mf_sync_error: null },
+      ["mf_sync_attempted_at", "mf_sync_input", "mf_sync_state"],
+    );
+
+    expect(sheet.writes.map((w) => w.col)).toEqual([
+      EXPENSE_COL_V3.mf_sync_attempted_at,
+      EXPENSE_COL_V3.mf_sync_input,
+      EXPENSE_COL_V3.mf_sync_state,
+      EXPENSE_COL_V3.mf_sync_error, // order に無い列は後ろ
+    ]);
   });
 
   it("パーセントエンコード済みの ID・日時は text/数値の書式どおりに往復する", () => {

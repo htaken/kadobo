@@ -178,6 +178,22 @@ export interface ExpenseLedgerRow {
   mf_sync_input: string;
 }
 
+/**
+ * 列指定更新（`updateExpenseColumns`）で書く列の順序を決める。`order` に含まれ、かつ `patch` にある列を
+ * `order` の順に先に、残りを `patch` のキー順に並べる。実アダプタとテスト用フェイクが同じ順序を使う。
+ */
+export function orderedColumnKeys(
+  patch: Partial<ExpenseLedgerRow>,
+  order?: readonly (keyof ExpenseLedgerRow)[],
+): (keyof ExpenseLedgerRow)[] {
+  const keys = Object.keys(patch) as (keyof ExpenseLedgerRow)[];
+  if (order === undefined) {
+    return keys;
+  }
+  const first = order.filter((k) => keys.includes(k));
+  return [...first, ...keys.filter((k) => !first.includes(k))];
+}
+
 // ---------------------------------------------------------------------------
 // SheetsPort
 // ---------------------------------------------------------------------------
@@ -249,8 +265,16 @@ export interface SheetsPort {
    * `updateExpense` は行全体を読み直して書き戻すが、こちらは `patch` のキーに対応するセルだけを
    * 書く。MF 同期（`app/journalSync.ts`）は業務列を上書きしないよう、これだけを使う。
    * 対象行が無い場合は例外を投げる。**呼び出し側が `ports.lock.withLock` の中で呼ぶこと**。
+   *
+   * 実アダプタはセル単位で書くため、途中で失敗すると前半のセルだけが保存される。書込み順を呼び出し側が
+   * `order` で明示できる（`order` に含まれる列を先に、その順で書き、残りは `patch` のキー順。
+   * {@link orderedColumnKeys}）。確定を表す列（`mf_sync_state` 等）を最後にするために使う。
    */
-  updateExpenseColumns(receiptId: string, patch: Partial<ExpenseLedgerRow>): void;
+  updateExpenseColumns(
+    receiptId: string,
+    patch: Partial<ExpenseLedgerRow>,
+    order?: readonly (keyof ExpenseLedgerRow)[],
+  ): void;
   /** 全行を返す（週次照合用。月数十件規模なので全件で足りる）。 */
   getAllExpenses(): ExpenseLedgerRow[];
 }
